@@ -1,0 +1,19 @@
+# Dependencies and generated plugin bundle
+/node_modules/
+/dist/
+/*.tgz
+
+# Private workflow, verification, backups and legacy experiments
+/.gjc/
+/.local/
+/backups/
+/e2e-results/
+/tests/
+/AGENTS.md
+/scripts/verify-runtime.ts
+
+# Credentials and local machine output
+.env
+.env.*
+*.log
+.DS_Store
