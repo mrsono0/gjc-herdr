@@ -28,12 +28,13 @@ npm test
 아래 명령은 실행한 사용자의 plugin registry를 변경한다. 먼저 검증용 격리 환경에서 사용한다.
 
 ```sh
-gjc plugin install "gjc-herdr@file:$(pwd)"
+npm pack --ignore-scripts
+gjc plugin install "gjc-herdr@file:$(pwd)/gjc-herdr-0.1.0.tgz"
 gjc plugin list --json
 gjc
 ```
 
-`package.json.gjc.extensions`의 `dist/extension.js`가 로드된다. plain local path는 별도 GJC bundle 설치 경로로 분류되므로 native npm extension에 `--user`나 `--scope`를 덧붙이지 않는다. `plugin link`만으로는 registry의 package dependencies가 채워지지 않아 discovery 성공을 보장하지 않는다.
+`package.json.gjc.extensions`의 `dist/extension.js`가 로드된다. Git 저장소를 가리키는 named `file:` directory 설치에서 Bun의 cache-to-destination copy `ENOENT`를 관측했으므로, build 결과만 담은 native npm tarball을 설치 경로로 사용한다. 이는 GJC bundle/O2가 아니라 package 이름을 명시한 native npm 설치다. plain local path는 별도 GJC bundle 설치 경로로 분류되므로 native npm extension에 `--user`나 `--scope`를 덧붙이지 않는다. `plugin link`만으로는 registry의 package dependencies가 채워지지 않아 discovery 성공을 보장하지 않는다.
 
 ## metadata와 화면 표시
 
