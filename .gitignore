@@ -1,6 +1,6 @@
-# Dependencies and generated plugin bundle
+# Dependencies and local pack output. dist/extension.js is committed so that
+# `gjc plugin install gjc-herdr@git+https://...#<tag>` works without a build step.
 /node_modules/
-/dist/
 /*.tgz
 
 # Private workflow, verification, backups and legacy experiments
