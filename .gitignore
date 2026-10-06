@@ -10,6 +10,7 @@
 /e2e-results/
 /tests/
 /AGENTS.md
+/marketplace-report.md
 /scripts/verify-runtime.ts
 
 # Credentials and local machine output
