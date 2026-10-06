@@ -79,7 +79,7 @@ gjc
 | 항목 | 확인 결과 |
 |---|---|
 | 환경 | macOS arm64, Herdr 0.9.3. Git 설치는 GJC 0.18.7(격리 HOME과 실제 사용자 환경)에서 검증. 이전 MVP 검증은 GJC 0.18.6 격리 환경 |
-| Git 설치 | 격리 HOME과 실제 사용자 환경 모두에서 위 한 줄 명령으로 설치·실제 로드·token 발행·`/rename` 갱신·정상 종료 clear·제거 후 native-only 실행 확인. 설치된 `dist/extension.js`가 commit된 파일과 동일(sha256) |
+| Git 설치 | 격리 HOME: 위 한 줄 명령으로 설치·실제 로드·token 발행·`/rename` 갱신·정상 종료 clear·제거 후 native-only 실행 확인. 실제 사용자 환경: 기존 tarball 설치를 제거한 뒤 같은 명령으로 설치·실제 로드·token 발행·`/rename` 갱신·정상 종료 clear 확인(사용자 환경에서의 재제거는 실행하지 않음). 두 환경 모두 설치된 `dist/extension.js`가 commit된 파일과 동일(sha256) |
 | metadata | 모델 변경, `/rename` 갱신, native·다른 source의 키 보존, 오래된 seq 거부 확인 |
 | 실제 sidebar | 사용자 설정에서 native 행을 보존하고 두 custom 행 추가. 사용자 제공 화면으로 최종 표시 확인 |
 | provider | 기존 `cliproxyapi/glm-5.3`의 인증·실제 추론 1회 성공 |
