@@ -1,6 +1,6 @@
 {
 	"name": "gjc-herdr",
-	"version": "0.1.1",
+	"version": "0.1.2",
 	"description": "Display-only Herdr model and session metadata for GJC",
 	"type": "module",
 	"license": "UNLICENSED",
