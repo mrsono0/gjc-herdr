@@ -19,6 +19,7 @@ gjc plugin install "gjc-herdr@git+https://github.com/mrsono0/gjc-herdr.git"
 ### 최신 버전으로 업데이트
 
 설치 시점의 commit이 lock에 고정되므로 같은 설치 명령을 다시 실행하거나 `--force`를 붙여도 새 버전으로 바뀌지 않는다. `gjc plugin upgrade`는 marketplace plugin 전용이다. 제거 후 다시 설치한다.
+`bun update gjc-herdr`를 `~/.gjc/plugins/`에서 실행해도 같은 commit 고정을 푼다(검증됨). 이 방법은 GJC가 관리하는 registry directory를 직접 다루므로, 위의 제거 후 설치가 기본 방법이다.
 
 ```sh
 gjc plugin uninstall gjc-herdr
