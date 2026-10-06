@@ -1,7 +1,7 @@
 {
 	"name": "gjc-herdr",
-	"version": "0.1.3",
-	"description": "Display-only Herdr model and session metadata for GJC",
+	"version": "0.2.0",
+	"description": "Herdr model/session metadata and pane-to-pane prompt delivery for GJC",
 	"type": "module",
 	"license": "MIT",
 	"repository": {
@@ -28,7 +28,7 @@
 	"scripts": {
 		"build": "bun scripts/build.ts",
 		"check": "tsc --noEmit",
-		"test": "bun test test/metadata.test.ts"
+		"test": "bun test test/metadata.test.ts test/send.test.ts"
 	},
 	"devDependencies": {
 		"@gajae-code/coding-agent": "0.18.6",

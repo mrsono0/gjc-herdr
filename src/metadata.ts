@@ -3,6 +3,7 @@ import type { ExtensionAPI, ExtensionContext } from "@gajae-code/coding-agent";
 
 export const MODEL_KEY = "gjc_herdr_model";
 export const SESSION_KEY = "gjc_herdr_session";
+export const SESSION_ID_KEY = "gjc_herdr_session_id";
 export const TTL_MS = 60_000;
 export const REFRESH_MS = 20_000;
 
@@ -27,6 +28,7 @@ export function displayValue(value: string | undefined): string | undefined {
 export interface MetadataValues {
 	model?: string;
 	session?: string;
+	sessionId?: string;
 }
 
 export function reportArgs(
@@ -61,6 +63,12 @@ export function reportArgs(
 				: ["--token", `${key}=${text}`]),
 		);
 	}
+	// The session ID is a machine identity for prompt delivery, so it is never normalized.
+	args.push(
+		...(values.sessionId
+			? ["--token", `${SESSION_ID_KEY}=${values.sessionId}`]
+			: ["--clear-token", SESSION_ID_KEY]),
+	);
 	return args;
 }
 

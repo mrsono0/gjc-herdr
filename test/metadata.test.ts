@@ -3,6 +3,7 @@ import test from "node:test";
 import { spyOn } from "bun:test";
 import type { ExtensionAPI, ExtensionContext } from "@gajae-code/coding-agent";
 import * as publicHerdr from "@gajae-code/coding-agent/utils/herdr-pane";
+import * as zod from "zod/v4";
 import herdrMetadata from "../src/extension.ts";
 import {
 	createReporter,
@@ -10,8 +11,18 @@ import {
 	isMainSession,
 	MODEL_KEY,
 	reportArgs,
+	SESSION_ID_KEY,
 	SESSION_KEY,
 } from "../src/metadata.ts";
+
+const CLEAR_ALL = [
+	"--clear-token",
+	MODEL_KEY,
+	"--clear-token",
+	SESSION_KEY,
+	"--clear-token",
+	SESSION_ID_KEY,
+];
 
 test("non-Herdr, malformed panes and sub/nested contexts cannot publish", () => {
 	assert.equal(
@@ -37,7 +48,7 @@ test("non-Herdr, malformed panes and sub/nested contexts cannot publish", () => 
 	}
 });
 
-test("a denied public pane resolver registers no publisher even for a main context", () => {
+test("a denied public pane resolver registers no publisher but still registers delivery without exec", () => {
 	const originalHerdrFlag = process.env.HERDR_ENV;
 	const admission = spyOn(
 		publicHerdr,
@@ -49,21 +60,38 @@ test("a denied public pane resolver registers no publisher even for a main conte
 		return null;
 	});
 	let registrations = 0;
+	const commands: string[] = [];
+	const tools: string[] = [];
+	let execs = 0;
 	try {
 		herdrMetadata({
 			logger: { info() {} },
+			zod,
 			on() {
 				registrations++;
 			},
+			registerCommand(name: string) {
+				commands.push(name);
+			},
+			registerTool(tool: { name: string }) {
+				tools.push(tool.name);
+			},
+			exec: async () => {
+				execs++;
+				return { stdout: "", stderr: "", code: 0, killed: false };
+			},
 		} as unknown as ExtensionAPI);
 		assert.equal(registrations, 0);
+		assert.deepEqual(commands, ["herdr-send"]);
+		assert.deepEqual(tools, ["herdr_send"]);
+		assert.equal(execs, 0);
 		assert.equal(process.env.HERDR_ENV, originalHerdrFlag);
 	} finally {
 		admission.mockRestore();
 	}
 });
 
-test("display values are bounded Unicode text and missing values clear only plugin keys", () => {
+test("display values are bounded Unicode text, the session ID is raw, and missing values clear only plugin keys", () => {
 	assert.equal(displayValue("\n \x1b\r"), undefined);
 	assert.equal(displayValue("a\x1bb\nc"), "a b c");
 	assert.equal(Array.from(displayValue("😀".repeat(81))!).length, 80);
@@ -71,7 +99,18 @@ test("display values are bounded Unicode text and missing values clear only plug
 		model: "openai/gpt-4o-mini",
 	});
 	assert(args.includes(`${MODEL_KEY}=openai/gpt-4o-mini`));
-	assert.deepEqual(args.slice(-2), ["--clear-token", SESSION_KEY]);
+	assert.deepEqual(args.slice(-4), [
+		"--clear-token",
+		SESSION_KEY,
+		"--clear-token",
+		SESSION_ID_KEY,
+	]);
+	const longId = `01a11099-ef75-76e1-9e79-${"d".repeat(80)}`;
+	assert(
+		reportArgs("wC:p5", "gjc-herdr:test", 1, { sessionId: longId }).includes(
+			`${SESSION_ID_KEY}=${longId}`,
+		),
+	);
 	assert(
 		!args.some((value) =>
 			["report-agent", "release-agent", "--title", "--display-agent"].includes(
@@ -97,12 +136,7 @@ test("one publisher owns a fresh source, increasing sequence and CLI error handl
 	assert.equal(option(calls[0], "--source"), option(calls[1], "--source"));
 	assert.equal(option(calls[0], "--seq"), "1");
 	assert.equal(option(calls[1], "--seq"), "2");
-	assert.deepEqual(calls[1].slice(-4), [
-		"--clear-token",
-		MODEL_KEY,
-		"--clear-token",
-		SESSION_KEY,
-	]);
+	assert.deepEqual(calls[1].slice(-6), CLEAR_ALL);
 	code = 1;
 	await assert.rejects(report({ model: "m" }), /exit 1/);
 });
@@ -128,8 +162,12 @@ test("session events read current values and shutdown clears without changing na
 	const calls: string[][] = [];
 	let name: string | undefined = "first";
 	let model = { provider: "openai", id: "gpt-4o-mini" };
+	let sessionId = "session-1";
 	const api = {
 		logger: { info() {}, warn() {} },
+		zod,
+		registerCommand() {},
+		registerTool() {},
 		on(
 			event: string,
 			handler: (event: unknown, ctx: ExtensionContext) => Promise<void>,
@@ -144,6 +182,7 @@ test("session events read current values and shutdown clears without changing na
 	} as unknown as ExtensionAPI;
 	const ctx = {
 		sessionMetadata: { kind: "main", taskDepth: 0 },
+		sessionManager: { getSessionId: () => sessionId },
 		get model() {
 			return model;
 		},
@@ -156,18 +195,16 @@ test("session events read current values and shutdown clears without changing na
 		assert.equal(calls.length, 0);
 		await handlers.get("session_start")!({}, ctx);
 		assert(calls[0].includes(`${SESSION_KEY}=first`));
+		assert(calls[0].includes(`${SESSION_ID_KEY}=session-1`));
 		model = { provider: "openai", id: "gpt-4o" };
 		name = undefined;
-		await handlers.get("agent_end")!({}, ctx);
+		sessionId = "session-2";
+		await handlers.get("session_switch")!({}, ctx);
 		assert(calls[1].includes(`${MODEL_KEY}=openai/gpt-4o`));
-		assert.deepEqual(calls[1].slice(-2), ["--clear-token", SESSION_KEY]);
+		assert(calls[1].includes(`${SESSION_ID_KEY}=session-2`));
+		assert.equal(calls[1][calls[1].indexOf(SESSION_KEY) - 1], "--clear-token");
 		await handlers.get("session_shutdown")!({}, ctx);
-		assert.deepEqual(calls[2].slice(-4), [
-			"--clear-token",
-			MODEL_KEY,
-			"--clear-token",
-			SESSION_KEY,
-		]);
+		assert.deepEqual(calls[2].slice(-6), CLEAR_ALL);
 		await handlers.get("agent_start")!({}, ctx);
 		assert.equal(calls.length, 3);
 	} finally {

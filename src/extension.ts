@@ -1,10 +1,17 @@
 import type { ExtensionAPI, ExtensionContext } from "@gajae-code/coding-agent";
 import { resolveHerdrPaneEnvironment } from "@gajae-code/coding-agent/utils/herdr-pane";
 import { createReporter, isMainSession, REFRESH_MS } from "./metadata.ts";
+import { registerSendFeatures } from "./send.ts";
 
 export default function herdrMetadata(api: ExtensionAPI): void {
 	api.logger.info("gjc-herdr extension loaded");
 	const pane = resolveHerdrPaneEnvironment({ env: { ...process.env } });
+	// Explicit delivery to another pane does not depend on this process publishing metadata.
+	registerSendFeatures(
+		api,
+		pane?.binPath ?? "herdr",
+		pane?.paneId ?? process.env.HERDR_PANE_ID,
+	);
 	if (!pane) return;
 
 	const report = createReporter(api.exec.bind(api), pane.paneId, pane.binPath);
@@ -31,6 +38,7 @@ export default function herdrMetadata(api: ExtensionAPI): void {
 			await report({
 				model: model ? `${model.provider}/${model.id}` : undefined,
 				session: api.getSessionName(),
+				sessionId: context.sessionManager.getSessionId(),
 			});
 		});
 	}
