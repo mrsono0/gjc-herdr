@@ -1,6 +1,6 @@
 {
 	"name": "gjc-herdr",
-	"version": "0.1.0",
+	"version": "0.1.1",
 	"description": "Display-only Herdr model and session metadata for GJC",
 	"type": "module",
 	"license": "UNLICENSED",
@@ -21,8 +21,11 @@
 			"./dist/extension.js"
 		]
 	},
+	"engines": {
+		"bun": "1.4.2"
+	},
 	"scripts": {
-		"build": "bun build src/extension.ts --target=bun --outdir dist --format=esm --external=@gajae-code/natives",
+		"build": "bun scripts/build.ts",
 		"check": "tsc --noEmit",
 		"test": "bun test test/metadata.test.ts"
 	},
