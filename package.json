@@ -1,9 +1,9 @@
 {
 	"name": "gjc-herdr",
-	"version": "0.1.2",
+	"version": "0.1.3",
 	"description": "Display-only Herdr model and session metadata for GJC",
 	"type": "module",
-	"license": "UNLICENSED",
+	"license": "MIT",
 	"repository": {
 		"type": "git",
 		"url": "git+https://github.com/mrsono0/gjc-herdr.git"
@@ -14,7 +14,8 @@
 	},
 	"files": [
 		"dist/extension.js",
-		"README.md"
+		"README.md",
+		"LICENSE"
 	],
 	"gjc": {
 		"extensions": [
