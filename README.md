@@ -21,7 +21,7 @@ gjc plugin install "gjc-herdr@git+https://github.com/mrsono0/gjc-herdr.git#v0.1.
 
 1. **사전 확인**
    ```sh
-   gjc --version      # 0.18.6 이상에서 검증
+   gjc --version      # Git 설치는 0.18.7에서 검증 (플러그인 동작은 0.18.6에서도 검증)
    herdr --version    # 0.9.3에서 검증
    bun --version      # GJC plugin 설치에 필요
    git --version
