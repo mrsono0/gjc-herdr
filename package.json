@@ -14,7 +14,7 @@
 	},
 	"files": [
 		"dist/extension.js",
-		"docs/installation.md"
+		"README.md"
 	],
 	"gjc": {
 		"extensions": [
