@@ -7,13 +7,25 @@ GJC의 native 상태·세션/resume 처리를 유지하면서 Herdr sidebar에 *
 ## 설치 (한 줄)
 
 ```sh
-gjc plugin install "gjc-herdr@git+https://github.com/mrsono0/gjc-herdr.git#v0.2.0"
+gjc plugin install "gjc-herdr@git+https://github.com/mrsono0/gjc-herdr.git"
 ```
 
-- `gjc-herdr@` 접두사와 `#v0.2.0` tag를 그대로 쓴다. 접두사 없이 URL만 주면 GJC는 다른 설치 형식(bundle)으로 분류해 실패한다.
+- tag 없이 설치하면 `main`의 최신 release가 설치된다. `main`에는 build된 `dist/extension.js`가 포함된 release 상태만 push한다.
+- `gjc-herdr@` 접두사를 그대로 쓴다. 접두사 없이 URL만 주면 GJC는 다른 설치 형식(bundle)으로 분류해 실패한다.
 - `--user`·`--scope`·`--project`를 붙이지 않는다.
 - 설치는 실행한 사용자의 `~/.gjc/plugins/` registry만 변경한다. Bun이 Git에서 가져오며 npm registry를 사용하지 않는다.
-- `#main`은 개발용이다. 사용자 설치는 tag로 고정한다.
+- 특정 버전으로 고정하려면 tag를 붙인다: `gjc plugin install "gjc-herdr@git+https://github.com/mrsono0/gjc-herdr.git#v0.2.0"`.
+
+### 최신 버전으로 업데이트
+
+설치 시점의 commit이 lock에 고정되므로 같은 설치 명령을 다시 실행하거나 `--force`를 붙여도 새 버전으로 바뀌지 않는다. `gjc plugin upgrade`는 marketplace plugin 전용이다. 제거 후 다시 설치한다.
+
+```sh
+gjc plugin uninstall gjc-herdr
+gjc plugin install "gjc-herdr@git+https://github.com/mrsono0/gjc-herdr.git"
+```
+
+실행 중이던 GJC는 재시작해야 새 버전을 로드한다.
 
 ## AI 에이전트 설치 지침
 
@@ -28,8 +40,8 @@ gjc plugin install "gjc-herdr@git+https://github.com/mrsono0/gjc-herdr.git#v0.2.
    echo "$HERDR_ENV $HERDR_PANE_ID"   # Herdr pane 안에서 실행 중인지 (1 과 pane id가 보여야 표시 대상)
    ```
    Herdr 밖에서 실행한 GJC에는 아무것도 표시되지 않는다(정상).
-2. **기존 설치 확인**: `gjc plugin list --json`의 `npm` 배열에 `gjc-herdr`가 있으면 재설치하지 말고 `~/.gjc/plugins/package.json`의 `dependencies["gjc-herdr"]`를 확인한다. 이미 `git+https://github.com/mrsono0/gjc-herdr.git#v0.2.0`이면 설치 단계를 건너뛴다. 다른 source(이전 tag·로컬 tarball 등)면 `gjc plugin uninstall gjc-herdr` 후 위 한 줄로 설치한다.
-3. **설치**: 위 한 줄 명령. 성공 판정은 `gjc plugin list --json`에 `gjc-herdr` 0.2.0 `enabled: true`, 그리고 `~/.gjc/plugins/node_modules/gjc-herdr/dist/extension.js`가 존재하는 것이다.
+2. **기존 설치 확인**: `gjc plugin list --json`의 `npm` 배열에 `gjc-herdr`가 있으면 `~/.gjc/plugins/package.json`의 `dependencies["gjc-herdr"]`와 설치된 version을 확인한다. 최신 release가 이미 설치되어 있으면 설치 단계를 건너뛴다. 이전 버전이거나 다른 source(tag 고정·로컬 tarball 등)면 `gjc plugin uninstall gjc-herdr` 후 위 한 줄로 설치한다.
+3. **설치**: 위 한 줄 명령. 성공 판정은 `gjc plugin list --json`에 `gjc-herdr`가 `enabled: true`이고 version이 저장소 `main`의 `package.json` version과 같으며, `~/.gjc/plugins/node_modules/gjc-herdr/dist/extension.js`가 존재하는 것이다.
 4. **Sidebar 설정**: 아래 "Sidebar 설정" 절대로 `~/.config/herdr/config.toml`에 두 행만 추가한다. 기존 행은 지우지 않는다. 파일이 없거나 `[ui.sidebar.agents]`가 없으면 그 섹션만 새로 만든다.
 5. **표시 확인** (설치됨 ≠ 로드됨 ≠ 표시됨):
    - 플러그인이 로드되기 전 실행 중이던 GJC는 종료 후 **새로 시작**한다.
@@ -109,7 +121,8 @@ gjc
 | metadata | 모델 변경, `/rename` 갱신, native·다른 source의 키 보존, 오래된 seq 거부 확인 |
 | 실제 sidebar | 사용자 설정에서 native 행을 보존하고 두 custom 행 추가. 사용자 제공 화면으로 최종 표시 확인 |
 | provider | 기존 `cliproxyapi/glm-5.3`과 사용자 기본 모델 `cliproxyapi/gpt-6.1-sol` 각각 인증·실제 추론 1회 성공 |
-| 프롬프트 전달 (0.2.0) | GJC 0.18.7·Herdr 0.9.3, 격리 plugin registry에 설치한 로컬 build로 두 pane 실제 확인: `/herdr-send`(수락)·`--wait`+agent 이름(완료)·모델의 `herdr_send` 도구 호출·`--raw` 각각 받는 쪽 실제 응답, GJC가 종료된 shell pane 대상은 무전송 오류, 세 token 발행·정상 종료 clear. 작업 중 대상의 추가 프롬프트 처리와 다른 cwd에서의 session ID 지정 전달은 공식 CLI로 확인. Git tag 설치본으로는 아직 확인하지 않음 |
+| 프롬프트 전달 (0.2.0) | GJC 0.18.7·Herdr 0.9.3, 격리 plugin registry에 설치한 로컬 build로 두 pane 실제 확인: `/herdr-send`(수락)·`--wait`+agent 이름(완료)·모델의 `herdr_send` 도구 호출·`--raw` 각각 받는 쪽 실제 응답, GJC가 종료된 shell pane 대상은 무전송 오류, 세 token 발행·정상 종료 clear. 작업 중 대상의 추가 프롬프트 처리와 다른 cwd에서의 session ID 지정 전달은 공식 CLI로 확인. 실제 사용자 환경의 `#v0.2.0` Git 설치본(같은 dist sha256)으로는 로드·session ID token·자기 전송 거절·입력 오류 처리·정상 종료 clear까지 확인했고, 두 pane 실제 전달은 다시 하지 않음 |
+| 최신 설치·업데이트 | 격리 registry에서 tag 없는 명령이 `main`(= `v0.2.0` commit)을 설치함을 확인. 이전 commit에 고정된 설치는 같은 명령 재실행·`--force`로 바뀌지 않고, 제거 후 설치하면 최신으로 바뀜을 확인(다른 plugin 유지) |
 | 개발 검증 | typecheck·Bun 1.4.2 고정 build·단위 테스트 15개(metadata 5, 전달 10) |
 
 화면 검증은 최종 screenshot 기준이며 모든 UI 전환의 자동 녹화가 아니다. Provider 검증은 위 경로 2개에 한정하며 모든 provider·OAuth 계정이나 다른 runtime 환경의 성공을 보장하지 않는다. Native reporter 대체·권한 위임, 플러그인 주도 fixed-file cold resume, cwd/context 통계, pane layout 제어는 제공하지 않는다.
@@ -125,4 +138,4 @@ npm run check
 npm test               # mock 기반 단위 테스트; 실제 Herdr E2E가 아님
 ```
 
-`dist/extension.js`는 Git에서 설치될 때 그대로 사용되므로 source와 함께 commit한다. Bun은 의존성 설치 시 build script를 실행하지 않는다. 번들 바이트는 Bun 버전에 따라 달라지므로 build는 `package.json`의 `engines.bun`(1.4.2)으로 고정되며, 다른 버전이면 `scripts/build.ts`가 중단한다. `npm run build`/`bun run build`는 상위 디렉터리의 `node_modules/.bin/bun`을 먼저 잡을 수 있으므로 `bun scripts/build.ts`로 직접 실행한다. 릴리스는 `package.json` version과 같은 tag(`v0.2.0`)로 고정한다. 라이선스는 MIT(`LICENSE`)다. 로컬 검증 기록·screenshot·workflow 원장·credentials·환경 의존 통합 검증 도구는 공개하지 않는다.
+`dist/extension.js`는 Git에서 설치될 때 그대로 사용되므로 source와 함께 commit한다. Bun은 의존성 설치 시 build script를 실행하지 않는다. 번들 바이트는 Bun 버전에 따라 달라지므로 build는 `package.json`의 `engines.bun`(1.4.2)으로 고정되며, 다른 버전이면 `scripts/build.ts`가 중단한다. `npm run build`/`bun run build`는 상위 디렉터리의 `node_modules/.bin/bun`을 먼저 잡을 수 있으므로 `bun scripts/build.ts`로 직접 실행한다. tag 없는 설치가 `main`을 가져오므로 `main`에는 source·`dist`·version이 일치하는 release commit만 push하고, 미완성 작업은 별도 branch에서 한다. 각 release는 `package.json` version과 같은 tag(예: `v0.2.0`)도 함께 push한다. 라이선스는 MIT(`LICENSE`)다. 로컬 검증 기록·screenshot·workflow 원장·credentials·환경 의존 통합 검증 도구는 공개하지 않는다.
