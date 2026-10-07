@@ -19668,11 +19668,712 @@ function registerSendFeatures(api, herdrBin, senderPane) {
   });
 }
 
+// src/call.ts
+import { randomUUID as randomUUID3 } from "crypto";
+var PANE_ID2 = /^w[^:\s]+:p[^:\s]+$/;
+var LOOKUP_TIMEOUT_MS = 3000;
+var READ_TIMEOUT_MS = 3000;
+var CALL_BUDGET_MS = 60000;
+var READ_RESERVE_MS = 3000;
+var READ_LINES = "200";
+var USAGE2 = "Usage: /herdr-call <pane-id-or-unique-agent-name> <text>";
+
+class CallFailure extends Error {
+  partial;
+  constructor(partial) {
+    super(partial.error.message);
+    this.partial = partial;
+  }
+}
+function record2(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value) ? value : undefined;
+}
+function parseJson2(text) {
+  try {
+    return record2(JSON.parse(text));
+  } catch {
+    return;
+  }
+}
+function errorMessage2(error) {
+  return error instanceof Error ? error.message : String(error);
+}
+function isMissingExecutable2(error) {
+  return error?.code === "ENOENT";
+}
+function stderrEnvelope(result) {
+  return record2(parseJson2(result.stderr)?.error);
+}
+async function runHerdr(deps, args, timeoutMs, signal, phase) {
+  if (timeoutMs <= 0) {
+    throw new CallFailure({
+      status: "not_sent",
+      delivery: "not_sent",
+      error: { code: "timeout", message: "Call budget exhausted." }
+    });
+  }
+  let result;
+  try {
+    result = await deps.exec(deps.herdrBin, args, {
+      timeout: timeoutMs,
+      signal
+    });
+  } catch (error) {
+    if (signal?.aborted) {
+      throw new CallFailure({
+        status: phase === "prompt" ? "uncertain" : "not_sent",
+        delivery: phase === "prompt" ? "unknown" : "not_sent",
+        error: { code: "aborted", message: "Call aborted." }
+      });
+    }
+    throw new CallFailure({
+      status: "not_sent",
+      delivery: "not_sent",
+      error: {
+        code: "herdr_unavailable",
+        message: isMissingExecutable2(error) ? `Herdr CLI is not available at ${deps.herdrBin}: ${errorMessage2(error)}` : `Herdr CLI is unavailable: ${errorMessage2(error)}`
+      }
+    });
+  }
+  if (result.killed) {
+    if (phase === "prompt") {
+      throw new CallFailure({
+        status: "uncertain",
+        delivery: "unknown",
+        error: {
+          code: signal?.aborted ? "aborted" : "timeout",
+          message: signal?.aborted ? "Local wait aborted; the remote agent may still be running." : "Prompt wait timed out; submission state is unknown and the remote agent may still be running."
+        }
+      });
+    }
+    throw new CallFailure({
+      status: phase === "read" ? "read_failed" : "not_sent",
+      delivery: phase === "read" ? "submitted" : "not_sent",
+      error: { code: "timeout", message: `Herdr ${args[1]} timed out.` }
+    });
+  }
+  return result;
+}
+function notSentEnvelope(result) {
+  const error = stderrEnvelope(result);
+  const herdrCode = typeof error?.code === "string" ? error.code : undefined;
+  const message = typeof error?.message === "string" ? error.message : result.stderr.trim() || `exit ${result.code}`;
+  if (herdrCode === "agent_not_found" || herdrCode === "pane_not_found") {
+    return new CallFailure({
+      status: "not_sent",
+      delivery: "not_sent",
+      error: {
+        code: "target_not_found",
+        message: `Herdr target not found: ${message}`,
+        herdrCode,
+        exitCode: result.code
+      }
+    });
+  }
+  return new CallFailure({
+    status: "not_sent",
+    delivery: "not_sent",
+    error: {
+      code: "herdr_unavailable",
+      message: `Herdr is unavailable: ${message}`,
+      herdrCode,
+      exitCode: result.code
+    }
+  });
+}
+function usageFailure(result, phase) {
+  return new CallFailure({
+    status: "not_sent",
+    delivery: "not_sent",
+    error: {
+      code: "cli_usage",
+      message: `Herdr ${phase} rejected the invocation (usage error); check the herdr version.`,
+      exitCode: result.code
+    }
+  });
+}
+async function resolveTargetPaneId(deps, target, deadline, signal) {
+  if (PANE_ID2.test(target))
+    return target;
+  const result = await runHerdr(deps, ["agent", "list"], Math.min(LOOKUP_TIMEOUT_MS, deadline - Date.now()), signal, "lookup");
+  if (result.code === 2)
+    throw usageFailure(result, "agent list");
+  if (result.code !== 0)
+    throw notSentEnvelope(result);
+  const agents = record2(record2(parseJson2(result.stdout))?.result)?.agents;
+  if (!Array.isArray(agents)) {
+    throw new CallFailure({
+      status: "not_sent",
+      delivery: "not_sent",
+      error: {
+        code: "protocol_error",
+        message: "Herdr agent list returned an invalid response.",
+        exitCode: result.code
+      }
+    });
+  }
+  const matches = agents.map(record2).filter((row) => row?.name === target);
+  if (matches.length === 0) {
+    throw new CallFailure({
+      status: "not_sent",
+      delivery: "not_sent",
+      error: {
+        code: "target_not_found",
+        message: `No Herdr agent is named ${target}; pass an explicit pane ID.`
+      }
+    });
+  }
+  if (matches.length > 1) {
+    throw new CallFailure({
+      status: "not_sent",
+      delivery: "not_sent",
+      error: {
+        code: "target_ambiguous",
+        message: `Herdr agent name ${target} matches ${matches.length} panes; pass an explicit pane ID.`
+      }
+    });
+  }
+  const paneId = matches[0]?.pane_id;
+  if (typeof paneId !== "string" || !paneId) {
+    throw new CallFailure({
+      status: "not_sent",
+      delivery: "not_sent",
+      error: {
+        code: "protocol_error",
+        message: "Herdr agent list entry has no pane ID."
+      }
+    });
+  }
+  return paneId;
+}
+var AGENT_STATES = new Set([
+  "idle",
+  "working",
+  "blocked",
+  "done",
+  "unknown"
+]);
+async function getPreflightAgent(deps, paneId, deadline, signal) {
+  const result = await runHerdr(deps, ["agent", "get", paneId], Math.min(LOOKUP_TIMEOUT_MS, deadline - Date.now()), signal, "lookup");
+  if (result.code === 2)
+    throw usageFailure(result, "agent get");
+  if (result.code !== 0)
+    throw notSentEnvelope(result);
+  const response = record2(record2(parseJson2(result.stdout))?.result);
+  const agent = record2(response?.agent);
+  if (response?.type !== "agent_info" || typeof agent?.pane_id !== "string" || !agent.pane_id || typeof agent.terminal_id !== "string" || !agent.terminal_id || typeof agent.agent_status !== "string" || !AGENT_STATES.has(agent.agent_status)) {
+    throw new CallFailure({
+      status: "not_sent",
+      delivery: "not_sent",
+      error: {
+        code: "protocol_error",
+        message: "Herdr agent get returned an invalid response.",
+        exitCode: result.code
+      }
+    });
+  }
+  const launchPending = agent.launch_pending;
+  if (launchPending !== undefined && typeof launchPending !== "boolean") {
+    throw new CallFailure({
+      status: "not_sent",
+      delivery: "not_sent",
+      error: {
+        code: "protocol_error",
+        message: "Herdr agent get returned an invalid launch_pending value.",
+        exitCode: result.code
+      }
+    });
+  }
+  return {
+    paneId: agent.pane_id,
+    terminalId: agent.terminal_id,
+    state: agent.agent_status,
+    launchPending: launchPending === true,
+    agentLabel: typeof agent.agent === "string" ? agent.agent : undefined
+  };
+}
+function markerInstruction(requestId) {
+  return `
+
+Answer with the exact token GJC_HERDR_BEGIN_${requestId} on the first line ` + `of your final answer and GJC_HERDR_END_${requestId} on the last line.`;
+}
+function extractMarkedAnswer(capture, requestId) {
+  const id = requestId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const prefix = "[\\s>\u23FA\u25CF\u2022\\-*]*";
+  const begin = new RegExp(`^${prefix}GJC_HERDR_BEGIN_${id}\\s*$`);
+  const end = new RegExp(`^${prefix}GJC_HERDR_END_${id}\\s*$`);
+  const lines = capture.split(/\r?\n/);
+  let beginIndex = -1;
+  let endIndex = -1;
+  for (let index = 0;index < lines.length; index++) {
+    const line = lines[index];
+    if (begin.test(line)) {
+      if (beginIndex !== -1)
+        return;
+      beginIndex = index;
+    } else if (end.test(line)) {
+      if (beginIndex === -1 || endIndex !== -1)
+        return;
+      endIndex = index;
+    }
+  }
+  if (beginIndex === -1 || endIndex === -1 || endIndex <= beginIndex) {
+    return;
+  }
+  const body = lines.slice(beginIndex + 1, endIndex);
+  if (!body.some((line) => line.trim()))
+    return;
+  const indents = body.filter((line) => line.trim()).map((line) => /^[ \t]*/.exec(line)[0]);
+  const common = indents.reduce((a, b) => b.length < a.length ? b : a);
+  return body.map((line) => line.slice(common.length)).join(`
+`);
+}
+function promptFailure(result, agentLabel) {
+  const error = stderrEnvelope(result);
+  const herdrCode = typeof error?.code === "string" ? error.code : undefined;
+  const message = typeof error?.message === "string" ? error.message : result.stderr.trim() || `exit ${result.code}`;
+  const exitCode = result.code;
+  switch (herdrCode) {
+    case "agent_not_ready":
+      return new CallFailure({
+        status: "not_sent",
+        delivery: "not_sent",
+        error: {
+          code: "target_not_ready",
+          message: `Herdr rejected the prompt before any input: ${message}` + (agentLabel === "gjc" ? " (Target looks like a GJC session; use herdr_send for those.)" : ""),
+          herdrCode,
+          exitCode
+        }
+      });
+    case "agent_blocked":
+      return new CallFailure({
+        status: "blocked",
+        delivery: "not_sent",
+        error: {
+          code: "agent_blocked",
+          message: `Target is blocked waiting for a user decision; no input was sent: ${message}`,
+          herdrCode,
+          exitCode
+        }
+      });
+    case "agent_not_found":
+    case "pane_not_found":
+      return new CallFailure({
+        status: "not_sent",
+        delivery: "not_sent",
+        error: {
+          code: "target_not_found",
+          message: `Herdr target not found at prompt time: ${message}`,
+          herdrCode,
+          exitCode
+        }
+      });
+    case "agent_prompt_stalled":
+      return new CallFailure({
+        status: "stalled",
+        delivery: "submitted",
+        error: {
+          code: "agent_prompt_stalled",
+          message: `Prompt was submitted but no agent activity was observed: ${message}`,
+          herdrCode,
+          exitCode
+        }
+      });
+    case "timeout":
+      return new CallFailure({
+        status: "uncertain",
+        delivery: "unknown",
+        error: {
+          code: "timeout",
+          message: `Prompt wait timed out; submission state is unknown and the remote agent may still be running: ${message}`,
+          herdrCode,
+          exitCode
+        }
+      });
+    default:
+      return new CallFailure({
+        status: "uncertain",
+        delivery: "unknown",
+        error: {
+          code: "prompt_failed",
+          message: `Prompt failed after possible submission: ${message}`,
+          herdrCode,
+          exitCode
+        }
+      });
+  }
+}
+async function callRegisteredAgent(deps, request, senderPane, signal) {
+  const startedAt = Date.now();
+  const deadline = startedAt + CALL_BUDGET_MS;
+  const requestId = randomUUID3();
+  const finish = (partial) => ({
+    ok: false,
+    requestId,
+    elapsedMs: Date.now() - startedAt,
+    ...partial
+  });
+  const target = request.target.trim();
+  if (!target) {
+    return finish({
+      status: "not_sent",
+      delivery: "not_sent",
+      error: { code: "invalid_request", message: "Target is required." }
+    });
+  }
+  if (target.startsWith("-")) {
+    return finish({
+      status: "not_sent",
+      delivery: "not_sent",
+      error: {
+        code: "invalid_request",
+        message: "Target must be a pane ID or agent name, not an option."
+      }
+    });
+  }
+  if (!request.text.trim()) {
+    return finish({
+      status: "not_sent",
+      delivery: "not_sent",
+      error: { code: "invalid_request", message: "Prompt text must not be empty." }
+    });
+  }
+  if (signal?.aborted) {
+    return finish({
+      status: "not_sent",
+      delivery: "not_sent",
+      error: { code: "aborted", message: "Call aborted before delivery." }
+    });
+  }
+  try {
+    const paneId = await resolveTargetPaneId(deps, target, deadline, signal);
+    if (paneId === senderPane) {
+      return finish({
+        status: "not_sent",
+        delivery: "not_sent",
+        pane: paneId,
+        error: {
+          code: "self_target",
+          message: "Cannot call the current Herdr pane."
+        }
+      });
+    }
+    if (deps.inFlight.has(paneId)) {
+      return finish({
+        status: "not_sent",
+        delivery: "not_sent",
+        pane: paneId,
+        error: {
+          code: "target_busy",
+          message: "Another call to this pane is already in flight here."
+        }
+      });
+    }
+    deps.inFlight.add(paneId);
+    try {
+      const preflight = await getPreflightAgent(deps, paneId, deadline, signal);
+      if (preflight.paneId !== paneId) {
+        return finish({
+          status: "not_sent",
+          delivery: "not_sent",
+          pane: paneId,
+          error: {
+            code: "protocol_error",
+            message: "Herdr agent get returned a different pane than requested."
+          }
+        });
+      }
+      if (preflight.launchPending) {
+        return finish({
+          status: "not_sent",
+          delivery: "not_sent",
+          pane: paneId,
+          state: preflight.state,
+          error: {
+            code: "target_not_ready",
+            message: "Target agent launch is still pending."
+          }
+        });
+      }
+      if (preflight.state === "blocked") {
+        return finish({
+          status: "blocked",
+          delivery: "not_sent",
+          pane: paneId,
+          state: preflight.state,
+          error: {
+            code: "agent_blocked",
+            message: "Target is blocked waiting for a user decision; no input was sent."
+          }
+        });
+      }
+      if (preflight.state === "working") {
+        return finish({
+          status: "not_sent",
+          delivery: "not_sent",
+          pane: paneId,
+          state: preflight.state,
+          error: {
+            code: "target_busy",
+            message: "Target agent is already working; not interrupted."
+          }
+        });
+      }
+      if (preflight.state === "unknown") {
+        return finish({
+          status: "not_sent",
+          delivery: "not_sent",
+          pane: paneId,
+          state: preflight.state,
+          error: {
+            code: "target_state_unknown",
+            message: "Target agent state is unknown; not prompted."
+          }
+        });
+      }
+      const promptBudget = deadline - Date.now() - READ_RESERVE_MS;
+      if (promptBudget <= 0) {
+        return finish({
+          status: "not_sent",
+          delivery: "not_sent",
+          pane: paneId,
+          state: preflight.state,
+          error: {
+            code: "timeout",
+            message: "Call budget exhausted before the prompt."
+          }
+        });
+      }
+      const patchedText = request.text + markerInstruction(requestId);
+      const promptArgs = [
+        "agent",
+        "prompt",
+        paneId,
+        patchedText,
+        "--wait",
+        "--timeout",
+        String(promptBudget)
+      ];
+      const prompt = await runHerdr(deps, [...promptArgs], deadline - Date.now(), signal, "prompt");
+      if (prompt.code === 2)
+        throw usageFailure(prompt, "agent prompt");
+      if (prompt.code !== 0) {
+        throw promptFailure(prompt, preflight.agentLabel);
+      }
+      const response = record2(record2(parseJson2(prompt.stdout))?.result);
+      const agent = record2(response?.agent);
+      if (response?.type !== "agent_prompted" || typeof agent?.agent_status !== "string" || !AGENT_STATES.has(agent.agent_status) || agent.pane_id !== paneId || agent.terminal_id !== preflight.terminalId) {
+        return finish({
+          status: "uncertain",
+          delivery: "unknown",
+          pane: paneId,
+          error: {
+            code: "protocol_error",
+            message: "Prompt response did not confirm the expected pane; answer recovery skipped.",
+            exitCode: prompt.code
+          }
+        });
+      }
+      const settled = agent.agent_status;
+      if (settled === "blocked") {
+        return finish({
+          status: "blocked",
+          delivery: "submitted",
+          pane: paneId,
+          state: settled,
+          error: {
+            code: "agent_blocked",
+            message: "Target is now blocked waiting for a user decision; answer recovery skipped."
+          }
+        });
+      }
+      if (settled !== "idle" && settled !== "done") {
+        return finish({
+          status: "uncertain",
+          delivery: "unknown",
+          pane: paneId,
+          state: settled,
+          error: {
+            code: "protocol_error",
+            message: `Prompt settled in unexpected state ${settled}.`
+          }
+        });
+      }
+      const readRemaining = deadline - Date.now();
+      if (readRemaining <= 0) {
+        return finish({
+          status: "uncertain",
+          delivery: "submitted",
+          pane: paneId,
+          state: settled,
+          error: {
+            code: "timeout",
+            message: "Prompt settled but no read budget remained."
+          }
+        });
+      }
+      const read = await runHerdr(deps, ["agent", "read", paneId, "--source", "recent-unwrapped", "--lines", READ_LINES], Math.min(READ_TIMEOUT_MS, readRemaining), signal, "read");
+      if (read.code !== 0) {
+        const error = stderrEnvelope(read);
+        return finish({
+          status: "read_failed",
+          delivery: "submitted",
+          pane: paneId,
+          state: settled,
+          error: {
+            code: "read_failed",
+            message: `Prompt was delivered but the answer read failed: ${typeof error?.message === "string" ? error.message : read.stderr.trim() || `exit ${read.code}`}`,
+            herdrCode: typeof error?.code === "string" ? error.code : undefined,
+            exitCode: read.code
+          }
+        });
+      }
+      const capture = read.stdout;
+      if (!capture.trim()) {
+        return finish({
+          status: "response_unverified",
+          delivery: "submitted",
+          pane: paneId,
+          state: settled,
+          error: {
+            code: "empty_response",
+            message: "Target read returned empty output."
+          }
+        });
+      }
+      const answer = extractMarkedAnswer(capture, requestId);
+      if (answer === undefined) {
+        return finish({
+          status: "response_unverified",
+          delivery: "submitted",
+          pane: paneId,
+          state: settled,
+          capture,
+          error: {
+            code: "response_unverified",
+            message: "Answer markers for this request were not found in the captured screen; the capture below is unverified target output."
+          }
+        });
+      }
+      return {
+        ok: true,
+        status: "answered",
+        delivery: "submitted",
+        requestId,
+        pane: paneId,
+        state: settled,
+        answer,
+        elapsedMs: Date.now() - startedAt
+      };
+    } finally {
+      deps.inFlight.delete(paneId);
+    }
+  } catch (error) {
+    if (error instanceof CallFailure) {
+      return finish(error.partial);
+    }
+    return finish({
+      status: "uncertain",
+      delivery: "unknown",
+      error: {
+        code: "prompt_failed",
+        message: errorMessage2(error)
+      }
+    });
+  }
+}
+function parseCallCommandArgs(args) {
+  const rest = args.replace(/^\s+/, "");
+  if (rest.startsWith("-"))
+    return USAGE2;
+  const match = /^(\S+)(?:\s([\s\S]*))?$/.exec(rest);
+  if (!match)
+    return USAGE2;
+  return { target: match[1], text: match[2] ?? "" };
+}
+function describeCallResult(result) {
+  const header = `herdr-call ${result.status} (delivery ${result.delivery}, request ${result.requestId}${result.pane ? `, pane ${result.pane}` : ""})`;
+  if (result.ok && result.status === "answered") {
+    return `${header}
+
+${result.answer}`;
+  }
+  const parts = [header];
+  if (result.error) {
+    parts.push(`${result.error.message}${result.error.herdrCode ? ` (herdr ${result.error.herdrCode})` : ""}`);
+  }
+  if (result.capture !== undefined) {
+    parts.push(`Unverified capture (partial target screen, not a confirmed answer):
+${result.capture}`);
+  }
+  return parts.join(`
+`);
+}
+function registerCallFeatures(api, herdrBin, senderPane) {
+  const deps = {
+    exec: api.exec.bind(api),
+    herdrBin,
+    inFlight: new Set
+  };
+  function summarize(result) {
+    api.logger.info("herdr-call finished", {
+      requestId: result.requestId,
+      pane: result.pane,
+      status: result.status,
+      delivery: result.delivery,
+      elapsedMs: result.elapsedMs,
+      code: result.error?.code
+    });
+  }
+  api.registerCommand("herdr-call", {
+    description: "Call a Herdr-registered agent in another pane and get its answer back: <pane-id-or-unique-agent-name> <text>",
+    handler: async (args) => {
+      const request = parseCallCommandArgs(args);
+      const result = typeof request === "string" ? {
+        ok: false,
+        status: "not_sent",
+        delivery: "not_sent",
+        requestId: "",
+        elapsedMs: 0,
+        error: { code: "invalid_request", message: request }
+      } : await callRegisteredAgent(deps, request, senderPane);
+      summarize(result);
+      const message = describeCallResult(result);
+      await api.sendMessage({
+        customType: "herdr-call",
+        content: message,
+        display: true,
+        details: result
+      }, { triggerTurn: false });
+    }
+  });
+  const { z } = api.zod;
+  api.registerTool({
+    name: "herdr_agent_call",
+    label: "Herdr Agent Call",
+    description: "Call a Herdr-registered agent (Claude Code, Codex, Copilot, Gemini, ...) in another Herdr pane and get its answer text back. " + "`target` must be an explicit Herdr pane ID or a name that resolves to exactly one agent; the target must be observed idle/done, " + "and Herdr's own known-agent/foreground gate decides finally whether the prompt is sent (zero input on rejection). " + "One prompt with a bounded wait (60s total budget) and one bounded screen read (200 lines); the answer is recovered from " + "per-request marker lines, and anything less is returned as an unverified capture instead of a success. " + "No remote approvals, key presses, or retries are ever sent. For GJC targets use the existing herdr_send tool instead.",
+    parameters: z.object({
+      target: z.string().describe("Target Herdr pane ID (e.g. wC:p2) or unique agent name"),
+      text: z.string().describe("Prompt text to deliver verbatim")
+    }),
+    async execute(_toolCallId, params, signal) {
+      const result = await callRegisteredAgent(deps, { target: params.target, text: params.text }, senderPane, signal);
+      summarize(result);
+      return {
+        content: [{ type: "text", text: describeCallResult(result) }],
+        details: result,
+        isError: !result.ok
+      };
+    }
+  });
+}
+
 // src/extension.ts
 function herdrMetadata(api) {
   api.logger.info("gjc-herdr extension loaded");
   const pane = resolveHerdrPaneEnvironment({ env: { ...process.env } });
   registerSendFeatures(api, pane?.binPath ?? "herdr", pane?.paneId ?? process.env.HERDR_PANE_ID);
+  registerCallFeatures(api, pane?.binPath ?? "herdr", pane?.paneId ?? process.env.HERDR_PANE_ID);
   if (!pane)
     return;
   const report = createReporter(api.exec.bind(api), pane.paneId, pane.binPath);
