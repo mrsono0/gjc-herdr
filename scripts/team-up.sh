@@ -56,15 +56,22 @@ retry() { # 감지·보고 지연을 기다리며 명령을 반복
 }
 
 # --- 팀장(이 pane) ---
-retry claim_name "$HERDR_PANE_ID" "$LEAD_NAME"
-herdr pane rename "$HERDR_PANE_ID" "$LEAD_LABEL" >/dev/null 2>&1
+# 이 pane의 실제 cwd가 프로젝트 안일 때, 그리고 이름을 이 pane이 확보했을 때만 label을 바꾼다.
+# (다른 프로젝트 pane에서 실행되거나 이름이 다른 pane 소유면 이름·pane label·작업공간 label 모두 건드리지 않는다)
+pane_cwd="$(herdr pane get "$HERDR_PANE_ID" 2>/dev/null | jget result.pane.cwd)"
+case "$pane_cwd/" in "$ROOT"/*) ;; *) echo "pane $HERDR_PANE_ID is not in $ROOT; nothing changed" >&2; exit 0 ;; esac
 
-if [ -n "${HERDR_WORKSPACE_ID:-}" ]; then
-	cur="$(herdr workspace get "$HERDR_WORKSPACE_ID" 2>/dev/null | jget result.workspace.label)"
-	# 비었거나 Herdr가 폴더명으로 자동 부여한 기본값일 때만 바꾼다(사용자가 정한 이름은 유지)
-	if [ -z "$cur" ] || [ "$cur" = "$(basename "$ROOT")" ]; then
-		herdr workspace rename "$HERDR_WORKSPACE_ID" "$WS_LABEL" >/dev/null 2>&1
+if retry claim_name "$HERDR_PANE_ID" "$LEAD_NAME"; then
+	herdr pane rename "$HERDR_PANE_ID" "$LEAD_LABEL" >/dev/null 2>&1
+	if [ -n "${HERDR_WORKSPACE_ID:-}" ]; then
+		cur="$(herdr workspace get "$HERDR_WORKSPACE_ID" 2>/dev/null | jget result.workspace.label)"
+		# 비었거나 Herdr가 폴더명으로 자동 부여한 기본값일 때만 바꾼다(사용자가 정한 이름은 유지)
+		if [ -z "$cur" ] || [ "$cur" = "$(basename "$ROOT")" ]; then
+			herdr workspace rename "$HERDR_WORKSPACE_ID" "$WS_LABEL" >/dev/null 2>&1
+		fi
 	fi
+else
+	echo "agent name '$LEAD_NAME' not claimed by $HERDR_PANE_ID; labels left unchanged" >&2
 fi
 
 [ "$mode" = "--spawn" ] || exit 0
