@@ -76,8 +76,30 @@ pane="$(herdr pane split --current --direction right --cwd "$ROOT" --no-focus 2>
 [ -n "$pane" ] || { echo "pane split failed" >&2; exit 1; }
 herdr pane rename "$pane" "$MATE_LABEL" >/dev/null 2>&1
 herdr pane run "$pane" gjc >/dev/null 2>&1 || { echo "pane run failed for $pane" >&2; exit 1; }
-if retry claim_name "$pane" "$MATE_NAME"; then
-	echo "spawned $MATE_NAME at $pane (세션 이름은 GJC 입력창에서 /rename '$MATE_LABEL' 로 직접 맞추세요)"
-else
+if ! retry claim_name "$pane" "$MATE_NAME"; then
 	echo "spawned pane $pane but agent name was not claimed within the retry window" >&2
+	exit 1
+fi
+echo "spawned $MATE_NAME at $pane"
+
+# 사이드바는 pane label이 아니라 GJC 세션 이름을 보인다. GJC가 idle이고 플러그인 session_id token이
+# 발행된 뒤(= 세션이 시작되어 입력을 받을 수 있음)에만 /rename을 입력하고, 아니면 수동 안내만 남긴다.
+mate_ready() {
+	herdr pane get "$pane" 2>/dev/null | python3 -c 'import sys,json
+p=json.load(sys.stdin)["result"]["pane"]
+sys.exit(0 if p.get("agent_status")=="idle" and p.get("tokens",{}).get("gjc_herdr_session_id") else 1)' 2>/dev/null
+}
+mate_renamed() {
+	[ "$(herdr pane get "$pane" 2>/dev/null | jget result.pane.tokens.gjc_herdr_session)" = "$MATE_LABEL" ]
+}
+if retry mate_ready; then
+	herdr pane send-text "$pane" "/rename $MATE_LABEL" >/dev/null 2>&1
+	herdr pane send-keys "$pane" enter >/dev/null 2>&1
+	if retry mate_renamed; then
+		echo "session renamed to '$MATE_LABEL'"
+	else
+		echo "typed /rename but the session name token did not update; check the GJC input box" >&2
+	fi
+else
+	echo "GJC not ready for input; run /rename '$MATE_LABEL' in the GJC input box manually" >&2
 fi
