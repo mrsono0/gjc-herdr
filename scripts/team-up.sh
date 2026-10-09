@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # gjc-herdr 팀 구성 보조. 기본: 이 pane의 이름·label만 맞춘다(pane 생성 없음).
-#   scripts/team-up.sh --hook    SessionStart hook용. 즉시 반환하고 백그라운드에서 기본 동작을 수행
+#   scripts/team-up.sh --hook    SessionStart hook용. 즉시 반환하고 백그라운드에서 --spawn 동작을 수행
 #   scripts/team-up.sh           기본 동작을 지금 수행
-#   scripts/team-up.sh --spawn   기본 동작 + 팀원 GJC pane이 없을 때만 생성(명시 실행 전용)
+#   scripts/team-up.sh --spawn   기본 동작 + 팀원 GJC가 없으면 띄움(재시작 후 남은 빈 셸 pane은 재사용, 없을 때만 새 pane 생성)
 # 아무것도 덮어쓰지 않는다: 이미 다른 pane이 쓰는 이름은 건드리지 않고, 작업공간 label은 비었거나 폴더명(Herdr 기본값)일 때만 설정한다.
 set -u
 
@@ -26,7 +26,7 @@ command -v herdr >/dev/null || exit 0
 command -v python3 >/dev/null || exit 0
 
 if [ "$mode" = "--hook" ]; then
-	nohup "$0" >/dev/null 2>&1 &
+	nohup "$0" --spawn >/dev/null 2>&1 &
 	exit 0
 fi
 
@@ -82,8 +82,18 @@ if [ -n "$existing" ]; then
 	echo "mate already exists at $existing; nothing spawned"
 	exit 0
 fi
-pane="$(herdr pane split --current --direction right --cwd "$ROOT" --no-focus 2>/dev/null | jget result.pane.pane_id)"
-[ -n "$pane" ] || { echo "pane split failed" >&2; exit 1; }
+# 재시작 후 남은 팀원 pane(label 일치·이 프로젝트 cwd·agent 없음 = 빈 셸)이 있으면 재사용한다.
+pane="$(herdr pane list 2>/dev/null | python3 -c 'import sys,json
+root,ws,label=sys.argv[1:4]
+try: panes=json.load(sys.stdin)["result"]["panes"]
+except Exception: sys.exit(0)
+for p in panes:
+    if p.get("workspace_id")==ws and p.get("label")==label and not p.get("agent") and ((p.get("foreground_cwd") or p.get("cwd") or "").rstrip("/")+"/").startswith(root+"/"):
+        print(p["pane_id"]); break' "$ROOT" "${HERDR_WORKSPACE_ID:-}" "$MATE_LABEL")"
+if [ -z "$pane" ]; then
+	pane="$(herdr pane split --current --direction right --cwd "$ROOT" --no-focus 2>/dev/null | jget result.pane.pane_id)"
+	[ -n "$pane" ] || { echo "pane split failed" >&2; exit 1; }
+fi
 herdr pane rename "$pane" "$MATE_LABEL" >/dev/null 2>&1
 herdr pane run "$pane" gjc >/dev/null 2>&1 || { echo "pane run failed for $pane" >&2; exit 1; }
 if ! retry claim_name "$pane" "$MATE_NAME"; then
