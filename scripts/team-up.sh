@@ -91,7 +91,7 @@ for p in panes:
     if p.get("workspace_id")==ws and p.get("label")==label and not p.get("agent") and ((p.get("foreground_cwd") or p.get("cwd") or "").rstrip("/")+"/").startswith(root+"/"):
         print(p["pane_id"]); break' "$ROOT" "${HERDR_WORKSPACE_ID:-}" "$MATE_LABEL")"
 if [ -z "$pane" ]; then
-	pane="$(herdr pane split --current --direction right --cwd "$ROOT" --no-focus 2>/dev/null | jget result.pane.pane_id)"
+	pane="$(herdr pane split --current --direction down --cwd "$ROOT" --no-focus 2>/dev/null | jget result.pane.pane_id)"
 	[ -n "$pane" ] || { echo "pane split failed" >&2; exit 1; }
 fi
 herdr pane rename "$pane" "$MATE_LABEL" >/dev/null 2>&1
