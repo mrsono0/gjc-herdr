@@ -205,6 +205,8 @@ gjc
 
 ## 개발
 
+> Herdr + 팀장(Claude Code) + 팀원(GJC) 개발 환경과 새 컴퓨터에서의 AI 자동 구축 절차는 [docs/dev-environment.md](docs/dev-environment.md), 환경 점검은 `scripts/check-env.sh`.
+
 ```sh
 git clone https://github.com/mrsono0/gjc-herdr.git
 cd gjc-herdr
