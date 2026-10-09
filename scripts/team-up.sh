@@ -3,7 +3,7 @@
 #   scripts/team-up.sh --hook    SessionStart hook용. 즉시 반환하고 백그라운드에서 기본 동작을 수행
 #   scripts/team-up.sh           기본 동작을 지금 수행
 #   scripts/team-up.sh --spawn   기본 동작 + 팀원 GJC pane이 없을 때만 생성(명시 실행 전용)
-# 아무것도 덮어쓰지 않는다: 이미 다른 pane이 쓰는 이름은 건드리지 않고, 작업공간 label은 비어 있을 때만 설정한다.
+# 아무것도 덮어쓰지 않는다: 이미 다른 pane이 쓰는 이름은 건드리지 않고, 작업공간 label은 비었거나 폴더명(Herdr 기본값)일 때만 설정한다.
 set -u
 
 LEAD_NAME="${GJCH_LEAD_NAME:-gjc-herdr-lead}"
@@ -61,7 +61,10 @@ herdr pane rename "$HERDR_PANE_ID" "$LEAD_LABEL" >/dev/null 2>&1
 
 if [ -n "${HERDR_WORKSPACE_ID:-}" ]; then
 	cur="$(herdr workspace get "$HERDR_WORKSPACE_ID" 2>/dev/null | jget result.workspace.label)"
-	[ -n "$cur" ] || herdr workspace rename "$HERDR_WORKSPACE_ID" "$WS_LABEL" >/dev/null 2>&1
+	# 비었거나 Herdr가 폴더명으로 자동 부여한 기본값일 때만 바꾼다(사용자가 정한 이름은 유지)
+	if [ -z "$cur" ] || [ "$cur" = "$(basename "$ROOT")" ]; then
+		herdr workspace rename "$HERDR_WORKSPACE_ID" "$WS_LABEL" >/dev/null 2>&1
+	fi
 fi
 
 [ "$mode" = "--spawn" ] || exit 0
