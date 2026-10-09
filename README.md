@@ -4,6 +4,36 @@ GJC의 native 상태·세션/resume 처리를 유지하면서 Herdr sidebar에 *
 
 배포 정책: **npm registry에는 발행하지 않는다.** 이 Git 저장소에서 직접 설치한다. 실행 파일 `dist/extension.js`는 저장소에 포함되어 있어 설치 시 build가 필요 없다.
 
+## 새 컴퓨터 빠른 시작 (Herdr + Claude Code 팀장 + GJC 팀원)
+
+Herdr 안에서 Claude Code(팀장)와 GJC(팀원)가 서로 호출하며 개발하는 환경을 clone 한 번으로 구성할 수 있다. AI가 읽고 따를 수 있게 준비되어 있다.
+
+**사람이 할 일**
+
+1. 아래 "필요한 프로그램"을 설치한다.
+2. 저장소를 clone하고 **Herdr pane 안에서** 그 폴더로 들어가 Claude Code를 실행한다.
+   ```sh
+   git clone https://github.com/mrsono0/gjc-herdr.git
+   cd gjc-herdr
+   claude
+   ```
+3. Claude에게 **"안내대로 환경 설정해줘"** 라고 말한다. 루트 `CLAUDE.md`가 자동으로 읽혀, Claude가 `scripts/check-env.sh`(읽기 전용 점검)를 실행하고 부족한 항목만 [docs/dev-environment.md](docs/dev-environment.md) 절차대로 해결한다. `gjc-herdr` 플러그인 설치와 `~/.config/herdr/config.toml` 같은 사용자 설정 변경은 승인을 요청한다.
+4. 설정이 끝나면 Claude를 한 번 재시작한다. `.claude/settings.json`의 SessionStart hook이 `scripts/team-up.sh`를 실행해 팀장(`gjc-herdr-lead`) pane 이름을 정하고 팀원 GJC(`gjc-herdr-mate`) pane을 만든다. `herdr agent list`로 두 agent가 보이면 성공이다.
+
+**필요한 프로그램**
+
+| 프로그램 | 용도 | 설치 | 확인 |
+|---|---|---|---|
+| [Herdr](https://herdr.dev) | agent pane 관리자. 팀 구성과 sidebar 표시의 바탕 (0.9.3에서 검증) | `brew install herdr` 또는 `curl -fsSL https://herdr.dev/install.sh \| sh` | `herdr --version` |
+| [Claude Code CLI](https://docs.claude.com/en/docs/claude-code) | 팀장 (2.1.295에서 사용) | `brew install --cask claude-code@latest` 또는 공식 문서의 설치 방법 | `claude --version` |
+| [GJC (Gajae Code)](https://github.com/Yeachan-Heo/gajae-code) | 팀원이자 이 플러그인의 대상 (0.18.8에서 사용, 설치 검증은 0.18.7) | 해당 저장소의 [설치 문서](https://github.com/Yeachan-Heo/gajae-code/blob/main/docs/install.md)에서 태그된 설치 스크립트를 내려받아 실행 | `gjc --version` |
+| [Bun](https://bun.sh) 1.4.2 | GJC가 Git 플러그인을 설치할 때 필요, build는 1.4.2 고정 | `curl -fsSL https://bun.sh/install \| bash` (특정 버전은 Bun 문서 참조) | `bun --version` |
+| git, python3 | clone, `team-up.sh`의 JSON 처리 | macOS는 보통 기본 포함 또는 `brew install git python` | `git --version`, `python3 --version` |
+| `gjc-herdr` 플러그인 | 모델·세션 표시, `/herdr-send`, `/herdr-call` | 아래 "설치 (한 줄)" | `gjc plugin list --json` |
+| Node.js/npm (개발 시에만) | `npm ci`, 단위 테스트, typecheck | `brew install node` | `npm --version` |
+
+Herdr 밖에서 실행하면 팀 자동 구성과 표시 token이 동작하지 않는다(정상). 설치 상태는 언제든 `scripts/check-env.sh`로 다시 점검할 수 있다. 자세한 구성·대화 방법·문제 해결은 [docs/dev-environment.md](docs/dev-environment.md).
+
 ## 설치 (한 줄)
 
 ```sh

@@ -37,8 +37,8 @@
 
    | 항목 | 해결 |
    |---|---|
-   | `gjc` 없음 | GJC 본체는 이 저장소가 설치하지 않는다. 사용자에게 설치를 요청한다 |
-   | `herdr` 없음 / Herdr pane 밖 | Herdr를 설치하고 **Herdr 안의 pane에서** Claude Code를 실행하도록 안내한다(팀 구성·token 표시는 Herdr 안에서만 동작) |
+   | `gjc` 없음 | GJC 본체는 이 저장소가 설치하지 않는다. README "필요한 프로그램" 표의 링크를 사용자에게 안내해 설치를 요청한다 |
+   | `herdr` 없음 / Herdr pane 밖 | README "필요한 프로그램" 표대로 Herdr를 설치하고 **Herdr 안의 pane에서** Claude Code를 실행하도록 안내한다(팀 구성·token 표시는 Herdr 안에서만 동작) |
    | `bun` 없음 또는 버전 불일치 | GJC plugin 설치에 필요. build는 `package.json`의 `engines.bun`(1.4.2) 고정 |
    | `node_modules` 없음 | `npm ci --ignore-scripts --no-audit --no-fund` (개발·테스트 시) |
    | `team-up.sh` 실행 권한 없음 | `chmod +x scripts/team-up.sh scripts/check-env.sh` |
