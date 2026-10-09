@@ -109,6 +109,22 @@ Claude Code와 Claude 모델을 사용하는 GJC는 서로 다른 실행 환경�
 
 Claude Code가 메인으로 GJC에 작업을 맡기고 답변 본문을 자동으로 받는 기능은 현재 제공하지 않는다. 별도의 요청·응답 연동이 필요하다. GJC의 `--raw`로 Claude Code pane에 직접 입력할 수는 있지만, 기존 입력과 섞일 수 있고 정상 수신·처리를 확인하지 못하므로 자동 회신 채널로 보장하지 않는다.
 
+#### Claude Code 등 플러그인 없는 발신자가 GJC에 보내는 2단계 레시피
+
+플러그인 없이도 공개 CLI만으로 GJC에 프롬프트를 보낼 수 있다(자동 회신 회수는 아니다). 받는 GJC가 이 플러그인을 로드했고 보내는 쪽이 같은 저장소 루트에서 실행한다고 가정한다.
+
+```bash
+# 1) 받는 GJC의 session ID token 읽기 (pane ID 또는 Herdr agent 이름)
+herdr agent get <name> | python3 -c "import sys,json;print(json.load(sys.stdin)['result']['agent']['tokens']['gjc_herdr_session_id'])"
+# 2) 공식 SDK로 전달 (--wait 생략하면 수락만 확인)
+gjc sdk session send <session-id> --text "요청" --wait --timeout-ms 150000
+```
+
+- 받는 쪽이 작업 중이어도 진행 중인 turn에 끼어들어 처리된다(실측: 40초 도구 실행 중 보낸 메시지가 약 5초에 완료. 측정 1회·한 가지 경우). `pane send-text`+`alt+q` 대기열은 turn 종료까지 밀릴 수 있어 이 경로와 다르다.
+- 슬래시 명령(`/rename` 등)은 일반 프롬프트로 처리되어 실행되지 않는다.
+- token이 없는 GJC(플러그인 미로드)는 `gjc sdk session list`와 pane의 foreground PID를 직접 대조해야 한다.
+- 받는 쪽이 승인·질문 창에서 `blocked`이면 먼저 사용자에게 알린다(이 플러그인의 `herdr_send`는 이때 보내지 않는다).
+
 ### 사용법
 
 ```text
@@ -129,7 +145,7 @@ Claude Code가 메인으로 GJC에 작업을 맡기고 답변 본문을 자동�
 
 - `gjc`가 보내는 쪽 GJC 프로세스의 `PATH`에 있어야 한다. 없으면 `gjc CLI not found on PATH`.
 - 같은 컴퓨터·같은 사용자·같은 Herdr server만 대상이다. token이 없는 받는 쪽은 보내는 쪽과 같은 저장소에서 실행 중일 때만 찾는다(전역 검색 없음).
-- 재시도·중복 방지·승인 대기(blocked) 감지·여러 대상 동시 전달은 없다. 오류·timeout 후 자동 재전송이나 raw 전환을 하지 않는다.
+- 받는 쪽이 승인·질문 창에서 `blocked`이면 SDK·raw 모두 보내지 않고 `not_sent`(v0.3.1부터, 단위 테스트 기준이며 실제 blocked GJC 확인은 하지 않음)로 알린다. 재시도·중복 방지·여러 대상 동시 전달은 없다. 오류·timeout 후 자동 재전송이나 raw 전환을 하지 않는다.
 - 이 전달(`herdr_send`) 경로는 Herdr의 `herdr agent prompt`를 사용하지 않는다. Herdr 0.9.3은 알려진 agent 종류만 받으며 `gjc`는 해당되지 않는다([herdrdev/herdr#4732](https://github.com/herdrdev/herdr/issues/4732)). 감지 에이전트 호출은 아래 `/herdr-call` 절이 담당한다.
 
 ## 감지 agent 호출 (v0.3.0)
@@ -183,7 +199,7 @@ gjc
 | 최신 설치·업데이트 | 격리 registry에서 tag 없는 명령이 `main`(= `v0.2.0` commit)을 설치함을 확인. 이전 commit에 고정된 설치는 같은 명령 재실행·`--force`로 바뀌지 않고, 제거 후 설치하면 최신으로 바뀜을 확인(다른 plugin 유지) |
 | marketplace 설치 (미지원) | GJC 0.18.7에서 실험됨: `.claude-plugin/marketplace.json` catalog로 `marketplace add`·`discover`·`install`·`uninstall`은 동작하지만, marketplace 설치는 `plugins/cache/plugins/…` 복사본으로만 존재하고 session의 extension loader는 `plugins/package.json` + `plugins/node_modules`만 읽어서 `gjc.extensions`가 로드되지 않음(같은 격리 root에서 git 설치 대조군은 token 발행). catalog는 되돌림(22d8076). 근거 `.local/verification/marketplace-20261006/`
 | 감지 agent 호출 (0.3.0) | GJC 0.18.7·Herdr 0.9.3, 로컬 build로 실제 감지 Claude Code(v2.1.292) 대상 실증: 도구·명령 두 경로 모두 표식 답변 본문 회수(`answered`), reported-only·미존재 대상 `not_sent`(입력 0회), 사전 `blocked` 무전송, 장문 과제 `timeout`→원격 계속 실행, 파일 fallback 실측 — 문서화된 **호출자 2단 절차**(제품 코드 아님): 경로만 답변받아 회수한 뒤 호출자가 파일을 구간별로 읽어 1–170행 누락 없이 확인. stalled·전송 후 blocked는 실측 미재현(단위 매핑만). 감지 제품 1종(Claude Code) 실측. 근거 `.local/`(비공개) |
-| 개발 검증 | typecheck·Bun 1.4.2 고정 build·단위 테스트 32개(metadata 5, 전달 10, 호출 17) |
+| 개발 검증 | typecheck·Bun 1.4.2 고정 build·단위 테스트 33개(metadata 5, 전달 11, 호출 17) |
 
 화면 검증은 최종 screenshot 기준이며 모든 UI 전환의 자동 녹화가 아니다. Provider 검증은 위 경로 2개에 한정하며 모든 provider·OAuth 계정이나 다른 runtime 환경의 성공을 보장하지 않는다. Native reporter 대체·권한 위임, 플러그인 주도 fixed-file cold resume, cwd/context 통계, pane layout 제어는 제공하지 않는다. `이름@마켓플레이스` 형태의 marketplace 설치도 지원하지 않는다(위 표 참고).
 

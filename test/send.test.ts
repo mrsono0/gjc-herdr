@@ -297,6 +297,31 @@ test("self delivery is refused before transport in both modes", async () => {
 	}
 });
 
+test("a blocked target refuses delivery in both modes and sends nothing", async () => {
+	for (const raw of [false, true]) {
+		const { deps, count } = fakeExec({
+			"herdr pane get": () =>
+				ok({
+					result: {
+						pane: {
+							pane_id: "wE:p2",
+							agent_status: "blocked",
+							tokens: { [SESSION_ID_KEY]: TARGET },
+						},
+					},
+				}),
+		});
+		const result = await deliverPrompt(deps, { pane: "wE:p2", text: "x", raw }, SENDER);
+		assert.equal(result.ok, false);
+		assert.equal(result.status, "not_sent");
+		assert.match(result.error ?? "", /blocked/);
+		assert.equal(
+			count("gjc send") + count("herdr pane send-text") + count("herdr pane send-keys"),
+			0,
+		);
+	}
+});
+
 test("SDK send outcomes are classified without retries", async () => {
 	const enoent = Object.assign(
 		new Error('Executable not found in $PATH: "gjc"'),

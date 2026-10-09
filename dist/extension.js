@@ -19386,7 +19386,11 @@ async function resolveTargetPane(deps, target) {
   if (typeof pane?.pane_id !== "string" || !pane.pane_id) {
     throw new Error("Herdr pane get returned an invalid response.");
   }
-  return { paneId: pane.pane_id, tokens: record(pane.tokens) ?? {} };
+  return {
+    paneId: pane.pane_id,
+    tokens: record(pane.tokens) ?? {},
+    agentStatus: typeof pane.agent_status === "string" ? pane.agent_status : undefined
+  };
 }
 async function resolveTargetSession(deps, pane) {
   const token = pane.tokens[SESSION_ID_KEY];
@@ -19573,6 +19577,9 @@ async function deliverPrompt(deps, request, sender, signal) {
     pane = await resolveTargetPane(deps, target);
   } catch (error) {
     return fail(errorMessage(error));
+  }
+  if (pane.agentStatus === "blocked") {
+    return fail("Target is blocked on an approval or question; answer it first, then retry.", pane.paneId);
   }
   if (request.raw) {
     if (pane.paneId === sender.pane) {
