@@ -540,3 +540,15 @@ test("describeCallResult labels unverified captures explicitly", () => {
 	assert.match(text, /Unverified capture/);
 	assert.match(text, /partial screen/);
 });
+
+test("a focused target is not prompted and nothing is sent", async () => {
+	const { deps, count } = fakeExec({
+		"herdr agent get": () => agentGet("idle", { focused: true }),
+	});
+	const result = await callRegisteredAgent(deps, { target: TARGET_PANE, text: "hi" }, SENDER_PANE);
+	assert.equal(result.ok, false);
+	assert.equal(result.status, "not_sent");
+	assert.equal(result.delivery, "not_sent");
+	assert.equal(result.error?.code, "target_focused");
+	assert.equal(count("herdr agent prompt"), 0);
+});

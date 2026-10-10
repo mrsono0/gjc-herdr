@@ -60,6 +60,7 @@ export interface TargetPane {
 	paneId: string;
 	tokens: Json;
 	agentStatus?: string;
+	focused?: boolean;
 }
 
 function record(value: unknown): Json | undefined {
@@ -150,6 +151,7 @@ export async function resolveTargetPane(
 		tokens: record(pane.tokens) ?? {},
 		agentStatus:
 			typeof pane.agent_status === "string" ? pane.agent_status : undefined,
+		focused: pane.focused === true,
 	};
 }
 
@@ -413,6 +415,12 @@ export async function deliverPrompt(
 	if (request.raw) {
 		if (pane.paneId === sender.pane) {
 			return fail("Cannot send raw input to the current Herdr pane.", pane.paneId);
+		}
+		if (pane.focused) {
+			return fail(
+				"Target pane is focused by a person who may be typing; raw input not sent. Retry later or ask them to unfocus it.",
+				pane.paneId,
+			);
 		}
 		return sendRawPrompt(deps, pane.paneId, request.text);
 	}

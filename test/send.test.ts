@@ -30,8 +30,14 @@ function herdrError(code: string, message: string): Partial<ExecResult> {
 	return { code: 1, stderr: JSON.stringify({ error: { code, message } }) };
 }
 
-function paneGet(paneId: string, tokens: Record<string, string> = {}) {
-	return ok({ result: { pane: { pane_id: paneId, agent: "gjc", tokens } } });
+function paneGet(
+	paneId: string,
+	tokens: Record<string, string> = {},
+	extra: Record<string, unknown> = {},
+) {
+	return ok({
+		result: { pane: { pane_id: paneId, agent: "gjc", tokens, ...extra } },
+	});
 }
 
 /** Routes `herdr <a> <b>` and `gjc sdk session <verb>` calls; unrouted calls fail the test. */
@@ -543,4 +549,23 @@ test("command and tool share delivery and read the sender session per call", asy
 	assert.equal(self.details.error, "Cannot send a prompt to the current GJC session.");
 	assert.equal(self.isError, true);
 	assert.equal(count("gjc send"), 2);
+});
+
+test("raw delivery refuses a focused pane but SDK delivery does not", async () => {
+	const focused = fakeExec({
+		"herdr pane get": () => paneGet("wE:p2", { [SESSION_ID_KEY]: TARGET }, { focused: true }),
+	});
+	const raw = await deliverPrompt(focused.deps, { pane: "wE:p2", text: "x", raw: true }, SENDER);
+	assert.equal(raw.ok, false);
+	assert.equal(raw.status, "not_sent");
+	assert.match(raw.error ?? "", /focused by a person/);
+	assert(!focused.calls.some(({ args }) => args[1] === "send-text" || args[1] === "send-keys"));
+
+	const unfocused = fakeExec({
+		"herdr pane get": () => paneGet("wE:p2", {}, { focused: false }),
+		"herdr pane send-text": () => ({}),
+		"herdr pane send-keys": () => ({}),
+	});
+	const written = await deliverPrompt(unfocused.deps, { pane: "wE:p2", text: "x", raw: true }, SENDER);
+	assert.equal(written.status, "raw_written");
 });

@@ -32,6 +32,8 @@ export interface PreflightAgent {
 	terminalId: string;
 	state: "idle" | "working" | "blocked" | "done" | "unknown";
 	launchPending: boolean;
+	/** A human has this pane focused; typing into it could interleave with their input. */
+	focused: boolean;
 	/** Diagnostic only; the registered/detected verdict stays with Herdr's gate. */
 	agentLabel?: string;
 }
@@ -346,6 +348,7 @@ async function getPreflightAgent(
 		terminalId: agent.terminal_id,
 		state: agent.agent_status as PreflightAgent["state"],
 		launchPending: launchPending === true,
+		focused: agent.focused === true,
 		agentLabel: typeof agent.agent === "string" ? agent.agent : undefined,
 	};
 }
@@ -593,6 +596,19 @@ export async function callRegisteredAgent(
 					error: {
 						code: "target_not_ready",
 						message: "Target agent launch is still pending.",
+					},
+				});
+			}
+			if (preflight.focused) {
+				return finish({
+					status: "not_sent",
+					delivery: "not_sent",
+					pane: paneId,
+					state: preflight.state,
+					error: {
+						code: "target_focused",
+						message:
+							"Target pane is focused by a person who may be typing; not sent. Retry later or ask them to unfocus it.",
 					},
 				});
 			}

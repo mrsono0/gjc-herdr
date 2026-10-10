@@ -19389,7 +19389,8 @@ async function resolveTargetPane(deps, target) {
   return {
     paneId: pane.pane_id,
     tokens: record(pane.tokens) ?? {},
-    agentStatus: typeof pane.agent_status === "string" ? pane.agent_status : undefined
+    agentStatus: typeof pane.agent_status === "string" ? pane.agent_status : undefined,
+    focused: pane.focused === true
   };
 }
 async function resolveTargetSession(deps, pane) {
@@ -19584,6 +19585,9 @@ async function deliverPrompt(deps, request, sender, signal) {
   if (request.raw) {
     if (pane.paneId === sender.pane) {
       return fail("Cannot send raw input to the current Herdr pane.", pane.paneId);
+    }
+    if (pane.focused) {
+      return fail("Target pane is focused by a person who may be typing; raw input not sent. Retry later or ask them to unfocus it.", pane.paneId);
     }
     return sendRawPrompt(deps, pane.paneId, request.text);
   }
@@ -19896,6 +19900,7 @@ async function getPreflightAgent(deps, paneId, deadline, signal) {
     terminalId: agent.terminal_id,
     state: agent.agent_status,
     launchPending: launchPending === true,
+    focused: agent.focused === true,
     agentLabel: typeof agent.agent === "string" ? agent.agent : undefined
   };
 }
@@ -20099,6 +20104,18 @@ async function callRegisteredAgent(deps, request, senderPane, signal) {
           error: {
             code: "target_not_ready",
             message: "Target agent launch is still pending."
+          }
+        });
+      }
+      if (preflight.focused) {
+        return finish({
+          status: "not_sent",
+          delivery: "not_sent",
+          pane: paneId,
+          state: preflight.state,
+          error: {
+            code: "target_focused",
+            message: "Target pane is focused by a person who may be typing; not sent. Retry later or ask them to unfocus it."
           }
         });
       }
