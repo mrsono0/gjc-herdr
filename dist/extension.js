@@ -19321,7 +19321,7 @@ function createReporter(exec, pane, binPath) {
 
 // src/input.ts
 var READ_TIMEOUT_MS = 3000;
-var READ_LINES = "30";
+var READ_LINES = "60";
 var POLL_INTERVAL_MS = 2000;
 var DEFAULT_INPUT_WAIT_SEC = 60;
 var MAX_INPUT_WAIT_SEC = 600;
@@ -19349,12 +19349,14 @@ function brightText(line) {
     if (!dim)
       out += line.slice(last, match.index);
     last = match.index + match[0].length;
-    const params = match[1].split(/[;:]/).map((p) => p === "" ? 0 : Number(p));
+    const params = match[1].split(";");
     for (let i = 0;i < params.length; i++) {
-      const code = params[i];
-      if (code === 38 || code === 48)
-        i += params[i + 1] === 5 ? 2 : 4;
-      else if (code === 0)
+      const param = params[i];
+      const code = Number(param.split(":", 1)[0]);
+      if (code === 38 || code === 48) {
+        if (!param.includes(":"))
+          i += params[i + 1] === "5" ? 2 : 4;
+      } else if (code === 0)
         dim = false;
       else if (code === 2)
         dim = true;
@@ -19368,30 +19370,30 @@ function brightText(line) {
 }
 function claudeBox(lines) {
   const plain = lines.map((line) => strip(line).trim());
+  const rules = lines.map((line) => RULE.test(strip(line).trimEnd()));
   let bottom = -1;
   for (let i = plain.length - 1;i >= 0; i--) {
-    if (RULE.test(plain[i])) {
+    if (rules[i]) {
       bottom = i;
       break;
     }
   }
   if (bottom < 0)
     return;
+  if (plain.slice(bottom + 1).filter(Boolean).length > MAX_LINES_BELOW_BOX) {
+    return;
+  }
   let top = -1;
   for (let i = bottom - 1;i >= 0; i--) {
-    if (RULE.test(plain[i])) {
+    if (rules[i]) {
       top = i;
       break;
     }
   }
-  if (top < 0 || bottom - top < 2)
-    return;
-  if (!plain[top + 1].startsWith("\u276F"))
-    return;
-  if (plain.slice(bottom + 1).filter(Boolean).length > MAX_LINES_BELOW_BOX) {
-    return;
-  }
-  const typed = lines.slice(top + 1, bottom).map((line, i) => i === 0 ? brightText(line).replace(/^\s*\u276F/, "") : brightText(line)).join("").trim();
+  if (top < 0 || bottom - top < 2 || !plain[top + 1].startsWith("\u276F"))
+    return "typing";
+  const typed = brightText(lines.slice(top + 1, bottom).join(`
+`)).replace(/^\s*\u276F/, "").trim();
   return typed ? "typing" : "empty";
 }
 function gjcBox(lines) {
@@ -19412,11 +19414,13 @@ function gjcBox(lines) {
       break;
     }
   }
-  if (top < 0 || bottom - top < 2)
-    return;
   if (plain.slice(bottom + 1).filter(Boolean).length > MAX_LINES_BELOW_BOX) {
     return;
   }
+  if (top < 0)
+    return "typing";
+  if (bottom - top < 2)
+    return;
   const rows = plain.slice(top + 1, bottom).map((row) => row.replace(/^\u2502\s?/, "").replace(/\s*\u2502$/, ""));
   if (!rows[0]?.startsWith(">"))
     return;
@@ -19424,7 +19428,7 @@ function gjcBox(lines) {
   const rest = rows.slice(1).join("").trim();
   if (rest)
     return "typing";
-  if (first === "" || first.startsWith(GJC_PLACEHOLDER))
+  if (first === "" || first === GJC_PLACEHOLDER || first.startsWith(GJC_PLACEHOLDER) && /^\s+[\u21A9\u2325\u21E7\u2303\u2026]/.test(first.slice(GJC_PLACEHOLDER.length)))
     return "empty";
   return "typing";
 }
@@ -19433,9 +19437,12 @@ function classifyInput(screen) {
 `);
   return claudeBox(lines) ?? gjcBox(lines) ?? "unknown";
 }
-async function readInputState(deps, paneId, signal) {
+async function readInputState(deps, paneId, signal, timeoutMs = READ_TIMEOUT_MS) {
+  const timeout = Math.floor(timeoutMs);
+  if (timeout < 1)
+    return "typing";
   try {
-    const result = await deps.exec(deps.herdrBin, ["pane", "read", paneId, "--source", "visible", "--lines", READ_LINES, "--format", "ansi"], { timeout: READ_TIMEOUT_MS, signal });
+    const result = await deps.exec(deps.herdrBin, ["pane", "read", paneId, "--source", "visible", "--lines", READ_LINES, "--format", "ansi"], { timeout, signal });
     if (result.killed || result.code !== 0)
       return "unknown";
     return classifyInput(result.stdout);
@@ -19445,16 +19452,23 @@ async function readInputState(deps, paneId, signal) {
 }
 async function waitForEmptyInput(deps, paneId, maxWaitMs, signal) {
   const sleep = deps.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
-  let waitedMs = 0;
+  const now = deps.now ?? (() => performance.now());
+  const startedAt = now();
+  let state = "unknown";
   for (;; ) {
-    const state = await readInputState(deps, paneId, signal);
-    if (state !== "typing")
+    let waitedMs = now() - startedAt;
+    if (signal?.aborted || state === "typing" && waitedMs >= maxWaitMs) {
       return { state, waitedMs };
-    if (waitedMs >= maxWaitMs || signal?.aborted)
+    }
+    const readBudget = maxWaitMs > 0 ? Math.min(READ_TIMEOUT_MS, maxWaitMs - waitedMs) : READ_TIMEOUT_MS;
+    if (readBudget < 1)
+      return { state: "typing", waitedMs };
+    state = await readInputState(deps, paneId, signal, readBudget);
+    waitedMs = now() - startedAt;
+    if (state !== "typing" || waitedMs >= maxWaitMs || signal?.aborted) {
       return { state, waitedMs };
-    const step = Math.min(POLL_INTERVAL_MS, maxWaitMs - waitedMs);
-    await sleep(step);
-    waitedMs += step;
+    }
+    await sleep(Math.min(POLL_INTERVAL_MS, maxWaitMs - waitedMs));
   }
 }
 
@@ -19657,12 +19671,15 @@ async function sendSessionPrompt(exec, sessionId, text, wait, signal) {
   }
   return { ...base, ok: true, status, operationRef };
 }
-async function sendRawPrompt(deps, pane, text) {
+async function sendRawPrompt(deps, pane, text, signal) {
   const base = { mode: "raw", pane };
   const run = async (args) => {
+    if (signal?.aborted)
+      return "Raw delivery aborted.";
     try {
       const result = await deps.exec(deps.herdrBin, args, {
-        timeout: HERDR_TIMEOUT_MS
+        timeout: HERDR_TIMEOUT_MS,
+        signal
       });
       if (result.killed)
         return "timed out";
@@ -19712,6 +19729,8 @@ async function deliverPrompt(deps, request, sender, signal) {
   if (request.raw && request.wait) {
     return fail("Raw delivery does not support wait.");
   }
+  if (signal?.aborted)
+    return fail("Prompt delivery aborted before sending.");
   let pane;
   try {
     pane = await resolveTargetPane(deps, target);
@@ -19727,6 +19746,28 @@ async function deliverPrompt(deps, request, sender, signal) {
     }
     const guard = await waitForEmptyInput(deps, pane.paneId, deps.inputWaitMs ?? inputWaitMs(), signal);
     const waited = guard.waitedMs > 0 ? { waitedMs: guard.waitedMs } : {};
+    if (signal?.aborted) {
+      return { ...fail("Raw delivery aborted before sending.", pane.paneId), ...waited };
+    }
+    if (guard.waitedMs > 0) {
+      try {
+        pane = await resolveTargetPane(deps, target);
+      } catch (error) {
+        return { ...fail(errorMessage(error), pane.paneId), ...waited };
+      }
+      if (signal?.aborted) {
+        return { ...fail("Raw delivery aborted before sending.", pane.paneId), ...waited };
+      }
+      if (pane.agentStatus === "blocked") {
+        return {
+          ...fail("Target is blocked on an approval or question; answer it first, then retry.", pane.paneId),
+          ...waited
+        };
+      }
+      if (pane.paneId === sender.pane) {
+        return { ...fail("Cannot send raw input to the current Herdr pane.", pane.paneId), ...waited };
+      }
+    }
     if (guard.state === "typing") {
       return {
         ...fail(`Target input box still has text after ${Math.round(guard.waitedMs / 1000)}s; raw input not sent. Retry later.`, pane.paneId),
@@ -19739,7 +19780,7 @@ async function deliverPrompt(deps, request, sender, signal) {
         ...waited
       };
     }
-    return { ...await sendRawPrompt(deps, pane.paneId, request.text), ...waited };
+    return { ...await sendRawPrompt(deps, pane.paneId, request.text, signal), ...waited };
   }
   let sessionId;
   try {
@@ -19866,20 +19907,32 @@ function stderrEnvelope(result) {
   return record2(parseJson2(result.stderr)?.error);
 }
 async function runHerdr(deps, args, timeoutMs, signal, phase) {
-  if (timeoutMs <= 0) {
+  if (timeoutMs <= 0 || Math.floor(timeoutMs) < 1) {
     throw new CallFailure({
-      status: "not_sent",
-      delivery: "not_sent",
+      status: phase === "read" ? "read_failed" : "not_sent",
+      delivery: phase === "read" ? "submitted" : "not_sent",
+      ...phase === "read" ? { pane: args[2] } : {},
       error: { code: "timeout", message: "Call budget exhausted." }
     });
   }
   let result;
   try {
     result = await deps.exec(deps.herdrBin, args, {
-      timeout: timeoutMs,
+      timeout: Math.floor(timeoutMs),
       signal
     });
   } catch (error) {
+    if (phase === "read") {
+      throw new CallFailure({
+        status: "read_failed",
+        delivery: "submitted",
+        pane: args[2],
+        error: {
+          code: signal?.aborted ? "aborted" : "read_failed",
+          message: signal?.aborted ? "Answer read aborted; the prompt was already delivered." : `Prompt was delivered but the answer read failed: ${errorMessage2(error)}`
+        }
+      });
+    }
     if (signal?.aborted) {
       throw new CallFailure({
         status: phase === "prompt" ? "uncertain" : "not_sent",
@@ -19910,6 +19963,7 @@ async function runHerdr(deps, args, timeoutMs, signal, phase) {
     throw new CallFailure({
       status: phase === "read" ? "read_failed" : "not_sent",
       delivery: phase === "read" ? "submitted" : "not_sent",
+      ...phase === "read" ? { pane: args[2] } : {},
       error: { code: "timeout", message: `Herdr ${args[1]} timed out.` }
     });
   }
@@ -19956,7 +20010,7 @@ function usageFailure(result, phase) {
 async function resolveTargetPaneId(deps, target, deadline, signal) {
   if (PANE_ID2.test(target))
     return target;
-  const result = await runHerdr(deps, ["agent", "list"], Math.min(LOOKUP_TIMEOUT_MS, deadline - Date.now()), signal, "lookup");
+  const result = await runHerdr(deps, ["agent", "list"], Math.min(LOOKUP_TIMEOUT_MS, deadline - (deps.now?.() ?? performance.now())), signal, "lookup");
   if (result.code === 2)
     throw usageFailure(result, "agent list");
   if (result.code !== 0)
@@ -20015,7 +20069,7 @@ var AGENT_STATES = new Set([
   "unknown"
 ]);
 async function getPreflightAgent(deps, paneId, deadline, signal) {
-  const result = await runHerdr(deps, ["agent", "get", paneId], Math.min(LOOKUP_TIMEOUT_MS, deadline - Date.now()), signal, "lookup");
+  const result = await runHerdr(deps, ["agent", "get", paneId], Math.min(LOOKUP_TIMEOUT_MS, deadline - (deps.now?.() ?? performance.now())), signal, "lookup");
   if (result.code === 2)
     throw usageFailure(result, "agent get");
   if (result.code !== 0)
@@ -20166,14 +20220,15 @@ function promptFailure(result, agentLabel) {
   }
 }
 async function callRegisteredAgent(deps, request, senderPane, signal) {
-  const startedAt = Date.now();
+  const now = deps.now ?? (() => performance.now());
+  const startedAt = now();
   let deadline = startedAt + CALL_BUDGET_MS;
   let waitedMs = 0;
   const requestId = randomUUID3();
   const finish = (partial) => ({
     ok: false,
     requestId,
-    elapsedMs: Date.now() - startedAt,
+    elapsedMs: now() - startedAt,
     ...waitedMs > 0 ? { waitedMs } : {},
     ...partial
   });
@@ -20235,9 +20290,17 @@ async function callRegisteredAgent(deps, request, senderPane, signal) {
     }
     deps.inFlight.add(paneId);
     try {
-      const guard = await waitForEmptyInput({ exec: deps.exec, herdrBin: deps.herdrBin, sleep: deps.sleep }, paneId, deps.inputWaitMs ?? inputWaitMs(), signal);
+      const guard = await waitForEmptyInput({ exec: deps.exec, herdrBin: deps.herdrBin, sleep: deps.sleep, now }, paneId, deps.inputWaitMs ?? inputWaitMs(), signal);
       waitedMs = guard.waitedMs;
       deadline += guard.waitedMs;
+      if (signal?.aborted) {
+        return finish({
+          status: "not_sent",
+          delivery: "not_sent",
+          pane: paneId,
+          error: { code: "aborted", message: "Call aborted before delivery." }
+        });
+      }
       if (guard.state === "typing") {
         return finish({
           status: "not_sent",
@@ -20321,7 +20384,7 @@ async function callRegisteredAgent(deps, request, senderPane, signal) {
           }
         });
       }
-      const promptBudget = deadline - Date.now() - READ_RESERVE_MS;
+      const promptBudget = Math.floor(deadline - now() - READ_RESERVE_MS);
       if (promptBudget <= 0) {
         return finish({
           status: "not_sent",
@@ -20344,7 +20407,7 @@ async function callRegisteredAgent(deps, request, senderPane, signal) {
         "--timeout",
         String(promptBudget)
       ];
-      const prompt = await runHerdr(deps, [...promptArgs], deadline - Date.now(), signal, "prompt");
+      const prompt = await runHerdr(deps, [...promptArgs], deadline - now(), signal, "prompt");
       if (prompt.code === 2)
         throw usageFailure(prompt, "agent prompt");
       if (prompt.code !== 0) {
@@ -20389,7 +20452,7 @@ async function callRegisteredAgent(deps, request, senderPane, signal) {
           }
         });
       }
-      const readRemaining = deadline - Date.now();
+      const readRemaining = deadline - now();
       if (readRemaining <= 0) {
         return finish({
           status: "uncertain",
@@ -20453,7 +20516,7 @@ async function callRegisteredAgent(deps, request, senderPane, signal) {
         pane: paneId,
         state: settled,
         answer,
-        elapsedMs: Date.now() - startedAt,
+        elapsedMs: now() - startedAt,
         ...waitedMs > 0 ? { waitedMs } : {}
       };
     } finally {

@@ -54,6 +54,7 @@ export interface SendDeps {
 	herdrBin: string;
 	/** Test seam for the input-box wait; defaults to a real timer. */
 	sleep?: (ms: number) => Promise<void>;
+	now?: () => number;
 	/** Max wait for a typed-in input box; defaults to GJC_HERDR_INPUT_WAIT_SEC (60 s). */
 	inputWaitMs?: number;
 }
@@ -345,12 +346,15 @@ export async function sendRawPrompt(
 	deps: SendDeps,
 	pane: string,
 	text: string,
+	signal?: AbortSignal,
 ): Promise<SendResult> {
 	const base = { mode: "raw" as const, pane };
 	const run = async (args: string[]): Promise<string | undefined> => {
+		if (signal?.aborted) return "Raw delivery aborted.";
 		try {
 			const result = await deps.exec(deps.herdrBin, args, {
 				timeout: HERDR_TIMEOUT_MS,
+				signal,
 			});
 			if (result.killed) return "timed out";
 			if (result.code !== 0) {
@@ -406,6 +410,7 @@ export async function deliverPrompt(
 	if (request.raw && request.wait) {
 		return fail("Raw delivery does not support wait.");
 	}
+	if (signal?.aborted) return fail("Prompt delivery aborted before sending.");
 
 	let pane: TargetPane;
 	try {
@@ -430,6 +435,28 @@ export async function deliverPrompt(
 			signal,
 		);
 		const waited = guard.waitedMs > 0 ? { waitedMs: guard.waitedMs } : {};
+		if (signal?.aborted) {
+			return { ...fail("Raw delivery aborted before sending.", pane.paneId), ...waited };
+		}
+		if (guard.waitedMs > 0) {
+			try {
+				pane = await resolveTargetPane(deps, target);
+			} catch (error) {
+				return { ...fail(errorMessage(error), pane.paneId), ...waited };
+			}
+			if (signal?.aborted) {
+				return { ...fail("Raw delivery aborted before sending.", pane.paneId), ...waited };
+			}
+			if (pane.agentStatus === "blocked") {
+				return {
+					...fail("Target is blocked on an approval or question; answer it first, then retry.", pane.paneId),
+					...waited,
+				};
+			}
+			if (pane.paneId === sender.pane) {
+				return { ...fail("Cannot send raw input to the current Herdr pane.", pane.paneId), ...waited };
+			}
+		}
 		if (guard.state === "typing") {
 			return {
 				...fail(
@@ -449,7 +476,7 @@ export async function deliverPrompt(
 				...waited,
 			};
 		}
-		return { ...(await sendRawPrompt(deps, pane.paneId, request.text)), ...waited };
+		return { ...(await sendRawPrompt(deps, pane.paneId, request.text, signal)), ...waited };
 	}
 
 	let sessionId: string;

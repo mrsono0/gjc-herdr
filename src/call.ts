@@ -28,6 +28,7 @@ export interface AgentCallDeps {
 	inFlight: Set<string>;
 	/** Test seam for the input-box wait; defaults to a real timer. */
 	sleep?: (ms: number) => Promise<void>;
+	now?: () => number;
 	/** Max wait for a typed-in input box; defaults to GJC_HERDR_INPUT_WAIT_SEC (60 s). */
 	inputWaitMs?: number;
 }
@@ -129,20 +130,34 @@ async function runHerdr(
 	signal: AbortSignal | undefined,
 	phase: Phase,
 ): Promise<ExecResult> {
-	if (timeoutMs <= 0) {
+	if (timeoutMs <= 0 || Math.floor(timeoutMs) < 1) {
 		throw new CallFailure({
-			status: "not_sent",
-			delivery: "not_sent",
+			status: phase === "read" ? "read_failed" : "not_sent",
+			delivery: phase === "read" ? "submitted" : "not_sent",
+			...(phase === "read" ? { pane: args[2] } : {}),
 			error: { code: "timeout", message: "Call budget exhausted." },
 		});
 	}
 	let result: ExecResult;
 	try {
 		result = await deps.exec(deps.herdrBin, args, {
-			timeout: timeoutMs,
+			timeout: Math.floor(timeoutMs),
 			signal,
 		});
 	} catch (error) {
+		if (phase === "read") {
+			throw new CallFailure({
+				status: "read_failed",
+				delivery: "submitted",
+				pane: args[2],
+				error: {
+					code: signal?.aborted ? "aborted" : "read_failed",
+					message: signal?.aborted
+						? "Answer read aborted; the prompt was already delivered."
+						: `Prompt was delivered but the answer read failed: ${errorMessage(error)}`,
+				},
+			});
+		}
 		if (signal?.aborted) {
 			throw new CallFailure({
 				status: phase === "prompt" ? "uncertain" : "not_sent",
@@ -177,6 +192,7 @@ async function runHerdr(
 		throw new CallFailure({
 			status: phase === "read" ? "read_failed" : "not_sent",
 			delivery: phase === "read" ? "submitted" : "not_sent",
+			...(phase === "read" ? { pane: args[2] } : {}),
 			error: { code: "timeout", message: `Herdr ${args[1]} timed out.` },
 		});
 	}
@@ -238,7 +254,7 @@ async function resolveTargetPaneId(
 	const result = await runHerdr(
 		deps,
 		["agent", "list"],
-		Math.min(LOOKUP_TIMEOUT_MS, deadline - Date.now()),
+		Math.min(LOOKUP_TIMEOUT_MS, deadline - (deps.now?.() ?? performance.now())),
 		signal,
 		"lookup",
 	);
@@ -311,7 +327,7 @@ async function getPreflightAgent(
 	const result = await runHerdr(
 		deps,
 		["agent", "get", paneId],
-		Math.min(LOOKUP_TIMEOUT_MS, deadline - Date.now()),
+		Math.min(LOOKUP_TIMEOUT_MS, deadline - (deps.now?.() ?? performance.now())),
 		signal,
 		"lookup",
 	);
@@ -511,7 +527,8 @@ export async function callRegisteredAgent(
 	senderPane: string | undefined,
 	signal?: AbortSignal,
 ): Promise<AgentCallResult> {
-	const startedAt = Date.now();
+	const now = deps.now ?? (() => performance.now());
+	const startedAt = now();
 	let deadline = startedAt + CALL_BUDGET_MS;
 	let waitedMs = 0;
 	const requestId = randomUUID();
@@ -520,7 +537,7 @@ export async function callRegisteredAgent(
 	): AgentCallResult => ({
 		ok: false,
 		requestId,
-		elapsedMs: Date.now() - startedAt,
+		elapsedMs: now() - startedAt,
 		...(waitedMs > 0 ? { waitedMs } : {}),
 		...partial,
 	});
@@ -586,13 +603,21 @@ export async function callRegisteredAgent(
 		try {
 			// Waiting for a person's or agent's half-typed input does not eat the call budget.
 			const guard = await waitForEmptyInput(
-				{ exec: deps.exec, herdrBin: deps.herdrBin, sleep: deps.sleep },
+				{ exec: deps.exec, herdrBin: deps.herdrBin, sleep: deps.sleep, now },
 				paneId,
 				deps.inputWaitMs ?? inputWaitMs(),
 				signal,
 			);
 			waitedMs = guard.waitedMs;
 			deadline += guard.waitedMs;
+			if (signal?.aborted) {
+				return finish({
+					status: "not_sent",
+					delivery: "not_sent",
+					pane: paneId,
+					error: { code: "aborted", message: "Call aborted before delivery." },
+				});
+			}
 			if (guard.state === "typing") {
 				return finish({
 					status: "not_sent",
@@ -680,7 +705,7 @@ export async function callRegisteredAgent(
 				});
 			}
 
-			const promptBudget = deadline - Date.now() - READ_RESERVE_MS;
+			const promptBudget = Math.floor(deadline - now() - READ_RESERVE_MS);
 			if (promptBudget <= 0) {
 				return finish({
 					status: "not_sent",
@@ -707,7 +732,7 @@ export async function callRegisteredAgent(
 			const prompt = await runHerdr(
 				deps,
 				[...promptArgs],
-				deadline - Date.now(),
+				deadline - now(),
 				signal,
 				"prompt",
 			);
@@ -763,7 +788,7 @@ export async function callRegisteredAgent(
 				});
 			}
 
-			const readRemaining = deadline - Date.now();
+			const readRemaining = deadline - now();
 			if (readRemaining <= 0) {
 				return finish({
 					status: "uncertain",
@@ -838,7 +863,7 @@ export async function callRegisteredAgent(
 				pane: paneId,
 				state: settled,
 				answer,
-				elapsedMs: Date.now() - startedAt,
+				elapsedMs: now() - startedAt,
 				...(waitedMs > 0 ? { waitedMs } : {}),
 			};
 		} finally {

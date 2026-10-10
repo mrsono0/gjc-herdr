@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import test from "node:test";
+import test, { afterEach } from "node:test";
 import type { ExecResult, ExtensionAPI } from "@gajae-code/coding-agent";
 import {
 	callRegisteredAgent,
@@ -15,8 +15,24 @@ import {
 const SENDER_PANE = "wE:p1";
 const TARGET_PANE = "wE:p2";
 const TERMINAL = "term_test01";
+const RULE_LINE = "─".repeat(60);
+const EMPTY_CLAUDE = `✻ Churned for 8s\n${RULE_LINE}\n❯\n${RULE_LINE}\n  -- INSERT -- ⏵⏵ auto mode on`;
+const TYPING_CLAUDE = `${RULE_LINE}\n❯ 권고 내용으로 적\n${RULE_LINE}\n  -- INSERT --`;
 
-type Handler = (args: string[]) => Partial<ExecResult> | Error;
+type ExecOptions = Parameters<ExtensionAPI["exec"]>[2];
+type Handler = (args: string[], options: ExecOptions) => Partial<ExecResult> | Error;
+const timeoutViolations: string[] = [];
+
+afterEach(() => {
+	assert.deepEqual(timeoutViolations.splice(0), [], "Mock exec received an invalid timeout");
+});
+
+function assertExecTimeout(timeout: number | undefined): void {
+	if (timeout === undefined) return;
+	const valid = Number.isInteger(timeout) && timeout > 0;
+	if (!valid) timeoutViolations.push(`timeout=${timeout}`);
+	assert(valid, `exec timeout must be a positive integer: ${timeout}`);
+}
 
 function ok(body: unknown): Partial<ExecResult> {
 	return { stdout: JSON.stringify(body) };
@@ -57,21 +73,28 @@ function agentPrompted(state: string) {
 
 /** Routes `herdr <group> <verb>` calls; unrouted calls fail the test. */
 function fakeExec(routes: Record<string, Handler>) {
-	const calls: { command: string; args: string[] }[] = [];
-	const exec: AgentCallDeps["exec"] = async (command, args) => {
-		calls.push({ command, args });
+	let clock = 0;
+	const calls: { command: string; args: string[]; options: ExecOptions }[] = [];
+	const handlers: Record<string, Handler> = { "herdr pane read": () => ({ stdout: EMPTY_CLAUDE }), ...routes };
+	const exec: AgentCallDeps["exec"] = async (command, args, options) => {
+		assertExecTimeout(options?.timeout);
+		calls.push({ command, args, options });
 		const key = `${command} ${args[0]} ${args[1]}`;
-		const handler = routes[key];
+		const handler = handlers[key];
 		assert(handler, `unexpected exec ${command} ${args.join(" ")}`);
-		const result = handler(args);
+		const result = handler(args, options);
 		if (result instanceof Error) throw result;
 		return { stdout: "", stderr: "", code: 0, killed: false, ...result };
 	};
 	const count = (key: string) =>
 		calls.filter(({ command, args }) => `${command} ${args[0]} ${args[1]}` === key)
 			.length;
-	const deps: AgentCallDeps = { exec, herdrBin: "herdr", inFlight: new Set() };
-	return { deps, calls, count };
+	const advance = (ms: number) => { clock += ms; };
+	const deps: AgentCallDeps = {
+		exec, herdrBin: "herdr", inFlight: new Set(), now: () => clock,
+		sleep: async (ms) => advance(ms),
+	};
+	return { deps, calls, count, advance };
 }
 
 function answerScreen(requestId: string, body: string): Partial<ExecResult> {
@@ -541,15 +564,11 @@ test("describeCallResult labels unverified captures explicitly", () => {
 	assert.match(text, /partial screen/);
 });
 
-const RULE_LINE = "─".repeat(60);
-const EMPTY_CLAUDE = `✻ Churned for 8s\n${RULE_LINE}\n❯\n${RULE_LINE}\n  -- INSERT -- ⏵⏵ auto mode on`;
-const TYPING_CLAUDE = `${RULE_LINE}\n❯ 권고 내용으로 적\n${RULE_LINE}\n  -- INSERT --`;
-
 test("a typed-in input box delays the prompt until it empties and extends the budget", async () => {
 	const screens = [TYPING_CLAUDE, TYPING_CLAUDE, EMPTY_CLAUDE];
 	let requestId = "";
 	const sleeps: number[] = [];
-	const { deps, count } = fakeExec({
+	const { deps, count, advance } = fakeExec({
 		"herdr pane read": () => ({ stdout: screens.shift() ?? EMPTY_CLAUDE }),
 		"herdr agent get": () => agentGet("idle", { focused: true }),
 		"herdr agent prompt": (args) => {
@@ -558,7 +577,7 @@ test("a typed-in input box delays the prompt until it empties and extends the bu
 		},
 		"herdr agent read": () => answerScreen(requestId, "ok"),
 	});
-	deps.sleep = async (ms) => void sleeps.push(ms);
+	deps.sleep = async (ms) => { sleeps.push(ms); advance(ms); };
 	const result = await callRegisteredAgent(deps, { target: TARGET_PANE, text: "hi" }, SENDER_PANE);
 	assert.equal(result.ok, true);
 	assert.equal(result.waitedMs, 4_000);
@@ -571,7 +590,6 @@ test("an input box that stays typed-in ends as not_sent/target_typing with no pr
 	const { deps, count } = fakeExec({
 		"herdr pane read": () => ({ stdout: TYPING_CLAUDE }),
 	});
-	deps.sleep = async () => {};
 	deps.inputWaitMs = 6_000;
 	const result = await callRegisteredAgent(deps, { target: TARGET_PANE, text: "hi" }, SENDER_PANE);
 	assert.equal(result.ok, false);
@@ -581,6 +599,7 @@ test("an input box that stays typed-in ends as not_sent/target_typing with no pr
 	assert.equal(result.waitedMs, 6_000);
 	assert.equal(count("herdr agent get"), 0);
 	assert.equal(count("herdr agent prompt"), 0);
+	assert.equal(deps.inFlight.size, 0);
 });
 
 test("an unreadable input box falls back to the focus rule", async () => {
@@ -616,4 +635,144 @@ test("a focused pane with an empty input box is prompted normally", async () => 
 	assert.equal(result.ok, true);
 	assert.equal(result.waitedMs, undefined);
 	assert.equal(count("herdr agent prompt"), 1);
+});
+
+test("default pane-read fixture guards a focused target without unknown fallback", async () => {
+	const { deps, count } = fakeExec({
+		"herdr agent get": () => agentGet("idle", { focused: true }),
+		"herdr agent prompt": () => agentPrompted("done"),
+		"herdr agent read": () => ({ stdout: "no answer markers" }),
+	});
+	const result = await callRegisteredAgent(deps, { target: TARGET_PANE, text: "x" }, SENDER_PANE);
+	assert.equal(result.status, "response_unverified");
+	assert.equal(count("herdr pane read"), 1);
+	assert.equal(count("herdr agent prompt"), 1);
+});
+
+test("call aborts during input reads or sleeps never reach preflight and release inFlight", async () => {
+	for (const abortDuring of ["read", "sleep"]) {
+		const controller = new AbortController();
+		const { deps, count, advance } = fakeExec({
+			"herdr pane read": () => {
+				if (abortDuring === "read") {
+					controller.abort();
+					return new Error("read aborted");
+				}
+				return { stdout: TYPING_CLAUDE };
+			},
+		});
+		deps.sleep = async (ms) => { advance(ms); controller.abort(); };
+		const result = await callRegisteredAgent(deps, { target: TARGET_PANE, text: "x" }, SENDER_PANE, controller.signal);
+		assert.equal(result.status, "not_sent");
+		assert.equal(result.delivery, "not_sent");
+		assert.equal(result.error?.code, "aborted");
+		assert.equal(result.pane, TARGET_PANE);
+		assert.equal(count("herdr agent get"), 0);
+		assert.equal(count("herdr agent prompt"), 0);
+		assert.equal(deps.inFlight.size, 0);
+	}
+});
+
+test("answer read throw or abort preserves submitted delivery and target pane", async () => {
+	for (const abort of [false, true]) {
+		const controller = new AbortController();
+		const { deps, count } = fakeExec({
+			"herdr agent get": () => agentGet("idle"),
+			"herdr agent prompt": () => agentPrompted("done"),
+			"herdr agent read": () => {
+				if (abort) controller.abort();
+				return new Error(abort ? "read aborted" : "spawn EIO");
+			},
+		});
+		const result = await callRegisteredAgent(deps, { target: TARGET_PANE, text: "x" }, SENDER_PANE, controller.signal);
+		assert.equal(result.status, "read_failed");
+		assert.equal(result.delivery, "submitted");
+		assert.equal(result.pane, TARGET_PANE);
+		assert.equal(result.error?.code, abort ? "aborted" : "read_failed");
+		assert.equal(count("herdr agent prompt"), 1);
+		assert.equal(count("herdr agent read"), 1);
+		assert.equal(deps.inFlight.size, 0);
+	}
+});
+
+test("read delays are excluded from the call budget with actual elapsed time", async () => {
+	const screens = [TYPING_CLAUDE, EMPTY_CLAUDE];
+	let requestId = "";
+	const { deps, calls, advance } = fakeExec({
+		"herdr pane read": () => {
+			advance(900);
+			return { stdout: screens.shift() ?? EMPTY_CLAUDE };
+		},
+		"herdr agent get": () => { advance(300.5); return agentGet("idle"); },
+		"herdr agent prompt": (args) => {
+			requestId = /GJC_HERDR_BEGIN_([0-9a-f-]{36})/.exec(args[3])![1]!;
+			advance(100);
+			return agentPrompted("done");
+		},
+		"herdr agent read": () => answerScreen(requestId, "ok"),
+	});
+	const result = await callRegisteredAgent(deps, { target: TARGET_PANE, text: "x" }, SENDER_PANE);
+	assert.equal(result.ok, true);
+	assert.equal(result.waitedMs, 3_800);
+	assert.equal(result.elapsedMs, 4_200.5);
+	const prompt = calls.find(({ args }) => args[1] === "prompt")!;
+	assert.match(prompt.args[6], /^\d+$/);
+	assert.equal(Number(prompt.args[6]), 56_699);
+	assert.equal(prompt.options?.timeout, 59_699);
+});
+
+test("a clipped input box is not sent even when the target is unfocused", async () => {
+	const { deps, count } = fakeExec({ "herdr pane read": () => ({ stdout: `  draft continuation\n${RULE_LINE}` }) });
+	deps.inputWaitMs = 0;
+	const result = await callRegisteredAgent(deps, { target: TARGET_PANE, text: "x" }, SENDER_PANE);
+	assert.equal(result.error?.code, "target_typing");
+	assert.equal(count("herdr agent prompt"), 0);
+	assert.equal(deps.inFlight.size, 0);
+});
+
+test("fractional list and get budgets reach exec only as positive integers", async () => {
+	const { deps, calls } = fakeExec({
+		"herdr agent list": () => ok({ result: { agents: [{ name: "reviewer", pane_id: TARGET_PANE }] } }),
+		"herdr agent get": () => agentGet("idle"),
+	});
+	let ticks = 0;
+	deps.now = () => ticks++ === 0 ? 0 : 57_000.5;
+	const result = await callRegisteredAgent(deps, { target: "reviewer", text: "x" }, SENDER_PANE);
+	assert.equal(result.error?.code, "timeout");
+	assert.equal(result.delivery, "not_sent");
+	assert.deepEqual(calls.filter(({ args }) => args[1] === "list" || args[1] === "get").map(({ options }) => options?.timeout), [2_999, 2_999]);
+});
+
+test("fractional answer-read budgets floor or preserve submitted on sub-ms exhaustion", async () => {
+	for (const readBudget of [2_998.75, 0.75]) {
+		let requestId = "";
+		const { deps, calls, count, advance } = fakeExec({
+			"herdr agent get": () => { advance(0.25); return agentGet("idle"); },
+			"herdr agent prompt": (args) => {
+				requestId = /GJC_HERDR_BEGIN_([0-9a-f-]{36})/.exec(args[3])![1]!;
+				advance(60_000 - 0.25 - readBudget);
+				return agentPrompted("done");
+			},
+			"herdr agent read": () => answerScreen(requestId, "ok"),
+		});
+		const result = await callRegisteredAgent(deps, { target: TARGET_PANE, text: "x" }, SENDER_PANE);
+		assert.equal(result.delivery, "submitted");
+		assert.equal(result.pane, TARGET_PANE);
+		assert.equal(result.status, readBudget < 1 ? "read_failed" : "answered");
+		assert.equal(calls.find(({ args }) => args[1] === "prompt")?.options?.timeout, 59_999);
+		assert.equal(count("herdr agent read"), readBudget < 1 ? 0 : 1);
+		if (readBudget >= 1) assert.equal(calls.find(({ args }) => args[1] === "read" && args[0] === "agent")?.options?.timeout, 2_998);
+		else assert.equal(result.error?.code, "timeout");
+		assert.equal(deps.inFlight.size, 0);
+	}
+});
+
+test("positive sub-ms lookup budget uses timeout refusal instead of spawning with zero", async () => {
+	const { deps, calls } = fakeExec({});
+	let ticks = 0;
+	deps.now = () => ticks++ === 0 ? 0 : 59_999.25;
+	const result = await callRegisteredAgent(deps, { target: "reviewer", text: "x" }, SENDER_PANE);
+	assert.equal(result.status, "not_sent");
+	assert.equal(result.error?.code, "timeout");
+	assert.equal(calls.length, 0);
 });

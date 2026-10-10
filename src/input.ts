@@ -10,6 +10,8 @@ export interface InputGuardDeps {
 	herdrBin: string;
 	/** Test seam; defaults to a real timer. */
 	sleep?: (ms: number) => Promise<void>;
+	/** Monotonic clock used to measure the complete wait, including reads. */
+	now?: () => number;
 }
 
 export interface InputWaitResult {
@@ -18,7 +20,7 @@ export interface InputWaitResult {
 }
 
 const READ_TIMEOUT_MS = 3_000;
-const READ_LINES = "30";
+const READ_LINES = "60";
 const POLL_INTERVAL_MS = 2_000;
 export const DEFAULT_INPUT_WAIT_SEC = 60;
 const MAX_INPUT_WAIT_SEC = 600;
@@ -50,10 +52,14 @@ function brightText(line: string): string {
 	for (const match of line.matchAll(ANSI)) {
 		if (!dim) out += line.slice(last, match.index);
 		last = match.index + match[0].length;
-		const params = match[1].split(/[;:]/).map((p) => (p === "" ? 0 : Number(p)));
+		const params = match[1].split(";");
 		for (let i = 0; i < params.length; i++) {
-			const code = params[i];
-			if (code === 38 || code === 48) i += params[i + 1] === 5 ? 2 : 4;
+			const param = params[i];
+			const code = Number(param.split(":", 1)[0]);
+			// Colon color arguments are one SGR parameter, including an optional colorspace.
+			if (code === 38 || code === 48) {
+				if (!param.includes(":")) i += params[i + 1] === "5" ? 2 : 4;
+			}
 			else if (code === 0) dim = false;
 			else if (code === 2) dim = true;
 			else if (code === 22) dim = false;
@@ -66,30 +72,28 @@ function brightText(line: string): string {
 /** Claude Code: the `❯` row(s) between the last two horizontal rules. */
 function claudeBox(lines: string[]): InputState | undefined {
 	const plain = lines.map((line) => strip(line).trim());
+	const rules = lines.map((line) => RULE.test(strip(line).trimEnd()));
 	let bottom = -1;
 	for (let i = plain.length - 1; i >= 0; i--) {
-		if (RULE.test(plain[i])) {
+		if (rules[i]) {
 			bottom = i;
 			break;
 		}
 	}
 	if (bottom < 0) return undefined;
+	if (plain.slice(bottom + 1).filter(Boolean).length > MAX_LINES_BELOW_BOX) {
+		return undefined;
+	}
 	let top = -1;
 	for (let i = bottom - 1; i >= 0; i--) {
-		if (RULE.test(plain[i])) {
+		if (rules[i]) {
 			top = i;
 			break;
 		}
 	}
-	if (top < 0 || bottom - top < 2) return undefined;
-	if (!plain[top + 1].startsWith("❯")) return undefined;
-	if (plain.slice(bottom + 1).filter(Boolean).length > MAX_LINES_BELOW_BOX) {
-		return undefined;
-	}
-	const typed = lines
-		.slice(top + 1, bottom)
-		.map((line, i) => (i === 0 ? brightText(line).replace(/^\s*❯/, "") : brightText(line)))
-		.join("")
+	if (top < 0 || bottom - top < 2 || !plain[top + 1].startsWith("❯")) return "typing";
+	const typed = brightText(lines.slice(top + 1, bottom).join("\n"))
+		.replace(/^\s*❯/, "")
 		.trim();
 	return typed ? "typing" : "empty";
 }
@@ -112,10 +116,11 @@ function gjcBox(lines: string[]): InputState | undefined {
 			break;
 		}
 	}
-	if (top < 0 || bottom - top < 2) return undefined;
 	if (plain.slice(bottom + 1).filter(Boolean).length > MAX_LINES_BELOW_BOX) {
 		return undefined;
 	}
+	if (top < 0) return "typing";
+	if (bottom - top < 2) return undefined;
 	const rows = plain
 		.slice(top + 1, bottom)
 		.map((row) => row.replace(/^│\s?/, "").replace(/\s*│$/, ""));
@@ -123,7 +128,10 @@ function gjcBox(lines: string[]): InputState | undefined {
 	const first = rows[0].slice(1).trim();
 	const rest = rows.slice(1).join("").trim();
 	if (rest) return "typing";
-	if (first === "" || first.startsWith(GJC_PLACEHOLDER)) return "empty";
+	if (
+		first === "" || first === GJC_PLACEHOLDER ||
+		(first.startsWith(GJC_PLACEHOLDER) && /^\s+[↩⌥⇧⌃…]/.test(first.slice(GJC_PLACEHOLDER.length)))
+	) return "empty";
 	return "typing";
 }
 
@@ -133,17 +141,20 @@ export function classifyInput(screen: string): InputState {
 	return claudeBox(lines) ?? gjcBox(lines) ?? "unknown";
 }
 
-/** One read-only `herdr pane read`; any failure is `unknown`, never an error. */
+/** One read-only read; failures are unknown, exhausted budgets conservatively count as typing. */
 export async function readInputState(
 	deps: InputGuardDeps,
 	paneId: string,
 	signal?: AbortSignal,
+	timeoutMs = READ_TIMEOUT_MS,
 ): Promise<InputState> {
+	const timeout = Math.floor(timeoutMs);
+	if (timeout < 1) return "typing";
 	try {
 		const result = await deps.exec(
 			deps.herdrBin,
 			["pane", "read", paneId, "--source", "visible", "--lines", READ_LINES, "--format", "ansi"],
-			{ timeout: READ_TIMEOUT_MS, signal },
+			{ timeout, signal },
 		);
 		if (result.killed || result.code !== 0) return "unknown";
 		return classifyInput(result.stdout);
@@ -164,13 +175,21 @@ export async function waitForEmptyInput(
 ): Promise<InputWaitResult> {
 	const sleep =
 		deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
-	let waitedMs = 0;
+	const now = deps.now ?? (() => performance.now());
+	const startedAt = now();
+	let state: InputState = "unknown";
 	for (;;) {
-		const state = await readInputState(deps, paneId, signal);
-		if (state !== "typing") return { state, waitedMs };
-		if (waitedMs >= maxWaitMs || signal?.aborted) return { state, waitedMs };
-		const step = Math.min(POLL_INTERVAL_MS, maxWaitMs - waitedMs);
-		await sleep(step);
-		waitedMs += step;
+		let waitedMs = now() - startedAt;
+		if (signal?.aborted || (state === "typing" && waitedMs >= maxWaitMs)) {
+			return { state, waitedMs };
+		}
+		const readBudget = maxWaitMs > 0 ? Math.min(READ_TIMEOUT_MS, maxWaitMs - waitedMs) : READ_TIMEOUT_MS;
+		if (readBudget < 1) return { state: "typing", waitedMs };
+		state = await readInputState(deps, paneId, signal, readBudget);
+		waitedMs = now() - startedAt;
+		if (state !== "typing" || waitedMs >= maxWaitMs || signal?.aborted) {
+			return { state, waitedMs };
+		}
+		await sleep(Math.min(POLL_INTERVAL_MS, maxWaitMs - waitedMs));
 	}
 }

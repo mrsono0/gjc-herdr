@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import test from "node:test";
+import test, { afterEach } from "node:test";
 import type {
 	ExecResult,
 	ExtensionAPI,
@@ -12,6 +12,7 @@ import {
 	GJC_NOT_FOUND,
 	parseCommandArgs,
 	registerSendFeatures,
+	sendRawPrompt,
 	type SendDeps,
 	type SendResult,
 	USAGE,
@@ -19,8 +20,24 @@ import {
 
 const SENDER = { sessionId: "sender-session", pane: "wE:p1" };
 const TARGET = "receiver-session";
+const RULE_LINE = "─".repeat(60);
+const EMPTY_CLAUDE = `${RULE_LINE}\n❯\n${RULE_LINE}\n  -- INSERT --`;
+const TYPING_CLAUDE = `${RULE_LINE}\n❯ 권고 내용으로 적\n${RULE_LINE}\n  -- INSERT --`;
 
-type Handler = (args: string[]) => Partial<ExecResult> | Error;
+type ExecOptions = Parameters<ExtensionAPI["exec"]>[2];
+type Handler = (args: string[], options: ExecOptions) => Partial<ExecResult> | Error;
+const timeoutViolations: string[] = [];
+
+afterEach(() => {
+	assert.deepEqual(timeoutViolations.splice(0), [], "Mock exec received an invalid timeout");
+});
+
+function assertExecTimeout(timeout: number | undefined): void {
+	if (timeout === undefined) return;
+	const valid = Number.isInteger(timeout) && timeout > 0;
+	if (!valid) timeoutViolations.push(`timeout=${timeout}`);
+	assert(valid, `exec timeout must be a positive integer: ${timeout}`);
+}
 
 function ok(body: unknown): Partial<ExecResult> {
 	return { stdout: JSON.stringify(body) };
@@ -42,14 +59,17 @@ function paneGet(
 
 /** Routes `herdr <a> <b>` and `gjc sdk session <verb>` calls; unrouted calls fail the test. */
 function fakeExec(routes: Record<string, Handler>) {
-	const calls: { command: string; args: string[] }[] = [];
-	const exec: SendDeps["exec"] = async (command, args) => {
-		calls.push({ command, args });
+	let clock = 0;
+	const calls: { command: string; args: string[]; options: ExecOptions }[] = [];
+	const handlers: Record<string, Handler> = { "herdr pane read": () => ({ stdout: EMPTY_CLAUDE }), ...routes };
+	const exec: SendDeps["exec"] = async (command, args, options) => {
+		assertExecTimeout(options?.timeout);
+		calls.push({ command, args, options });
 		const key =
 			command === "gjc" ? `gjc ${args[2]}` : `herdr ${args[0]} ${args[1]}`;
-		const handler = routes[key];
+		const handler = handlers[key];
 		assert(handler, `unexpected exec ${command} ${args.join(" ")}`);
-		const result = handler(args);
+		const result = handler(args, options);
 		if (result instanceof Error) throw result;
 		return { stdout: "", stderr: "", code: 0, killed: false, ...result };
 	};
@@ -59,8 +79,9 @@ function fakeExec(routes: Record<string, Handler>) {
 				? `gjc ${args[2]}` === key
 				: `herdr ${args[0]} ${args[1]}` === key,
 		).length;
-	const deps: SendDeps = { exec, herdrBin: "herdr" };
-	return { deps, calls, count };
+	const advance = (ms: number) => { clock += ms; };
+	const deps: SendDeps = { exec, herdrBin: "herdr", now: () => clock, sleep: async (ms) => advance(ms) };
+	return { deps, calls, count, advance };
 }
 
 const sent = (status: string, operationRef = "op-1") =>
@@ -552,9 +573,6 @@ test("command and tool share delivery and read the sender session per call", asy
 	assert.equal(count("gjc send"), 2);
 });
 
-const RULE_LINE = "─".repeat(60);
-const EMPTY_CLAUDE = `${RULE_LINE}\n❯\n${RULE_LINE}\n  -- INSERT --`;
-const TYPING_CLAUDE = `${RULE_LINE}\n❯ 권고 내용으로 적\n${RULE_LINE}\n  -- INSERT --`;
 const SENDS = (calls: { args: string[] }[]) =>
 	calls.filter(({ args }) => args[1] === "send-text" || args[1] === "send-keys");
 
@@ -566,7 +584,6 @@ test("raw delivery waits for a typed-in input box, then sends once", async () =>
 		"herdr pane send-text": () => ({}),
 		"herdr pane send-keys": () => ({}),
 	});
-	deps.sleep = async () => {};
 	const result = await deliverPrompt(deps, { pane: "wE:p2", text: "x", raw: true }, SENDER);
 	assert.equal(result.status, "raw_written");
 	assert.equal(result.waitedMs, 2_000);
@@ -578,7 +595,6 @@ test("raw delivery gives up on a stuck input box without typing anything", async
 		"herdr pane get": () => paneGet("wE:p2"),
 		"herdr pane read": () => ({ stdout: TYPING_CLAUDE }),
 	});
-	deps.sleep = async () => {};
 	deps.inputWaitMs = 4_000;
 	const result = await deliverPrompt(deps, { pane: "wE:p2", text: "x", raw: true }, SENDER);
 	assert.equal(result.ok, false);
@@ -614,4 +630,120 @@ test("raw delivery falls back to the focus rule when the input box is unreadable
 	const accepted = await deliverPrompt(sdk.deps, { pane: "wE:p2", text: "x" }, SENDER);
 	assert.equal(accepted.status, "accepted");
 	assert(!sdk.calls.some(({ args }) => args[1] === "read"));
+});
+
+test("raw rechecks blocked and focused state after waiting", async () => {
+	for (const latest of ["blocked", "focused", "blocked-still-typing"]) {
+		let gets = 0;
+		const screens = [TYPING_CLAUDE, latest.startsWith("blocked") ? EMPTY_CLAUDE : "$ approval / unknown UI"];
+		const { deps, calls, count } = fakeExec({
+			"herdr pane get": () => paneGet("wE:p2", {}, ++gets === 1
+				? { focused: false, agent_status: "idle" }
+				: { focused: true, agent_status: latest.startsWith("blocked") ? "blocked" : "idle" }),
+			"herdr pane read": () => ({ stdout: screens.shift()! }),
+		});
+		if (latest === "blocked-still-typing") deps.inputWaitMs = 2_000;
+		const result = await deliverPrompt(deps, { pane: "wE:p2", text: "x", raw: true }, SENDER);
+		assert.equal(result.status, "not_sent");
+		assert.equal(result.waitedMs, 2_000);
+		assert.match(result.error ?? "", latest.startsWith("blocked") ? /Target is blocked/ : /could not be read and the pane is focused/);
+		assert.equal(count("herdr pane get"), 2);
+		assert.equal(SENDS(calls).length, 0);
+	}
+});
+
+test("raw re-resolves names and refuses a refreshed self target", async () => {
+	let gets = 0;
+	const screens = [TYPING_CLAUDE, EMPTY_CLAUDE];
+	const { deps, calls, count } = fakeExec({
+		"herdr agent get": () => ok({ result: { agent: { pane_id: ++gets === 1 ? "wE:p2" : SENDER.pane } } }),
+		"herdr pane get": (args) => paneGet(args[2]),
+		"herdr pane read": () => ({ stdout: screens.shift()! }),
+	});
+	const result = await deliverPrompt(deps, { pane: "receiver", text: "x", raw: true }, SENDER);
+	assert.equal(result.status, "not_sent");
+	assert.equal(result.pane, SENDER.pane);
+	assert.match(result.error ?? "", /current Herdr pane/);
+	assert.equal(count("herdr agent get"), 2);
+	assert.equal(SENDS(calls).length, 0);
+});
+
+test("raw abort before lookup or during input reads and sleeps sends no input", async () => {
+	for (const when of ["before", "read", "sleep"]) {
+		const controller = new AbortController();
+		if (when === "before") controller.abort();
+		const { deps, calls, advance } = fakeExec({
+			"herdr pane get": () => paneGet("wE:p2", {}, { focused: false }),
+			"herdr pane read": () => {
+				if (when === "read") {
+					controller.abort();
+					return new Error("read aborted");
+				}
+				return { stdout: TYPING_CLAUDE };
+			},
+		});
+		deps.sleep = async (ms) => { advance(ms); controller.abort(); };
+		const result = await deliverPrompt(deps, { pane: "wE:p2", text: "x", raw: true }, SENDER, controller.signal);
+		assert.equal(result.status, "not_sent");
+		assert.match(result.error ?? "", /aborted/);
+		assert.equal(SENDS(calls).length, 0);
+		if (when === "before") assert.equal(calls.length, 0);
+	}
+});
+
+test("raw passes the signal to both writes and preserves partial delivery on intervening abort", async () => {
+	for (const abortAfterText of [false, true]) {
+		const controller = new AbortController();
+		const { deps, count } = fakeExec({
+			"herdr pane send-text": (_args, options) => {
+				assert.equal(options?.signal, controller.signal);
+				if (abortAfterText) controller.abort();
+				return {};
+			},
+			"herdr pane send-keys": (_args, options) => {
+				assert.equal(options?.signal, controller.signal);
+				return {};
+			},
+		});
+		const result = await sendRawPrompt(deps, "wE:p2", "x", controller.signal);
+		assert.equal(result.status, abortAfterText ? "raw_partial" : "raw_written");
+		assert.equal(count("herdr pane send-text"), 1);
+		assert.equal(count("herdr pane send-keys"), abortAfterText ? 0 : 1);
+	}
+});
+
+test("raw default empty fixture works for focused targets and clipped drafts cannot fall back", async () => {
+	const empty = fakeExec({
+		"herdr pane get": () => paneGet("wE:p2", {}, { focused: true }),
+		"herdr pane send-text": () => ({}),
+		"herdr pane send-keys": () => ({}),
+	});
+	assert.equal((await deliverPrompt(empty.deps, { pane: "wE:p2", text: "x", raw: true }, SENDER)).status, "raw_written");
+	const clipped = fakeExec({
+		"herdr pane get": () => paneGet("wE:p2", {}, { focused: false }),
+		"herdr pane read": () => ({ stdout: `  draft continuation\n${RULE_LINE}` }),
+	});
+	clipped.deps.inputWaitMs = 0;
+	const result = await deliverPrompt(clipped.deps, { pane: "wE:p2", text: "x", raw: true }, SENDER);
+	assert.equal(result.status, "not_sent");
+	assert.match(result.error ?? "", /input box still has text/);
+	assert.equal(SENDS(clipped.calls).length, 0);
+});
+
+test("fractional clock and wait budgets never turn a typing draft into unfocused raw delivery", async () => {
+	for (const waitBudget of [2_000.5, 5_000.75]) {
+		const { deps, calls, count, advance } = fakeExec({
+			"herdr pane get": () => paneGet("wE:p2", {}, { focused: false }),
+			"herdr pane read": () => { advance(0.25); return { stdout: TYPING_CLAUDE }; },
+			"herdr pane send-text": () => ({}),
+			"herdr pane send-keys": () => ({}),
+		});
+		advance(0.25);
+		deps.inputWaitMs = waitBudget;
+		const result = await deliverPrompt(deps, { pane: "wE:p2", text: "agent prompt", raw: true }, SENDER);
+		assert.equal(result.status, "not_sent");
+		assert.match(result.error ?? "", /input box still has text/);
+		assert.equal(count("herdr pane read"), waitBudget < 3_000 ? 1 : 3);
+		assert.equal(SENDS(calls).length, 0);
+	}
 });
