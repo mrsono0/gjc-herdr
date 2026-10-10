@@ -223,7 +223,7 @@ test("preflight states gate the call before any prompt", async () => {
 		assert.equal(result.error?.code, code);
 		assert.equal(count("herdr agent get"), 1);
 		assert.equal(count("herdr agent prompt"), 0);
-		assert.equal(calls.length, 1);
+		assert.equal(calls.length, 2); // pane read (input box) + agent get
 	}
 });
 
@@ -541,14 +541,79 @@ test("describeCallResult labels unverified captures explicitly", () => {
 	assert.match(text, /partial screen/);
 });
 
-test("a focused target is not prompted and nothing is sent", async () => {
+const RULE_LINE = "─".repeat(60);
+const EMPTY_CLAUDE = `✻ Churned for 8s\n${RULE_LINE}\n❯\n${RULE_LINE}\n  -- INSERT -- ⏵⏵ auto mode on`;
+const TYPING_CLAUDE = `${RULE_LINE}\n❯ 권고 내용으로 적\n${RULE_LINE}\n  -- INSERT --`;
+
+test("a typed-in input box delays the prompt until it empties and extends the budget", async () => {
+	const screens = [TYPING_CLAUDE, TYPING_CLAUDE, EMPTY_CLAUDE];
+	let requestId = "";
+	const sleeps: number[] = [];
 	const { deps, count } = fakeExec({
+		"herdr pane read": () => ({ stdout: screens.shift() ?? EMPTY_CLAUDE }),
 		"herdr agent get": () => agentGet("idle", { focused: true }),
+		"herdr agent prompt": (args) => {
+			requestId = /GJC_HERDR_BEGIN_([0-9a-f-]{36})/.exec(args[3])![1]!;
+			return agentPrompted("done");
+		},
+		"herdr agent read": () => answerScreen(requestId, "ok"),
 	});
+	deps.sleep = async (ms) => void sleeps.push(ms);
+	const result = await callRegisteredAgent(deps, { target: TARGET_PANE, text: "hi" }, SENDER_PANE);
+	assert.equal(result.ok, true);
+	assert.equal(result.waitedMs, 4_000);
+	assert.deepEqual(sleeps, [2_000, 2_000]);
+	assert.equal(count("herdr pane read"), 3);
+	assert.equal(count("herdr agent prompt"), 1);
+});
+
+test("an input box that stays typed-in ends as not_sent/target_typing with no prompt", async () => {
+	const { deps, count } = fakeExec({
+		"herdr pane read": () => ({ stdout: TYPING_CLAUDE }),
+	});
+	deps.sleep = async () => {};
+	deps.inputWaitMs = 6_000;
 	const result = await callRegisteredAgent(deps, { target: TARGET_PANE, text: "hi" }, SENDER_PANE);
 	assert.equal(result.ok, false);
 	assert.equal(result.status, "not_sent");
 	assert.equal(result.delivery, "not_sent");
-	assert.equal(result.error?.code, "target_focused");
+	assert.equal(result.error?.code, "target_typing");
+	assert.equal(result.waitedMs, 6_000);
+	assert.equal(count("herdr agent get"), 0);
 	assert.equal(count("herdr agent prompt"), 0);
+});
+
+test("an unreadable input box falls back to the focus rule", async () => {
+	const focused = fakeExec({
+		"herdr pane read": () => ({ stdout: "$ plain shell\n" }),
+		"herdr agent get": () => agentGet("idle", { focused: true }),
+	});
+	const refused = await callRegisteredAgent(focused.deps, { target: TARGET_PANE, text: "hi" }, SENDER_PANE);
+	assert.equal(refused.status, "not_sent");
+	assert.equal(refused.error?.code, "target_focused");
+	assert.equal(focused.count("herdr agent prompt"), 0);
+
+	const failedRead = fakeExec({
+		"herdr pane read": () => herdrError("io", "no pane"),
+		"herdr agent get": () => agentGet("idle", { focused: true }),
+	});
+	const alsoRefused = await callRegisteredAgent(failedRead.deps, { target: TARGET_PANE, text: "hi" }, SENDER_PANE);
+	assert.equal(alsoRefused.error?.code, "target_focused");
+});
+
+test("a focused pane with an empty input box is prompted normally", async () => {
+	let requestId = "";
+	const { deps, count } = fakeExec({
+		"herdr pane read": () => ({ stdout: EMPTY_CLAUDE }),
+		"herdr agent get": () => agentGet("idle", { focused: true }),
+		"herdr agent prompt": (args) => {
+			requestId = /GJC_HERDR_BEGIN_([0-9a-f-]{36})/.exec(args[3])![1]!;
+			return agentPrompted("done");
+		},
+		"herdr agent read": () => answerScreen(requestId, "ok"),
+	});
+	const result = await callRegisteredAgent(deps, { target: TARGET_PANE, text: "hi" }, SENDER_PANE);
+	assert.equal(result.ok, true);
+	assert.equal(result.waitedMs, undefined);
+	assert.equal(count("herdr agent prompt"), 1);
 });

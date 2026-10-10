@@ -19319,6 +19319,145 @@ function createReporter(exec, pane, binPath) {
   };
 }
 
+// src/input.ts
+var READ_TIMEOUT_MS = 3000;
+var READ_LINES = "30";
+var POLL_INTERVAL_MS = 2000;
+var DEFAULT_INPUT_WAIT_SEC = 60;
+var MAX_INPUT_WAIT_SEC = 600;
+var MAX_LINES_BELOW_BOX = 3;
+var RULE = /^[\u2500\u2501]{10,}$/;
+var ANSI = /\x1b\[([0-9;:]*)m/g;
+var GJC_PLACEHOLDER = "Type your message...";
+function inputWaitMs(env = process.env) {
+  const raw = env.GJC_HERDR_INPUT_WAIT_SEC;
+  if (raw === undefined || raw.trim() === "")
+    return DEFAULT_INPUT_WAIT_SEC * 1000;
+  const sec = Number(raw);
+  if (!Number.isFinite(sec) || sec < 0)
+    return DEFAULT_INPUT_WAIT_SEC * 1000;
+  return Math.min(sec, MAX_INPUT_WAIT_SEC) * 1000;
+}
+function strip(line) {
+  return line.replace(ANSI, "");
+}
+function brightText(line) {
+  let dim = false;
+  let out = "";
+  let last = 0;
+  for (const match of line.matchAll(ANSI)) {
+    if (!dim)
+      out += line.slice(last, match.index);
+    last = match.index + match[0].length;
+    const params = match[1].split(/[;:]/).map((p) => p === "" ? 0 : Number(p));
+    for (let i = 0;i < params.length; i++) {
+      const code = params[i];
+      if (code === 38 || code === 48)
+        i += params[i + 1] === 5 ? 2 : 4;
+      else if (code === 0)
+        dim = false;
+      else if (code === 2)
+        dim = true;
+      else if (code === 22)
+        dim = false;
+    }
+  }
+  if (!dim)
+    out += line.slice(last);
+  return out;
+}
+function claudeBox(lines) {
+  const plain = lines.map((line) => strip(line).trim());
+  let bottom = -1;
+  for (let i = plain.length - 1;i >= 0; i--) {
+    if (RULE.test(plain[i])) {
+      bottom = i;
+      break;
+    }
+  }
+  if (bottom < 0)
+    return;
+  let top = -1;
+  for (let i = bottom - 1;i >= 0; i--) {
+    if (RULE.test(plain[i])) {
+      top = i;
+      break;
+    }
+  }
+  if (top < 0 || bottom - top < 2)
+    return;
+  if (!plain[top + 1].startsWith("\u276F"))
+    return;
+  if (plain.slice(bottom + 1).filter(Boolean).length > MAX_LINES_BELOW_BOX) {
+    return;
+  }
+  const typed = lines.slice(top + 1, bottom).map((line, i) => i === 0 ? brightText(line).replace(/^\s*\u276F/, "") : brightText(line)).join("").trim();
+  return typed ? "typing" : "empty";
+}
+function gjcBox(lines) {
+  const plain = lines.map((line) => strip(line).trim());
+  let bottom = -1;
+  for (let i = plain.length - 1;i >= 0; i--) {
+    if (plain[i].startsWith("\u2570")) {
+      bottom = i;
+      break;
+    }
+  }
+  if (bottom < 0)
+    return;
+  let top = -1;
+  for (let i = bottom - 1;i >= 0; i--) {
+    if (plain[i].startsWith("\u256D")) {
+      top = i;
+      break;
+    }
+  }
+  if (top < 0 || bottom - top < 2)
+    return;
+  if (plain.slice(bottom + 1).filter(Boolean).length > MAX_LINES_BELOW_BOX) {
+    return;
+  }
+  const rows = plain.slice(top + 1, bottom).map((row) => row.replace(/^\u2502\s?/, "").replace(/\s*\u2502$/, ""));
+  if (!rows[0]?.startsWith(">"))
+    return;
+  const first = rows[0].slice(1).trim();
+  const rest = rows.slice(1).join("").trim();
+  if (rest)
+    return "typing";
+  if (first === "" || first.startsWith(GJC_PLACEHOLDER))
+    return "empty";
+  return "typing";
+}
+function classifyInput(screen) {
+  const lines = screen.replace(/\s+$/, "").split(`
+`);
+  return claudeBox(lines) ?? gjcBox(lines) ?? "unknown";
+}
+async function readInputState(deps, paneId, signal) {
+  try {
+    const result = await deps.exec(deps.herdrBin, ["pane", "read", paneId, "--source", "visible", "--lines", READ_LINES, "--format", "ansi"], { timeout: READ_TIMEOUT_MS, signal });
+    if (result.killed || result.code !== 0)
+      return "unknown";
+    return classifyInput(result.stdout);
+  } catch {
+    return "unknown";
+  }
+}
+async function waitForEmptyInput(deps, paneId, maxWaitMs, signal) {
+  const sleep = deps.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+  let waitedMs = 0;
+  for (;; ) {
+    const state = await readInputState(deps, paneId, signal);
+    if (state !== "typing")
+      return { state, waitedMs };
+    if (waitedMs >= maxWaitMs || signal?.aborted)
+      return { state, waitedMs };
+    const step = Math.min(POLL_INTERVAL_MS, maxWaitMs - waitedMs);
+    await sleep(step);
+    waitedMs += step;
+  }
+}
+
 // src/send.ts
 var HERDR_TIMEOUT_MS = 3000;
 var LIST_TIMEOUT_MS = 15000;
@@ -19586,10 +19725,21 @@ async function deliverPrompt(deps, request, sender, signal) {
     if (pane.paneId === sender.pane) {
       return fail("Cannot send raw input to the current Herdr pane.", pane.paneId);
     }
-    if (pane.focused) {
-      return fail("Target pane is focused by a person who may be typing; raw input not sent. Retry later or ask them to unfocus it.", pane.paneId);
+    const guard = await waitForEmptyInput(deps, pane.paneId, deps.inputWaitMs ?? inputWaitMs(), signal);
+    const waited = guard.waitedMs > 0 ? { waitedMs: guard.waitedMs } : {};
+    if (guard.state === "typing") {
+      return {
+        ...fail(`Target input box still has text after ${Math.round(guard.waitedMs / 1000)}s; raw input not sent. Retry later.`, pane.paneId),
+        ...waited
+      };
     }
-    return sendRawPrompt(deps, pane.paneId, request.text);
+    if (guard.state === "unknown" && pane.focused) {
+      return {
+        ...fail("Target input box could not be read and the pane is focused by a person who may be typing; raw input not sent. Retry later.", pane.paneId),
+        ...waited
+      };
+    }
+    return { ...await sendRawPrompt(deps, pane.paneId, request.text), ...waited };
   }
   let sessionId;
   try {
@@ -19683,10 +19833,10 @@ function registerSendFeatures(api, herdrBin, senderPane) {
 import { randomUUID as randomUUID3 } from "crypto";
 var PANE_ID2 = /^w[^:\s]+:p[^:\s]+$/;
 var LOOKUP_TIMEOUT_MS = 3000;
-var READ_TIMEOUT_MS = 3000;
+var READ_TIMEOUT_MS2 = 3000;
 var CALL_BUDGET_MS = 60000;
 var READ_RESERVE_MS = 3000;
-var READ_LINES = "200";
+var READ_LINES2 = "200";
 var USAGE2 = "Usage: /herdr-call <pane-id-or-unique-agent-name> <text>";
 
 class CallFailure extends Error {
@@ -20017,12 +20167,14 @@ function promptFailure(result, agentLabel) {
 }
 async function callRegisteredAgent(deps, request, senderPane, signal) {
   const startedAt = Date.now();
-  const deadline = startedAt + CALL_BUDGET_MS;
+  let deadline = startedAt + CALL_BUDGET_MS;
+  let waitedMs = 0;
   const requestId = randomUUID3();
   const finish = (partial) => ({
     ok: false,
     requestId,
     elapsedMs: Date.now() - startedAt,
+    ...waitedMs > 0 ? { waitedMs } : {},
     ...partial
   });
   const target = request.target.trim();
@@ -20083,6 +20235,20 @@ async function callRegisteredAgent(deps, request, senderPane, signal) {
     }
     deps.inFlight.add(paneId);
     try {
+      const guard = await waitForEmptyInput({ exec: deps.exec, herdrBin: deps.herdrBin, sleep: deps.sleep }, paneId, deps.inputWaitMs ?? inputWaitMs(), signal);
+      waitedMs = guard.waitedMs;
+      deadline += guard.waitedMs;
+      if (guard.state === "typing") {
+        return finish({
+          status: "not_sent",
+          delivery: "not_sent",
+          pane: paneId,
+          error: {
+            code: "target_typing",
+            message: `Target input box still has text after ${Math.round(guard.waitedMs / 1000)}s; not sent. Retry later.`
+          }
+        });
+      }
       const preflight = await getPreflightAgent(deps, paneId, deadline, signal);
       if (preflight.paneId !== paneId) {
         return finish({
@@ -20107,7 +20273,7 @@ async function callRegisteredAgent(deps, request, senderPane, signal) {
           }
         });
       }
-      if (preflight.focused) {
+      if (guard.state === "unknown" && preflight.focused) {
         return finish({
           status: "not_sent",
           delivery: "not_sent",
@@ -20115,7 +20281,7 @@ async function callRegisteredAgent(deps, request, senderPane, signal) {
           state: preflight.state,
           error: {
             code: "target_focused",
-            message: "Target pane is focused by a person who may be typing; not sent. Retry later or ask them to unfocus it."
+            message: "Target input box could not be read and the pane is focused by a person who may be typing; not sent. Retry later."
           }
         });
       }
@@ -20236,7 +20402,7 @@ async function callRegisteredAgent(deps, request, senderPane, signal) {
           }
         });
       }
-      const read = await runHerdr(deps, ["agent", "read", paneId, "--source", "recent-unwrapped", "--lines", READ_LINES], Math.min(READ_TIMEOUT_MS, readRemaining), signal, "read");
+      const read = await runHerdr(deps, ["agent", "read", paneId, "--source", "recent-unwrapped", "--lines", READ_LINES2], Math.min(READ_TIMEOUT_MS2, readRemaining), signal, "read");
       if (read.code !== 0) {
         const error = stderrEnvelope(read);
         return finish({
@@ -20287,7 +20453,8 @@ async function callRegisteredAgent(deps, request, senderPane, signal) {
         pane: paneId,
         state: settled,
         answer,
-        elapsedMs: Date.now() - startedAt
+        elapsedMs: Date.now() - startedAt,
+        ...waitedMs > 0 ? { waitedMs } : {}
       };
     } finally {
       deps.inFlight.delete(paneId);

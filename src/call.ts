@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { ExtensionAPI, ExecResult } from "@gajae-code/coding-agent";
+import { inputWaitMs, waitForEmptyInput } from "./input.ts";
 
 type Exec = ExtensionAPI["exec"];
 type Json = Record<string, unknown>;
@@ -25,6 +26,10 @@ export interface AgentCallDeps {
 	herdrBin: string;
 	/** Canonical pane IDs with an in-flight call in this plugin instance. */
 	inFlight: Set<string>;
+	/** Test seam for the input-box wait; defaults to a real timer. */
+	sleep?: (ms: number) => Promise<void>;
+	/** Max wait for a typed-in input box; defaults to GJC_HERDR_INPUT_WAIT_SEC (60 s). */
+	inputWaitMs?: number;
 }
 
 export interface PreflightAgent {
@@ -65,6 +70,8 @@ export interface AgentCallResult {
 		exitCode?: number;
 	};
 	elapsedMs: number;
+	/** Time spent waiting for the target's input box to empty; omitted when it did not wait. */
+	waitedMs?: number;
 }
 
 class CallFailure extends Error {
@@ -505,7 +512,8 @@ export async function callRegisteredAgent(
 	signal?: AbortSignal,
 ): Promise<AgentCallResult> {
 	const startedAt = Date.now();
-	const deadline = startedAt + CALL_BUDGET_MS;
+	let deadline = startedAt + CALL_BUDGET_MS;
+	let waitedMs = 0;
 	const requestId = randomUUID();
 	const finish = (
 		partial: Partial<AgentCallResult> & { status: AgentCallStatus; delivery: DeliveryCertainty },
@@ -513,6 +521,7 @@ export async function callRegisteredAgent(
 		ok: false,
 		requestId,
 		elapsedMs: Date.now() - startedAt,
+		...(waitedMs > 0 ? { waitedMs } : {}),
 		...partial,
 	});
 
@@ -575,6 +584,26 @@ export async function callRegisteredAgent(
 		}
 		deps.inFlight.add(paneId);
 		try {
+			// Waiting for a person's or agent's half-typed input does not eat the call budget.
+			const guard = await waitForEmptyInput(
+				{ exec: deps.exec, herdrBin: deps.herdrBin, sleep: deps.sleep },
+				paneId,
+				deps.inputWaitMs ?? inputWaitMs(),
+				signal,
+			);
+			waitedMs = guard.waitedMs;
+			deadline += guard.waitedMs;
+			if (guard.state === "typing") {
+				return finish({
+					status: "not_sent",
+					delivery: "not_sent",
+					pane: paneId,
+					error: {
+						code: "target_typing",
+						message: `Target input box still has text after ${Math.round(guard.waitedMs / 1000)}s; not sent. Retry later.`,
+					},
+				});
+			}
 			const preflight = await getPreflightAgent(deps, paneId, deadline, signal);
 			if (preflight.paneId !== paneId) {
 				return finish({
@@ -599,7 +628,8 @@ export async function callRegisteredAgent(
 					},
 				});
 			}
-			if (preflight.focused) {
+			// Input box unreadable: fall back to the focus rule (a focused pane may have a person typing).
+			if (guard.state === "unknown" && preflight.focused) {
 				return finish({
 					status: "not_sent",
 					delivery: "not_sent",
@@ -608,7 +638,7 @@ export async function callRegisteredAgent(
 					error: {
 						code: "target_focused",
 						message:
-							"Target pane is focused by a person who may be typing; not sent. Retry later or ask them to unfocus it.",
+							"Target input box could not be read and the pane is focused by a person who may be typing; not sent. Retry later.",
 					},
 				});
 			}
@@ -809,6 +839,7 @@ export async function callRegisteredAgent(
 				state: settled,
 				answer,
 				elapsedMs: Date.now() - startedAt,
+				...(waitedMs > 0 ? { waitedMs } : {}),
 			};
 		} finally {
 			deps.inFlight.delete(paneId);

@@ -1,6 +1,6 @@
 {
 	"name": "gjc-herdr",
-	"version": "0.3.2",
+	"version": "0.3.3",
 	"description": "Herdr model/session metadata, pane-to-pane prompt delivery, and detected-agent calls for GJC",
 	"type": "module",
 	"license": "MIT",
@@ -28,7 +28,7 @@
 	"scripts": {
 		"build": "bun scripts/build.ts",
 		"check": "tsc --noEmit",
-		"test": "bun test test/metadata.test.ts test/send.test.ts test/call.test.ts"
+		"test": "bun test test/metadata.test.ts test/input.test.ts test/send.test.ts test/call.test.ts"
 	},
 	"devDependencies": {
 		"@gajae-code/coding-agent": "0.18.6",

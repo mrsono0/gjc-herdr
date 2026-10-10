@@ -3,6 +3,7 @@ import type {
 	ExtensionContext,
 	ExecResult,
 } from "@gajae-code/coding-agent";
+import { inputWaitMs, waitForEmptyInput } from "./input.ts";
 import { SESSION_ID_KEY } from "./metadata.ts";
 
 type Exec = ExtensionAPI["exec"];
@@ -44,11 +45,17 @@ export interface SendResult {
 	sessionId?: string;
 	operationRef?: string;
 	error?: string;
+	/** Time spent waiting for the target's input box to empty; omitted when it did not wait. */
+	waitedMs?: number;
 }
 
 export interface SendDeps {
 	exec: Exec;
 	herdrBin: string;
+	/** Test seam for the input-box wait; defaults to a real timer. */
+	sleep?: (ms: number) => Promise<void>;
+	/** Max wait for a typed-in input box; defaults to GJC_HERDR_INPUT_WAIT_SEC (60 s). */
+	inputWaitMs?: number;
 }
 
 export interface Sender {
@@ -416,13 +423,33 @@ export async function deliverPrompt(
 		if (pane.paneId === sender.pane) {
 			return fail("Cannot send raw input to the current Herdr pane.", pane.paneId);
 		}
-		if (pane.focused) {
-			return fail(
-				"Target pane is focused by a person who may be typing; raw input not sent. Retry later or ask them to unfocus it.",
-				pane.paneId,
-			);
+		const guard = await waitForEmptyInput(
+			deps,
+			pane.paneId,
+			deps.inputWaitMs ?? inputWaitMs(),
+			signal,
+		);
+		const waited = guard.waitedMs > 0 ? { waitedMs: guard.waitedMs } : {};
+		if (guard.state === "typing") {
+			return {
+				...fail(
+					`Target input box still has text after ${Math.round(guard.waitedMs / 1000)}s; raw input not sent. Retry later.`,
+					pane.paneId,
+				),
+				...waited,
+			};
 		}
-		return sendRawPrompt(deps, pane.paneId, request.text);
+		// Input box unreadable: fall back to the focus rule (a focused pane may have a person typing).
+		if (guard.state === "unknown" && pane.focused) {
+			return {
+				...fail(
+					"Target input box could not be read and the pane is focused by a person who may be typing; raw input not sent. Retry later.",
+					pane.paneId,
+				),
+				...waited,
+			};
+		}
+		return { ...(await sendRawPrompt(deps, pane.paneId, request.text)), ...waited };
 	}
 
 	let sessionId: string;

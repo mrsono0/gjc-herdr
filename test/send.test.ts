@@ -59,7 +59,8 @@ function fakeExec(routes: Record<string, Handler>) {
 				? `gjc ${args[2]}` === key
 				: `herdr ${args[0]} ${args[1]}` === key,
 		).length;
-	return { deps: { exec, herdrBin: "herdr" }, calls, count };
+	const deps: SendDeps = { exec, herdrBin: "herdr" };
+	return { deps, calls, count };
 }
 
 const sent = (status: string, operationRef = "op-1") =>
@@ -479,7 +480,7 @@ test("raw delivery types then submits, and reports partial failure", async () =>
 		pane: "wE:p2",
 	});
 	assert.deepEqual(
-		success.calls.slice(1).map((call) => call.args),
+		success.calls.slice(2).map((call) => call.args),
 		[
 			["pane", "send-text", "wE:p2", "hi there"],
 			["pane", "send-keys", "wE:p2", "enter"],
@@ -551,21 +552,66 @@ test("command and tool share delivery and read the sender session per call", asy
 	assert.equal(count("gjc send"), 2);
 });
 
-test("raw delivery refuses a focused pane but SDK delivery does not", async () => {
-	const focused = fakeExec({
-		"herdr pane get": () => paneGet("wE:p2", { [SESSION_ID_KEY]: TARGET }, { focused: true }),
+const RULE_LINE = "─".repeat(60);
+const EMPTY_CLAUDE = `${RULE_LINE}\n❯\n${RULE_LINE}\n  -- INSERT --`;
+const TYPING_CLAUDE = `${RULE_LINE}\n❯ 권고 내용으로 적\n${RULE_LINE}\n  -- INSERT --`;
+const SENDS = (calls: { args: string[] }[]) =>
+	calls.filter(({ args }) => args[1] === "send-text" || args[1] === "send-keys");
+
+test("raw delivery waits for a typed-in input box, then sends once", async () => {
+	const screens = [TYPING_CLAUDE, EMPTY_CLAUDE];
+	const { deps, calls } = fakeExec({
+		"herdr pane get": () => paneGet("wE:p2", {}, { focused: true }),
+		"herdr pane read": () => ({ stdout: screens.shift() ?? EMPTY_CLAUDE }),
+		"herdr pane send-text": () => ({}),
+		"herdr pane send-keys": () => ({}),
 	});
-	const raw = await deliverPrompt(focused.deps, { pane: "wE:p2", text: "x", raw: true }, SENDER);
-	assert.equal(raw.ok, false);
-	assert.equal(raw.status, "not_sent");
-	assert.match(raw.error ?? "", /focused by a person/);
-	assert(!focused.calls.some(({ args }) => args[1] === "send-text" || args[1] === "send-keys"));
+	deps.sleep = async () => {};
+	const result = await deliverPrompt(deps, { pane: "wE:p2", text: "x", raw: true }, SENDER);
+	assert.equal(result.status, "raw_written");
+	assert.equal(result.waitedMs, 2_000);
+	assert.equal(SENDS(calls).length, 2);
+});
+
+test("raw delivery gives up on a stuck input box without typing anything", async () => {
+	const { deps, calls } = fakeExec({
+		"herdr pane get": () => paneGet("wE:p2"),
+		"herdr pane read": () => ({ stdout: TYPING_CLAUDE }),
+	});
+	deps.sleep = async () => {};
+	deps.inputWaitMs = 4_000;
+	const result = await deliverPrompt(deps, { pane: "wE:p2", text: "x", raw: true }, SENDER);
+	assert.equal(result.ok, false);
+	assert.equal(result.status, "not_sent");
+	assert.match(result.error ?? "", /input box still has text after 4s/);
+	assert.equal(result.waitedMs, 4_000);
+	assert.equal(SENDS(calls).length, 0);
+});
+
+test("raw delivery falls back to the focus rule when the input box is unreadable; SDK is unaffected", async () => {
+	const focused = fakeExec({
+		"herdr pane get": () => paneGet("wE:p2", {}, { focused: true }),
+		"herdr pane read": () => ({ stdout: "$ plain shell" }),
+	});
+	const refused = await deliverPrompt(focused.deps, { pane: "wE:p2", text: "x", raw: true }, SENDER);
+	assert.equal(refused.status, "not_sent");
+	assert.match(refused.error ?? "", /could not be read and the pane is focused/);
+	assert.equal(SENDS(focused.calls).length, 0);
 
 	const unfocused = fakeExec({
 		"herdr pane get": () => paneGet("wE:p2", {}, { focused: false }),
+		"herdr pane read": () => ({ stdout: "$ plain shell" }),
 		"herdr pane send-text": () => ({}),
 		"herdr pane send-keys": () => ({}),
 	});
 	const written = await deliverPrompt(unfocused.deps, { pane: "wE:p2", text: "x", raw: true }, SENDER);
 	assert.equal(written.status, "raw_written");
+
+	const sdk = fakeExec({
+		"herdr pane get": () => paneGet("wE:p2", { [SESSION_ID_KEY]: TARGET }, { focused: true }),
+		"gjc send": () => sent("accepted"),
+	});
+	const accepted = await deliverPrompt(sdk.deps, { pane: "wE:p2", text: "x" }, SENDER);
+	assert.equal(accepted.status, "accepted");
+	assert(!sdk.calls.some(({ args }) => args[1] === "read"));
 });
