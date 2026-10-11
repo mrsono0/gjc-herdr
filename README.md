@@ -179,6 +179,12 @@ gjc sdk session send <session-id> --text "요청" --wait --timeout-ms 150000
 - 받는 쪽이 승인·질문 창에서 `blocked`이면 SDK·raw 모두 보내지 않고 `not_sent`(v0.3.1부터, 단위 테스트 기준이며 실제 blocked GJC 확인은 하지 않음)로 알린다. 재시도·중복 방지·여러 대상 동시 전달은 없다. 오류·timeout 후 자동 재전송이나 raw 전환을 하지 않는다.
 - 이 전달(`herdr_send`) 경로는 Herdr의 `herdr agent prompt`를 사용하지 않는다. Herdr 0.9.3은 알려진 agent 종류만 받으며 `gjc`는 해당되지 않는다([herdrdev/herdr#4732](https://github.com/herdrdev/herdr/issues/4732)). 감지 에이전트 호출은 아래 `/herdr-call` 절이 담당한다.
 
+**주의: 셸 직접 전송은 플러그인의 입력 보호를 우회한다.** 자기 pane/session·`blocked` 거부와 터미널 입력 전송 시 입력창 검사·대기 후 포기·입력창을 읽지 못한 포커스 pane 거부는 `/herdr-send`·`herdr_send`, `/herdr-call`·`herdr_agent_call` 경로에서만 적용된다. 기본 GJC 전달은 SDK로 입력창을 건드리지 않는다.
+
+에이전트가 bash 도구로 `herdr agent prompt`·`herdr pane send-text`/`send-keys`를 직접 부르면 위 플러그인 보호를 전혀 거치지 않아, 사람이 입력 중인 문장 뒤에 붙어 제출될 수 있다. 실제로 다른 팀에서 GJC가 셸 `herdr agent prompt`로 팀장 pane에 보낸 내용이 사용자가 입력 중이던 문장에 붙어 제출된 사례가 보고됐다(2026-10-11).
+
+GJC가 다른 에이전트에 보낼 때는 위 플러그인 명령·도구만 쓰고, 이 규칙을 팀 규칙 파일(`AGENTS.md` 등)에도 적는다. 사람이나 스크립트가 CLI를 직접 써야 하면 전송 전에 idle·비포커스·빈 입력란을 직접 확인한다. 이 저장소의 `scripts/critic-send.sh`가 이런 확인을 하는 예시다.
+
 ## 감지 agent 호출 (v0.3.0)
 
 Herdr가 **감지한** 다른 pane의 에이전트(Claude Code, Codex 등 Herdr 0.9.3이 알아본 종류)에게 프롬프트를 보내고, 그 답변 본문을 되돌려받는다. 전달·대기·회수 모두 Herdr 공개 CLI(`herdr agent prompt --wait` / `herdr agent read`)를 쓰며 스크래핑이나 `--raw` 입력은 사용하지 않는다.
