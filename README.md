@@ -4,9 +4,9 @@ GJC의 native 상태·세션/resume 처리를 유지하면서 Herdr sidebar에 *
 
 배포 정책: **npm registry에는 발행하지 않는다.** 이 Git 저장소에서 직접 설치한다. 실행 파일 `dist/extension.js`는 저장소에 포함되어 있어 설치 시 build가 필요 없다.
 
-## 새 컴퓨터 빠른 시작 (Herdr + Claude Code 팀장 + GJC 팀원)
+## 새 컴퓨터 빠른 시작 (Herdr + Claude Code 팀장 + GJC 팀원 + 선택 Codex 검토)
 
-Herdr 안에서 Claude Code(팀장)와 GJC(팀원)가 서로 호출하며 개발하는 환경을 clone 한 번으로 구성할 수 있다. AI가 읽고 따를 수 있게 준비되어 있다.
+Herdr 안에서 Claude Code(팀장)가 GJC(구현 팀원)와 선택 Codex(독립 검토·조사 팀원)에 역할을 나눠 개발하는 환경을 구성할 수 있다. AI가 읽고 따를 수 있게 준비되어 있다. Codex 자동 구성은 `GJCH_TEAM_CODEX=0`으로 끌 수 있다. Codex는 **`--yolo`(승인·샌드박스 없음)** 로 실행되므로, 저장소 쓰기·commit 금지는 지시서 규칙으로 지킨다.
 
 **사람이 할 일**
 
@@ -18,7 +18,7 @@ Herdr 안에서 Claude Code(팀장)와 GJC(팀원)가 서로 호출하며 개발
    claude
    ```
 3. Claude에게 **"안내대로 환경 설정해줘"** 라고 말한다. 루트 `CLAUDE.md`가 자동으로 읽혀, Claude가 `scripts/check-env.sh`(읽기 전용 점검)를 실행하고 부족한 항목만 [docs/dev-environment.md](docs/dev-environment.md) 절차대로 해결한다. `gjc-herdr` 플러그인 설치와 `~/.config/herdr/config.toml` 같은 사용자 설정 변경은 승인을 요청한다.
-4. 설정이 끝나면 Claude를 한 번 재시작한다. `.claude/settings.json`의 SessionStart hook이 `scripts/team-up.sh`를 실행해 팀장(`gjc-herdr-lead`) pane 이름을 정하고 팀원 GJC(`gjc-herdr-mate`) pane을 만든다. `herdr agent list`로 두 agent가 보이면 성공이다.
+4. 설정이 끝나면 Claude를 한 번 재시작한다. `.claude/settings.json`의 SessionStart hook이 `scripts/team-up.sh`를 실행해 팀장(`gjc-herdr-lead`) pane 이름을 정하고 팀원 GJC(`gjc-herdr-mate`) pane을 만든다. `codex`가 있고 끄지 않았으면 저장소 밖 결과 폴더를 사용하는 선택 검토 Codex(agent `gjc-herdr-critic`, pane label `GJCH 검토·조사 · Codex`)도 구성한다. `herdr agent list`로 구성 예정인 agent가 보이는지 확인한다.
 
 **필요한 프로그램**
 
@@ -27,6 +27,7 @@ Herdr 안에서 Claude Code(팀장)와 GJC(팀원)가 서로 호출하며 개발
 | [Herdr](https://herdr.dev) | agent pane 관리자. 팀 구성과 sidebar 표시의 바탕 (0.9.3에서 검증) | `brew install herdr` 또는 `curl -fsSL https://herdr.dev/install.sh \| sh` | `herdr --version` |
 | [Claude Code CLI](https://docs.claude.com/en/docs/claude-code) | 팀장 (2.1.295에서 사용) | `brew install --cask claude-code@latest` 또는 공식 문서의 설치 방법 | `claude --version` |
 | [GJC (Gajae Code)](https://github.com/Yeachan-Heo/gajae-code) | 팀원이자 이 플러그인의 대상 (0.18.8에서 사용, 설치 검증은 0.18.7) | 해당 저장소의 [설치 문서](https://github.com/Yeachan-Heo/gajae-code/blob/main/docs/install.md)에서 태그된 설치 스크립트를 내려받아 실행 | `gjc --version` |
+| [Codex CLI](https://github.com/openai/codex) (선택) | 독립 검토·조사 팀원. `GJCH_TEAM_CODEX=0`으로 끌 수 있음 | 공식 설치 안내 또는 `npm install -g @openai/codex` | `codex --version` |
 | [Bun](https://bun.sh) 1.4.2 | GJC가 Git 플러그인을 설치할 때 필요, build는 1.4.2 고정 | `curl -fsSL https://bun.sh/install \| bash` (특정 버전은 Bun 문서 참조) | `bun --version` |
 | git, python3 | clone, `team-up.sh`의 JSON 처리 | macOS는 보통 기본 포함 또는 `brew install git python` | `git --version`, `python3 --version` |
 | `gjc-herdr` 플러그인 | 모델·세션 표시, `/herdr-send`, `/herdr-call` | 아래 "설치 (한 줄)" | `gjc plugin list --json` |

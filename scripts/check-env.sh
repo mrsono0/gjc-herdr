@@ -22,6 +22,11 @@ else
 fi
 command -v gjc >/dev/null && ok "gjc $(gjc --version 2>/dev/null)" || bad "gjc 없음 (GJC 본체는 이 저장소가 설치하지 않음)"
 command -v herdr >/dev/null && ok "herdr $(herdr --version 2>/dev/null)" || warn "herdr 없음 (팀 구성·표시는 Herdr pane 안에서만 동작)"
+if command -v codex >/dev/null; then
+	ok "codex: $(command -v codex) (선택 검토 팀원)"
+else
+	warn "codex 없음 (검토 팀원은 선택 사항; GJCH_TEAM_CODEX=0으로 끌 수 있음)"
+fi
 
 # --- Herdr pane 여부 ---
 if [ "${HERDR_ENV:-}" = 1 ] && [ -n "${HERDR_PANE_ID:-}" ]; then

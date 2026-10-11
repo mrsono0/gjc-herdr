@@ -1,15 +1,28 @@
-# 개발 환경: Herdr + 팀장(Claude Code) + 팀원(GJC)
+# 개발 환경: Herdr + 팀장(Claude Code) + 구현(GJC) + 선택 검토(Codex)
 
-이 저장소는 한 Herdr workspace에서 **팀장(Claude Code)** 과 **팀원(GJC)** 이 서로 호출하며 `gjc-herdr`을 개발하도록 구성되어 있다. 새 컴퓨터에서 `git clone`한 뒤 AI(Claude Code 등)가 이 문서를 읽고 스스로 점검·구축할 수 있게 쓴 문서다. 이 문서는 AI 에이전트가 따를 지침이므로 각 단계의 **실제 출력으로 판정**하고, 확인하지 못한 항목을 성공으로 적지 않는다.
+이 저장소는 한 Herdr workspace에서 **팀장(Claude Code)** 이 **구현 팀원(GJC)** 과 **선택 검토·조사 팀원(Codex)** 에게 역할을 나눠 `gjc-herdr`을 개발하도록 구성되어 있다. 구현과 독립 검토를 같은 에이전트의 같은 회차에 맡기지 않는다. 새 컴퓨터에서 `git clone`한 뒤 AI(Claude Code 등)가 이 문서를 읽고 스스로 점검·구축할 수 있게 쓴 문서다. 각 단계의 **실제 출력으로 판정**하고, 확인하지 못한 항목을 성공으로 적지 않는다.
 
 ## 1. 구성 요약
 
-| 역할 | 에이전트 | 이름·label | 하는 일 |
-|---|---|---|---|
-| 팀장 | Claude Code | agent `gjc-herdr-lead`, pane label `GJCH 팀장 · Claude` | 사용자와 대화, 작업 분해·배정, 결과 검증, 승인이 필요한 외부 작업(commit/push/설치) 요청 |
-| 팀원 | GJC | agent `gjc-herdr-mate`, pane label·세션 이름 `GJCH 팀원 · GJC` | 배정된 파일 구현·검토, 실제 GJC 런타임 관측 |
+| 역할 | 에이전트 | 이름·label | 하는 일 | 하지 않는 일 |
+|---|---|---|---|---|
+| 팀장 | Claude Code | agent `gjc-herdr-lead`, pane label `GJCH 팀장 · Claude` | 사용자와 대화, 작업 분해·배정, 결과 검증, 승인이 필요한 외부 작업(commit/push/설치) 요청 | 사용자 승인 대체 |
+| 구현 팀원 | GJC | agent `gjc-herdr-mate`, pane label·세션 이름 `GJCH 팀원 · GJC` | 배정된 파일 구현, 실제 GJC 런타임 관측 | 같은 회차의 독립 검토 역할 겸임, 승인 없는 commit/push |
+| 검토·조사 팀원(선택) | Codex | agent `gjc-herdr-critic`, pane label `GJCH 검토·조사 · Codex` | 독립 검토·조사·근거 확인, 작업 폴더에 결과 파일 작성 | 저장소 쓰기·커밋·적용, 팀장 검증 대체, 사용자 승인 |
 
-작업공간 label은 `GJCH · gjc-herdr`이다. 이름은 `scripts/team-up.sh`가 환경변수 `GJCH_LEAD_NAME`/`GJCH_MATE_NAME`으로 바꿀 수 있다.
+작업공간 label은 `GJCH · gjc-herdr`이다. `scripts/team-up.sh`의 환경변수는 다음과 같다.
+
+| 환경변수 | 기본값·용도 |
+|---|---|
+| `GJCH_LEAD_NAME` | `gjc-herdr-lead` |
+| `GJCH_MATE_NAME` | `gjc-herdr-mate` |
+| `GJCH_CRITIC_NAME` | `gjc-herdr-critic` |
+| `GJCH_TEAM_CODEX` | `1`; `0`이면 Codex 자동 구성을 끈다 |
+| `GJCH_CODEX_MODEL` | `gpt-6.1-sol` |
+| `GJCH_CODEX_WORKDIR` | 저장소 형제 폴더 `<저장소 폴더명>-codex-work`(예: `../gjc-herdr-codex-work`) |
+| `GJCH_RETRIES` | `30`; GJC 이름·준비 상태 등을 2초 간격으로 재확인 |
+
+**Codex는 사용자 지시로 `--yolo`를 사용하며 샌드박스가 없다.** 저장소 쓰기·commit 금지는 지시서 규칙으로 지킨다. 외부 작업 폴더는 결과 파일 위치와 실수 방지 목적이지 권한 차단이 아니다. 생성 전에 `os.path.realpath`로 미존재 경로·`..`·기존 조상의 심볼릭 링크를 해석해 저장소 자체·저장소 안·저장소를 품는 상위 폴더를 거부한다. 사전 판정에 통과한 정규화 경로만 `mkdir -p`로 생성하고, 이후 `cd`/`pwd -P`로 물리 경로를 다시 판정해, 그사이 경로가 바뀌었으면 Codex를 띄우지 않는다(생성 자체를 막지는 못한다. 판정과 생성 사이에 다른 프로세스가 조상 폴더를 바꾸는 경쟁은 이 오설정 방지 장치의 보장 범위 밖이다). 사전 거부된 경로에는 디렉터리를 만들지 않는다. Codex가 없으면 WARN과 함께 생략하며, 기존 `gjc-herdr-critic` pane은 다시 시작하거나 변경하지 않는다.
 
 ## 2. 자동 구성이 일어나는 방식
 
@@ -20,9 +33,10 @@
    - 이 pane의 agent 이름을 `gjc-herdr-lead`로 확보(이미 다른 pane이 쓰면 건드리지 않음)하고 pane label과, 폴더명 기본값인 작업공간 label을 바꾼다. Claude 감지 지연 때문에 최대 약 60초 재시도한다.
    - 팀원 pane이 없으면 `pane split --no-focus`로 만들고(재시작 후 남은 빈 셸 pane은 재사용) `gjc`를 실행해 `gjc-herdr-mate`로 이름을 붙인다.
    - GJC가 idle이고 `gjc_herdr_session_id` token이 발행되면 `/rename GJCH 팀원 · GJC`를 입력해 세션 이름을 맞춘다. 준비가 안 되면 수동 안내만 출력한다.
+   - 선택 Codex 단계: `GJCH_TEAM_CODEX=0`·`codex` 없음·기존 critic 이름 점유 시 생략한다. 그 외에는 별도 작업 폴더의 같은 workspace 빈 셸 pane을 재사용하거나, 같은 workspace의 팀원 오른쪽(팀원이 없으면 현재 pane 아래)에 no-focus로 만들고 `herdr agent start ... -- --yolo -m <모델> -C <작업 폴더>`로 시작한다. GJC 단계 실패 시에도 Codex 단계는 별도로 시도하며, 실패한 단계가 있으면 종료 코드는 비0이다.
 4. 사용자의 focus·다른 pane·설정은 바꾸지 않는다.
 
-수동 실행: `scripts/team-up.sh`(이름·label만), `scripts/team-up.sh --spawn`(팀원 포함).
+수동 실행: `scripts/team-up.sh`(이름·label만), `scripts/team-up.sh --spawn`(구현·선택 검토 팀원 포함). `GJCH_TEAM_CODEX=0 scripts/team-up.sh --spawn`이면 GJC만 구성한다. `herdr agent start`는 pane이 빈 셸 프롬프트 상태여야 하며, 성공은 예상 agent가 감지되고 입력 준비가 됐다는 뜻이다.
 
 ## 3. 새 컴퓨터에서 AI가 따를 환경 구축 절차
 
@@ -39,6 +53,7 @@
    |---|---|
    | `gjc` 없음 | GJC 본체는 이 저장소가 설치하지 않는다. README "필요한 프로그램" 표의 링크를 사용자에게 안내해 설치를 요청한다 |
    | `herdr` 없음 / Herdr pane 밖 | README "필요한 프로그램" 표대로 Herdr를 설치하고 **Herdr 안의 pane에서** Claude Code를 실행하도록 안내한다(팀 구성·token 표시는 Herdr 안에서만 동작) |
+   | `codex` 없음 | 선택 검토 팀원이다. README의 Codex 설치 안내를 따르거나 `GJCH_TEAM_CODEX=0`으로 끈다 |
    | `bun` 없음 또는 버전 불일치 | GJC plugin 설치에 필요. build는 `package.json`의 `engines.bun`(1.4.2) 고정 |
    | `node_modules` 없음 | `npm ci --ignore-scripts --no-audit --no-fund` (개발·테스트 시) |
    | `team-up.sh` 실행 권한 없음 | `chmod +x scripts/team-up.sh scripts/check-env.sh` |
@@ -46,12 +61,12 @@
    | sidebar 설정 없음 | README "Sidebar 설정". `~/.config/herdr/config.toml`은 **사용자 설정이므로 사용자 승인 후** 기존 행을 보존한 채 추가만 한다 |
 
 2. **개발 도구 확인(선택)**: `npm run check`, `npm test` (mock 단위 테스트), `bun scripts/build.ts`(source 변경 시에만, dist와 함께 commit).
-3. **팀 자동 구성 확인**: 사용자가 Herdr pane에서 이 폴더로 `claude`를 새로 시작하게 한 뒤 `herdr agent list`로 확인한다. `gjc-herdr-lead`(Claude)와 `gjc-herdr-mate`(GJC)가 보이면 성공이다. 보이지 않으면 `scripts/team-up.sh --spawn`을 수동 실행하고 stderr 안내를 읽는다. **hook은 Claude 재시작 시 자동 실행되는지 새 컴퓨터에서 처음 한 번 실제로 확인한다.**
+3. **팀 자동 구성 확인**: 사용자가 Herdr pane에서 이 폴더로 `claude`를 새로 시작하게 한 뒤 `herdr agent list`로 확인한다. `gjc-herdr-lead`(Claude)와 `gjc-herdr-mate`(GJC), Codex를 켰고 설치돼 있으면 `gjc-herdr-critic`도 확인한다. 구성 예정인 agent가 보이지 않으면 `scripts/team-up.sh --spawn`을 수동 실행하고 stderr 안내를 읽는다. Codex의 작업 폴더와 label도 실제 응답으로 확인한다. **hook은 Claude 재시작 시 자동 실행되는지 새 컴퓨터에서 처음 한 번 실제로 확인한다.**
 4. **보고**: 점검·플러그인·team-up·표시를 각각 실제 출력으로 구분해 보고한다.
 
 금지: GJC·Herdr 본체 수정, 사용자 credentials·PATH·권한·다른 플러그인 변경, 소유하지 않은 pane 종료, 승인 없는 commit·push·tag·전역 설치.
 
-## 4. 팀장 ↔ 팀원 대화 방법
+## 4. 팀장 ↔ 구현 팀원·검토 팀원 대화 방법
 
 GJC는 Herdr가 *감지*한 agent가 아니라 상태 *보고*만 있어, `herdr agent prompt gjc-herdr-mate`는 `agent_not_ready`로 거절된다. 방향별 채널은 다르다.
 
@@ -62,6 +77,14 @@ GJC는 Herdr가 *감지*한 agent가 아니라 상태 *보고*만 있어, `herdr
   ```
   답은 반환된 `content.text`다. 팀원이 working이면 입력이 진행 중인 turn에 합쳐지므로 짧은 후속만 보낸다. timeout처럼 전송 확실성이 불명하면 재전송 전에 `herdr agent read gjc-herdr-mate`로 먼저 확인한다. 읽기 전용 관찰은 `gjc sdk session tail <session_id> --json`.
 - **팀원 → 팀장 (GJC → Claude):** GJC의 `/herdr-call` 또는 `herdr_agent_call` 도구로 대상 `gjc-herdr-lead`를 호출해 답을 받는다(이 플러그인의 기능). 팀장이 working이면 `agent_not_ready`로 거절될 수 있으며, 그러면 같은 pane에 입력을 밀어 넣지 말고 결과를 파일로 남기고 다음 기회에 알린다.
+- **팀장 → 검토 (Claude → Codex):** 요청마다 `herdr agent get gjc-herdr-critic`으로 현재 pane ID와 idle 상태를 확인한다. 빈 입력창의 idle 상태에서 `/new`로 새 대화를 연 뒤 자체 완결 지시서를 보낸다.
+  ```sh
+  herdr pane send-text <pane-id> "/new"
+  herdr pane send-keys <pane-id> enter
+  herdr agent prompt gjc-herdr-critic "<검토 지시서>" --wait --timeout <ms>
+  ```
+  보낸 뒤 `herdr agent get gjc-herdr-critic`으로 이름이 여전히 그 pane을 가리키는지 확인한다. 다른 팀에서 `/new` 뒤 첫 입력으로 Codex 세션이 바뀌며 agent 이름이 풀린 사례가 있었다. 풀렸으면 `herdr agent rename <pane-id> gjc-herdr-critic`으로 다시 붙인다.
+  지시서에 결과를 **작업 폴더의 지정 파일**로 쓰고 경로를 회신하도록 적는다. pane 출력은 접혀 보일 수 있고 working 중에는 read가 불가하므로, 완료·idle/done을 확인한 뒤 그 파일을 읽어 본문을 받는다. Codex → 팀장 직접 호출은 기대하지 않는다(샌드박스는 없지만 직접 호출 경로는 미확인이다). timeout이면 자동 재전송·`/new` 입력을 하지 말고 공개 상태와 결과 파일의 완료 여부부터 확인한다.
 - 슬래시 명령(`/rename` 등)은 SDK 텍스트로 실행되지 않는다. 필요하면 사용자 승인 후 `herdr pane send-text <pane-id> "/명령"` + `herdr pane send-keys <pane-id> enter`를 입력창이 빈 idle 상태에서만 쓴다. `pane` 명령은 agent 이름이 아니라 pane ID만 받으므로 `herdr agent get <이름>`으로 pane ID를 얻는다.
 - 큰 근거·로그는 채팅에 붙이지 말고 파일 경로와 sha256으로 공유한다.
 
@@ -70,6 +93,9 @@ GJC는 Herdr가 *감지*한 agent가 아니라 상태 *보고*만 있어, `herdr
 - 사용자 지시는 팀장이 받는다. 팀원이 직접 받으면 팀장에게 요약해 알리고, 범위 확대는 팀장 확인 후 한다.
 - 배정에는 목적 한 줄, 맡길 결과, 쓰기 허용 파일(최대 3–5개), 금지 사항, 회신 방식, 배경(상대에게 대화 이력이 없다고 가정)을 적는다. 같은 파일을 동시에 쓰지 않는다.
 - 팀원은 관측 사실 / source 근거 / 가설 / 미확인을 구분해 보고하고, 팀장은 직접 확인한 사실만 사용자에게 보고한다.
+- 검토 요청마다 idle 상태에서 **`/new`**를 한다. 이전 회차·팀장 설명을 기억하면 같은 시각에 끌려가 같은 결함을 놓칠 수 있으므로 독립성을 유지하기 위한 규칙이다. 진행 중이거나 승인·질문 UI가 있으면 새 대화를 강제로 시작하지 않는다.
+- 검토 지시서는 대화 이력이 없어도 수행 가능한 자체 완결 문서다. 2회차라면 1회차 지적 목록·근거 파일 경로·sha256을 새 지시서에 싣는다.
+- 구현(GJC)과 검토(Codex)를 같은 회차에 섞지 않는다. Codex는 검토 결과 파일만 작업 폴더에 작성하며 저장소 쓰기·commit·적용은 금지한다. **`--yolo`는 사용자 지시이고 샌드박스가 없으므로 이 금지는 지시서 규칙으로 지킨다.** 검토 결과가 팀장 검증이나 사용자 승인을 대신하지 않는다.
 - 확인된 요구 없이 기능·테스트·추상화를 늘리지 않는다(최소 구현).
 - 다른 프로젝트의 agent·workspace(다른 workspace의 이름이 다른 agent)는 팀원이 아니므로 호출·입력하지 않는다.
 - 이 저장소의 루트 `AGENTS.md`는 작성자의 로컬 비공개 파일이라 clone에는 없다. 팀원에게는 팀장이 첫 배정 메시지에 위 규칙의 필요한 부분을 직접 전달한다.
@@ -79,6 +105,8 @@ GJC는 Herdr가 *감지*한 agent가 아니라 상태 *보고*만 있어, `herdr
 | 증상 | 원인·조치 |
 |---|---|
 | 팀원 pane이 안 생김 | hook이 가드에서 종료됨(Herdr 밖, cwd가 프로젝트 밖, `GJCH_TEAM_ROLE` 설정, `herdr`/`python3` 없음). `scripts/check-env.sh`와 `scripts/team-up.sh --spawn` 출력 확인 |
+| Codex pane이 안 생김 | `codex` 없음 또는 `GJCH_TEAM_CODEX=0`이면 선택 단계 생략. 기존 critic이 있으면 새 pane을 만들지 않음. 저장소 자체·내부·상위 작업 폴더는 거부하므로 `GJCH_CODEX_WORKDIR`의 실제 경로와 stderr를 확인 |
+| `/clear` 뒤 팀장 이름(`gjc-herdr-lead`)이 사라짐 | hook은 `startup`에서만 실행된다. `scripts/team-up.sh`를 다시 실행해 이름·label을 되찾는다 |
 | agent 이름이 이미 사용 중 | 다른 pane이 점유 중이라 label을 건드리지 않음(의도된 동작). 이름은 pane 종료·교체 시 사라짐 |
 | sidebar에 모델·세션이 안 보임 | 플러그인 설치됨 ≠ 로드됨 ≠ 표시됨. 실행 중이던 GJC를 재시작하고 `herdr pane get <pane-id>`의 token을 확인, 이후 README "Sidebar 설정" |
 | `agent_not_ready` | 대상이 감지되지 않았거나 working/blocked. GJC 대상은 위 SDK 경로를 쓴다 |
