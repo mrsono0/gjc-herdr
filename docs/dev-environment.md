@@ -77,13 +77,15 @@ GJC는 Herdr가 *감지*한 agent가 아니라 상태 *보고*만 있어, `herdr
   ```
   답은 반환된 `content.text`다. 팀원이 working이면 입력이 진행 중인 turn에 합쳐지므로 짧은 후속만 보낸다. timeout처럼 전송 확실성이 불명하면 재전송 전에 `herdr agent read gjc-herdr-mate`로 먼저 확인한다. 읽기 전용 관찰은 `gjc sdk session tail <session_id> --json`.
 - **팀원 → 팀장 (GJC → Claude):** GJC의 `/herdr-call` 또는 `herdr_agent_call` 도구로 대상 `gjc-herdr-lead`를 호출해 답을 받는다(이 플러그인의 기능). 팀장이 working이면 `agent_not_ready`로 거절될 수 있으며, 그러면 같은 pane에 입력을 밀어 넣지 말고 결과를 파일로 남기고 다음 기회에 알린다.
-- **팀장 → 검토 (Claude → Codex):** 요청마다 `herdr agent get gjc-herdr-critic`으로 현재 pane ID와 idle 상태를 확인한다. 빈 입력창의 idle 상태에서 `/new`로 새 대화를 연 뒤 자체 완결 지시서를 보낸다.
+- **팀장 → 검토 (Claude → Codex):** 자체 완결 지시서 파일을 스크립트로 보낸다. 같은 workspace의 소유 Codex가 idle/done·비포커스일 때만 시작하며, 저장소 스냅숏 → 빈 입력란 확인 → 필요 시 `/new`·새 화면 준비 확인 → pane ID로 전송·working 수락 확인 → 전송 뒤 이름 확인·필요 시 재등록 → 고정 pane의 완료 대기 → 저장소 비교를 수행한다.
   ```sh
-  herdr pane send-text <pane-id> "/new"
-  herdr pane send-keys <pane-id> enter
-  herdr agent prompt gjc-herdr-critic "<검토 지시서>" --wait --timeout <ms>
+  scripts/critic-send.sh <지시서 파일>                    # 기본 30분
+  scripts/critic-send.sh --timeout 3600000 <지시서 파일>   # 대기 한도 1시간
+  scripts/critic-send.sh --no-wait <지시서 파일>           # 수락까지 확인하고 반환
+  scripts/critic-send.sh --compare <출력된 스냅숏 파일>    # 완료 확인 뒤 나중 비교
   ```
-  보낸 뒤 `herdr agent get gjc-herdr-critic`으로 이름이 여전히 그 pane을 가리키는지 확인한다. 다른 팀에서 `/new` 뒤 첫 입력으로 Codex 세션이 바뀌며 agent 이름이 풀린 사례가 있었다. 풀렸으면 `herdr agent rename <pane-id> gjc-herdr-critic`으로 다시 붙인다.
+  이름·작업 폴더는 `team-up.sh`와 같은 `GJCH_CRITIC_NAME`·`GJCH_CODEX_WORKDIR`를 사용한다. 입력 전에 빈 placeholder(`Ask Codex to do anything`)가 보이지 않으면 draft·불확실한 화면으로 거부하며 자동 삭제하지 않는다. 이미 빈 새 화면(context 100%, 입출력 0)이면 `/new` 없이 보낸다. 기존 대화에서는 `/new` 뒤 새 화면과 revision/상태 seq 변경·idle/done·`interactive_ready`를 함께 확인하며, 30초 안에 준비되지 않으면 지시서를 보내지 않는다. 스냅숏은 저장소 밖 `/tmp`에 남긴다. 종료 코드 1은 조건 거부·확인 실패(지시서 전송 전 준비 timeout 포함), 2는 `/new`·지시서 전송 불확실 또는 완료 대기 timeout, 3은 저장소 변화다. `--compare`는 다른 옵션과 함께 쓰지 않는다. 전송 시도 뒤 중단하거나 `--no-wait`로 반환하면 재전송하지 말고 공개 상태·완료를 확인한 뒤 출력된 `--compare` 명령을 쓴다. focus/occupant 확인과 입력은 원자적이지 않으며, 화면 형식이 달라지면 안전하게 거부한다.
+  스크립트를 못 쓸 때만 수동으로 **소유 pane·idle/done·비포커스·빈 입력란 확인 → 기존 대화이면 `/new`·새 입력란 준비 관측 → `herdr agent prompt <pane-id> "<지시서>" --wait --timeout <ms>` → 전송 뒤 이름 확인** 순서를 따른다. `interactive_ready`나 고정 sleep만으로는 준비를 판단하지 않는다. 이름이 풀렸으면 다른 pane이 점유하지 않았음을 확인하고 `herdr agent rename <pane-id> gjc-herdr-critic`으로 다시 붙인다. 완료 대기는 이름이 풀려도 고정 pane·terminal·workspace·cwd로 계속하며, 다른 이름으로 바뀌면 중단한다. 수동 경로의 저장소 전후 비교도 생략하지 않는다.
   지시서에 결과를 **작업 폴더의 지정 파일**로 쓰고 경로를 회신하도록 적는다. pane 출력은 접혀 보일 수 있고 working 중에는 read가 불가하므로, 완료·idle/done을 확인한 뒤 그 파일을 읽어 본문을 받는다. Codex → 팀장 직접 호출은 기대하지 않는다(샌드박스는 없지만 직접 호출 경로는 미확인이다). timeout이면 자동 재전송·`/new` 입력을 하지 말고 공개 상태와 결과 파일의 완료 여부부터 확인한다.
 - 슬래시 명령(`/rename` 등)은 SDK 텍스트로 실행되지 않는다. 필요하면 사용자 승인 후 `herdr pane send-text <pane-id> "/명령"` + `herdr pane send-keys <pane-id> enter`를 입력창이 빈 idle 상태에서만 쓴다. `pane` 명령은 agent 이름이 아니라 pane ID만 받으므로 `herdr agent get <이름>`으로 pane ID를 얻는다.
 - 큰 근거·로그는 채팅에 붙이지 말고 파일 경로와 sha256으로 공유한다.
@@ -93,9 +95,11 @@ GJC는 Herdr가 *감지*한 agent가 아니라 상태 *보고*만 있어, `herdr
 - 사용자 지시는 팀장이 받는다. 팀원이 직접 받으면 팀장에게 요약해 알리고, 범위 확대는 팀장 확인 후 한다.
 - 배정에는 목적 한 줄, 맡길 결과, 쓰기 허용 파일(최대 3–5개), 금지 사항, 회신 방식, 배경(상대에게 대화 이력이 없다고 가정)을 적는다. 같은 파일을 동시에 쓰지 않는다.
 - 팀원은 관측 사실 / source 근거 / 가설 / 미확인을 구분해 보고하고, 팀장은 직접 확인한 사실만 사용자에게 보고한다.
-- 검토 요청마다 idle 상태에서 **`/new`**를 한다. 이전 회차·팀장 설명을 기억하면 같은 시각에 끌려가 같은 결함을 놓칠 수 있으므로 독립성을 유지하기 위한 규칙이다. 진행 중이거나 승인·질문 UI가 있으면 새 대화를 강제로 시작하지 않는다.
+- 검토 요청은 빈 새 대화에서 시작한다. 이미 빈 새 화면이면 그대로 보내고, 기존 대화이면 idle/done·빈 입력란을 확인한 뒤 **`/new`**를 한다. 이전 회차·팀장 설명에 끌려가지 않도록 독립성을 유지하기 위한 규칙이다. 진행 중이거나 승인·질문 UI가 있으면 새 대화를 강제로 시작하지 않는다.
 - 검토 지시서는 대화 이력이 없어도 수행 가능한 자체 완결 문서다. 2회차라면 1회차 지적 목록·근거 파일 경로·sha256을 새 지시서에 싣는다.
 - 구현(GJC)과 검토(Codex)를 같은 회차에 섞지 않는다. Codex는 검토 결과 파일만 작업 폴더에 작성하며 저장소 쓰기·commit·적용은 금지한다. **`--yolo`는 사용자 지시이고 샌드박스가 없으므로 이 금지는 지시서 규칙으로 지킨다.** 검토 결과가 팀장 검증이나 사용자 승인을 대신하지 않는다.
+- Codex는 Herdr로 다른 pane에 입력하거나 다른 agent의 승인·질문 대화상자에 응답하지 않는다. 이 금지도 검토 지시서에 적는다.
+- 팀장은 Codex 작업 전후 저장소 상태를 비교한다(`critic-send.sh` 정상 완료 시 자동 수행, 중단·`--no-wait` 뒤에는 완료 확인 후 `--compare`). HEAD의 commit·symbolic target(detached 여부 포함)·ref·stash·index·작업 트리(추적·untracked 파일 내용 포함)의 변화는 보지만 gitignore된 untracked 경로의 쓰기는 보이지 않는다. 변화가 있으면 확인하며, 동시 팀장 작업도 가능하므로 Codex 위반으로 단정하지 않는다. 작업 중 바뀌었다가 원복된 내용도 전후 비교만으로는 알 수 없다.
 - 확인된 요구 없이 기능·테스트·추상화를 늘리지 않는다(최소 구현).
 - 다른 프로젝트의 agent·workspace(다른 workspace의 이름이 다른 agent)는 팀원이 아니므로 호출·입력하지 않는다.
 - 이 저장소의 루트 `AGENTS.md`는 작성자의 로컬 비공개 파일이라 clone에는 없다. 팀원에게는 팀장이 첫 배정 메시지에 위 규칙의 필요한 부분을 직접 전달한다.
