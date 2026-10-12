@@ -6,7 +6,7 @@ GJC의 native 상태·세션/resume 처리를 유지하면서 Herdr sidebar에 *
 
 ## 새 컴퓨터 빠른 시작 (Herdr + Claude Code 팀장 + GJC 팀원 + 선택 Codex 검토)
 
-Herdr 안에서 Claude Code(팀장)가 GJC(구현 팀원)와 선택 Codex(독립 검토·조사 팀원)에 역할을 나눠 개발하는 환경을 구성할 수 있다. AI가 읽고 따를 수 있게 준비되어 있다. Codex 자동 구성은 `GJCH_TEAM_CODEX=0`으로 끌 수 있다. Codex는 **`--yolo`(승인·샌드박스 없음)** 로 실행되므로, 저장소 쓰기·commit 금지는 지시서 규칙으로 지킨다.
+Herdr 안에서 Claude Code(팀장)가 GJC(구현 팀원)와 선택 Codex(독립 검토·조사 팀원)에 역할을 나눠 개발하는 환경을 구성할 수 있다. AI가 읽고 따를 수 있게 준비되어 있다. Codex 자동 구성은 `GJCH_TEAM_CODEX=0`으로 끌 수 있다. Codex는 **`--yolo`(승인·샌드박스 없음)** 로 저장소 루트에서 실행되므로, "파일 수정이 필요하면 먼저 팀장 허락을 받는다"는 제1원칙을 규칙 파일·지시서로 지킨다.
 
 **사람이 할 일**
 
@@ -18,7 +18,7 @@ Herdr 안에서 Claude Code(팀장)가 GJC(구현 팀원)와 선택 Codex(독립
    claude
    ```
 3. Claude에게 **"안내대로 환경 설정해줘"** 라고 말한다. 루트 `CLAUDE.md`가 자동으로 읽혀, Claude가 `scripts/check-env.sh`(읽기 전용 점검)를 실행하고 부족한 항목만 [docs/dev-environment.md](docs/dev-environment.md) 절차대로 해결한다. `gjc-herdr` 플러그인 설치와 `~/.config/herdr/config.toml` 같은 사용자 설정 변경은 승인을 요청한다.
-4. 설정이 끝나면 Claude를 한 번 재시작한다. `.claude/settings.json`의 SessionStart(`startup|clear`) hook이 `scripts/team-up.sh --hook`을 실행한다. `startup`에서는 팀장(`gjc-herdr-lead`) pane 이름을 정하고 팀원 GJC(`gjc-herdr-mate`) pane을 만든다. `codex`가 있고 끄지 않았으면 저장소 밖 결과 폴더를 사용하는 선택 검토 Codex(agent `gjc-herdr-critic`, pane label `GJCH 검토·조사 · Codex`)도 구성한다. `/clear` 뒤에는 팀장 이름·pane label과, 비었거나 폴더명 기본값인 작업공간 label만 복구하며, 팀원·검토 pane이 없어도 새로 만들지 않는다. `herdr agent list`로 구성 예정인 agent가 보이는지 확인한다.
+4. 설정이 끝나면 Claude를 한 번 재시작한다. `.claude/settings.json`의 SessionStart(`startup|clear`) hook이 `scripts/team-up.sh --hook`을 실행한다. `startup`에서는 팀장(`gjc-herdr-lead`) pane 이름을 정하고 팀원 GJC(`gjc-herdr-mate`) pane을 만든다. `codex`가 있고 끄지 않았으면 저장소 루트에서 실행되는 선택 검토 Codex(agent `gjc-herdr-critic`, pane label `GJCH 검토·조사 · Codex`)도 구성한다. `/clear` 뒤에는 팀장 이름·pane label과, 비었거나 폴더명 기본값인 작업공간 label만 복구하며, 팀원·검토 pane이 없어도 새로 만들지 않는다. `herdr agent list`로 구성 예정인 agent가 보이는지 확인한다.
 
 **필요한 프로그램**
 

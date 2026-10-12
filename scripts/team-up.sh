@@ -5,7 +5,7 @@
 #   scripts/team-up.sh --spawn   기본 동작 + 없는 GJC 팀원·선택 Codex 검토 구성(남은 빈 셸 pane 재사용)
 #   GJCH_TEAM_CODEX=0은 Codex 생성을 끈다. Codex는 사용자 지시로 --yolo(샌드박스 없음)를 사용한다.
 #   --no-daemon은 공유 daemon 환경의 훅이 세션 ID를 다른 pane으로 보고하는 것을 막는다.
-#   검토 결과 폴더는 저장소 밖에 두며, 저장소 쓰기·commit 금지는 검토 지시서로 지킨다.
+#   Codex는 저장소 루트에서 실행하며, 파일 수정은 먼저 팀장 허락을 받는다는 규칙(AGENTS.md·지시서)으로 지킨다.
 # 아무것도 덮어쓰지 않는다: 이미 다른 pane이 쓰는 이름은 건드리지 않고, 작업공간 label은 비었거나 폴더명(Herdr 기본값)일 때만 설정한다.
 set -u
 
@@ -163,13 +163,6 @@ fi
 return 0
 }
 
-# 두 경로는 realpath/pwd -P로 정규화한 값이다. 끝의 /로 이름 접두가 같은 형제 폴더를 구별한다.
-critic_workdir_allowed() {
-	case "${1%/}/" in "${ROOT%/}/"*) return 1 ;; esac
-	case "${ROOT%/}/" in "${1%/}/"*) return 1 ;; esac
-	return 0
-}
-
 # --- 독립 검토 Codex (GJC 단계 성공 여부와 무관하게 수행) ---
 spawn_critic() {
 	local existing workdir pane anchor direction mate_workspace
@@ -186,18 +179,7 @@ spawn_critic() {
 		echo "critic already exists at $existing; nothing spawned"
 		return 0
 	fi
-	workdir="${GJCH_CODEX_WORKDIR:-$(dirname "$ROOT")/$(basename "$ROOT")-codex-work}"
-	workdir="$(realpath "$workdir")" || return 1
-	if ! critic_workdir_allowed "$workdir"; then
-		echo "Codex workdir must be separate from $ROOT (not the root, a child, or an ancestor): $workdir" >&2
-		return 1
-	fi
-	mkdir -p "$workdir" || return 1
-	workdir="$(cd "$workdir" && pwd -P)" || return 1
-	if ! critic_workdir_allowed "$workdir"; then
-		echo "Codex workdir must be separate from $ROOT (not the root, a child, or an ancestor): $workdir" >&2
-		return 1
-	fi
+	workdir="$ROOT"
 	pane="$(herdr pane list | python3 -c 'import sys,json,os
 workdir,ws,label=sys.argv[1:4]
 try: panes=json.load(sys.stdin)["result"]["panes"]
@@ -224,7 +206,7 @@ for p in panes:
 		echo "Codex start failed for $pane" >&2
 		return 1
 	fi
-	echo "spawned $CRITIC_NAME at $pane; results directory: $workdir"
+	echo "spawned $CRITIC_NAME at $pane (cwd $ROOT)"
 }
 
 mate_status=0
