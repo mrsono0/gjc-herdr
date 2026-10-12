@@ -76,6 +76,8 @@ GJC는 Herdr가 *감지*한 agent가 아니라 상태 *보고*만 있어, `herdr
   gjc sdk session send <session_id> --text "<요청>" --wait --timeout-ms 120000
   ```
   답은 반환된 `content.text`다. 팀원이 working이면 입력이 진행 중인 turn에 합쳐지므로 짧은 후속만 보낸다. timeout처럼 전송 확실성이 불명하면 재전송 전에 `herdr agent read gjc-herdr-mate`로 먼저 확인한다. 읽기 전용 관찰은 `gjc sdk session tail <session_id> --json`.
+  `endpoint_stale` 등으로 SDK 전송이 실패하면 재전송하지 않고 응답의 `operationRef`와 상태를 보존한다. `GJC_SDK_BROKER_AUTOSTART=0 gjc sdk session list --attach-only --scope all`로 기존 broker만 조회해(broker를 새로 띄우거나 재기동하지 않는다) 팀원의 `tokens.gjc_herdr_session_id`와 같은 ID가 있는지 확인한다. SDK endpoint 파일이나 listen 포트가 있어도 세션 등록을 뜻하지 않는다. `broker_unavailable` 등 조회 실패는 등록 누락으로 판정하지 않는다.
+  조회가 성공한 전체 목록에 그 ID가 없을 때만 인계할 내용을 파일로 남기고 **사용자 승인 후** 팀원 GJC를 `/exit`로 정상 종료한 뒤 `scripts/team-up.sh --spawn`으로 재시작한다. 재시작하면 팀원의 대화 맥락이 사라진다. 회복은 새 세션 ID의 목록 등록과 무해한 SDK 전송 1회·답변으로 확인한다. 그동안 급한 전달은 기존 수동 입력 규칙대로 팀원 pane의 idle·비포커스·빈 입력란을 확인한 뒤 pane 입력을 쓴다. 자동 fallback·자동 재시작은 하지 않는다.
 - **팀원 → 팀장 (GJC → Claude):** GJC의 `/herdr-call` 또는 `herdr_agent_call` 도구로 대상 `gjc-herdr-lead`를 호출해 답을 받는다(이 플러그인의 기능). 입력 보호를 거치지 않는 bash의 `herdr agent prompt`·`herdr pane send-text`/`send-keys` 직접 호출은 하지 않는다. 팀장이 working이면 `agent_not_ready`로 거절될 수 있으며, 그러면 같은 pane에 입력을 밀어 넣지 말고 결과를 파일로 남기고 다음 기회에 알린다.
 - **팀장 → 검토 (Claude → Codex):** 자체 완결 지시서 파일을 스크립트로 보낸다. 같은 workspace의 소유 Codex가 idle/done·비포커스일 때만 시작하며, 저장소 스냅숏 → 빈 입력란 확인 → 필요 시 `/new`·새 화면 준비 확인 → pane ID로 전송·working 수락 확인 → 전송 뒤 이름 확인·필요 시 재등록 → 고정 pane의 완료 대기 → 저장소 비교를 수행한다.
   ```sh
@@ -114,5 +116,6 @@ GJC는 Herdr가 *감지*한 agent가 아니라 상태 *보고*만 있어, `herdr
 | agent 이름이 이미 사용 중 | 다른 pane이 점유 중이라 label을 건드리지 않음(의도된 동작). 이름은 pane 종료·교체 시 사라짐 |
 | sidebar에 모델·세션이 안 보임 | 플러그인 설치됨 ≠ 로드됨 ≠ 표시됨. 실행 중이던 GJC를 재시작하고 `herdr pane get <pane-id>`의 token을 확인, 이후 README "Sidebar 설정" |
 | `agent_not_ready` | 대상이 감지되지 않았거나 working/blocked. GJC 대상은 위 SDK 경로를 쓴다 |
+| `gjc sdk session send`의 `endpoint_stale` | 재전송하지 않고 `operationRef`·상태를 보존한다. `GJC_SDK_BROKER_AUTOSTART=0 gjc sdk session list --attach-only --scope all`에서 팀원 token의 세션 ID 등록을 확인한다(endpoint 파일·포트 존재 ≠ 등록, 조회 실패 ≠ 누락). 성공한 목록에 없으면 §4대로 인계 파일을 남기고 사용자 승인 후 정상 종료·`scripts/team-up.sh --spawn` 재시작, 새 ID 등록·무해한 SDK 왕복 1회로 회복 확인. 이슈 #8에서는 실행 중 `gjc` 교체 뒤 세션 등록 누락을 관측했고 재시작 후 회복했으나, 등록 누락의 최초 원인은 미확정이다 |
 
 더 자세한 사용법은 [README](../README.md)를 참조한다.
