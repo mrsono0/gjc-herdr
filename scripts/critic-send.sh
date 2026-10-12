@@ -123,11 +123,50 @@ now_ms() { printf '%s\n' "$((SECONDS * 1000))"; }
 # 마지막 입력란이 빈 placeholder인 경우만 허용한다(이전 대화의 echo와 구별).
 screen_matches() { # 화면, empty|readable|fresh|typing|new
 	printf '%s' "$1" | python3 -c 'import re,sys
-s=sys.stdin.read()
+raw=sys.stdin.read()
+# src/input.ts와 같은 SGR 0·2·22 및 색상 인자 처리. 글자별 dim 상태를 보존한다.
+parts=[]
+dim_chars=[]
+dim=False
+end=0
+for match in re.finditer(r"\x1b\[([0-9;:]*)m",raw):
+    text=raw[end:match.start()]
+    parts.append(text)
+    dim_chars.extend([dim]*len(text))
+    end=match.end()
+    params=match.group(1).split(";")
+    i=0
+    while i<len(params):
+        param=params[i]
+        code=int(param.split(":",1)[0] or "0")
+        if code in (38,48):
+            if ":" in param:
+                color=param.split(":")
+                if not ((len(color)==3 and color[1]=="5") or (len(color) in (5,6) and color[1]=="2")):
+                    sys.exit(1)
+                values=color[-1:] if color[1]=="5" else color[-3:]
+            else:
+                mode=params[i+1] if i+1<len(params) else ""
+                count=2 if mode=="5" else 4 if mode=="2" else 0
+                if not count or i+count>=len(params): sys.exit(1)
+                values=params[i+2:i+count+1]
+                i+=count
+            if not all(value.isdecimal() and 0<=int(value)<=255 for value in values): sys.exit(1)
+        elif code==0: dim=False
+        elif code==2: dim=True
+        elif code==22: dim=False
+        i+=1
+text=raw[end:]
+parts.append(text)
+dim_chars.extend([dim]*len(text))
+s="".join(parts)
+# 잘린 SGR이나 다른 escape는 흐림 상태를 해석할 수 없으므로 거부한다.
+if "\x1b" in s: sys.exit(1)
 # 들여쓴 ›는 이어지는 draft 내용일 수 있으므로 0번째 칸만 후보로 본다.
 prompts=list(re.finditer(r"(?m)^›([^\n]*)$",s))
 last=prompts[-1].group(1).strip() if prompts else None
-empty=last=="Ask Codex to do anything"
+start=prompts[-1].start(1)+len(prompts[-1].group(1))-len(prompts[-1].group(1).lstrip()) if prompts else 0
+empty=last=="Ask Codex to do anything" and all(dim_chars[start:start+len(last)])
 footer=[line.strip() for line in s[prompts[-1].end():].splitlines() if line.strip()] if prompts else []
 hint="← for agents · ? for shortcuts"
 hint_line=footer[1] if len(footer)==2 else ""
@@ -150,7 +189,7 @@ clipped=re.fullmatch(r"(?: ·(?: ?…| \d+(?:\.\d*)?[KM]?(?: (?:o|ou|out)?)?…)
 readable=bool(last) and hint_ok and bool(status) and (not tail or bool(clipped) or bool(output))
 # 누적 입력 0으로 이전 대화와 구별한다. 헤더·잘린 출력 카운터에 의존하지 않는다.
 fresh=empty and readable and status.group(1)=="100" and status.group(2)=="0" and (not output or output.group(1)=="0")
-typing=last is not None and last not in ("", "Ask Codex to do anything")
+typing=last is not None and last!="" and not empty
 new=last=="/new"
 sys.exit(0 if {"empty":empty,"readable":readable,"fresh":fresh,"typing":typing,"new":new}[sys.argv[1]] else 1)' "$2"
 }
@@ -212,8 +251,8 @@ ready_deadline=$(( $(now_ms) + 30000 ))
 # 입력 직전에 다시 확인한다. 이후의 focus/occupant 변경과 입력은 원자적이지 않다.
 agent="$(herdr agent get "$CRITIC_NAME")" || fail '새 대화 전 대상 확인 실패.'
 validate_agent "$agent" 1 1 || exit 1
-screen="$(herdr pane read "$pane" --source visible)" || fail '전송 전 입력란 확인 실패.'
-screen_matches "$screen" empty || screen_size_failure '입력란에 draft가 있거나 입력란 형식이 불확실합니다.'
+screen="$(herdr pane read "$pane" --source visible --format ansi)" || fail '전송 전 입력란 확인 실패.'
+screen_matches "$screen" empty || screen_size_failure '입력란에 draft가 있거나 흐린 placeholder를 확인할 수 없습니다.'
 screen_matches "$screen" readable || screen_size_failure
 delivery_kind=""
 trap 'delivery_followup "$?"' EXIT
@@ -234,7 +273,7 @@ else
 		[ "$(now_ms)" -lt "$new_text_deadline" ] || { echo '/new 입력 반영 확인 timeout. Enter와 지시서는 보내지 않았습니다.' >&2; exit 2; }
 		agent="$(herdr agent get "$pane")" || fail 'Enter 전 대상 확인 실패.'
 		validate_agent "$agent" 1 1 || exit 1
-		screen="$(herdr pane read "$pane" --source visible)" || fail 'Enter 전 /new 입력란 확인 실패.'
+		screen="$(herdr pane read "$pane" --source visible --format ansi)" || fail 'Enter 전 /new 입력란 확인 실패.'
 		if screen_matches "$screen" new; then break; fi
 		if screen_matches "$screen" typing; then
 			echo 'Enter 전 입력란에 /new와 다른 글이 있습니다. Enter와 지시서는 보내지 않았습니다.' >&2
@@ -259,7 +298,7 @@ while :; do
 	[ "$focused" = False ] || fail 'pane에 focus가 생겨 지시서를 보내지 않았습니다.'
 	status="$(printf '%s' "$agent" | jget result.agent.agent_status)"
 	case "$status" in blocked|unknown) fail "새 입력란 상태=$status. 지시서를 보내지 않았습니다." ;; esac
-	screen="$(herdr pane read "$pane" --source visible)" || fail '새 대화 화면 확인 실패.'
+	screen="$(herdr pane read "$pane" --source visible --format ansi)" || fail '새 대화 화면 확인 실패.'
 	# 한 번의 과도 화면만으로 단정하지 않고 1초 간격 두 관측에서 글이 남으면 중단한다.
 	if screen_matches "$screen" typing; then
 		draft_reads=$((draft_reads + 1))
@@ -281,7 +320,7 @@ done
 fi
 agent="$(herdr agent get "$CRITIC_NAME")" || fail '전송 직전 이름 확인 실패.'
 validate_agent "$agent" 1 1 || exit 1
-screen="$(herdr pane read "$pane" --source visible)" || fail '전송 직전 입력란 확인 실패.'
+screen="$(herdr pane read "$pane" --source visible --format ansi)" || fail '전송 직전 입력란 확인 실패.'
 screen_matches "$screen" readable || screen_size_failure
 screen_matches "$screen" fresh || fail '전송 직전 새 입력란이 더 이상 비어 있지 않거나 준비되지 않았습니다. 지시서는 보내지 않았습니다.'
 # 최종 관측이 늦게 반환된 경우도 준비 한도를 다시 확인한다.
