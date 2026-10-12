@@ -168,7 +168,7 @@ last=prompts[-1].group(1).strip() if prompts else None
 start=prompts[-1].start(1)+len(prompts[-1].group(1))-len(prompts[-1].group(1).lstrip()) if prompts else 0
 empty=last=="Ask Codex to do anything" and all(dim_chars[start:start+len(last)])
 footer=[line.strip() for line in s[prompts[-1].end():].splitlines() if line.strip()] if prompts else []
-hint="← for agents · ? for shortcuts"
+hints=("← for agents · ? for shortcuts","? for shortcuts")
 hint_line=footer[1] if len(footer)==2 else ""
 warning=re.search(r"(?:^|[ \t]+)(⚠.*)$",hint_line)
 warning_ok=False
@@ -180,7 +180,7 @@ if warning:
         ("⚠ "+count.group(1)+" "+word+" · f2 to view").startswith(badge) for word in ("warning","warnings")))
     hint_line=hint_line[:warning.start()].rstrip()
 hint_prefix=hint_line[:-1].rstrip() if hint_line.endswith("…") else hint_line
-guide_ok=bool(hint_prefix) and hint.startswith(hint_prefix)
+guide_ok=bool(hint_prefix) and any(hint.startswith(hint_prefix) for hint in hints)
 hint_ok=len(footer)==1 or (len(footer)==2 and (guide_ok or (bool(warning) and not hint_prefix)) and (not warning or warning_ok))
 status=re.fullmatch(r".* · Context (\d+)% left · (\d+(?:\.\d+)?[KM]?) in( ·.*| …|…)?",footer[0]) if footer else None
 tail=(status.group(3) or "") if status else ""

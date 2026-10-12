@@ -4,6 +4,7 @@
 #   scripts/team-up.sh           기본 동작을 지금 수행
 #   scripts/team-up.sh --spawn   기본 동작 + 없는 GJC 팀원·선택 Codex 검토 구성(남은 빈 셸 pane 재사용)
 #   GJCH_TEAM_CODEX=0은 Codex 생성을 끈다. Codex는 사용자 지시로 --yolo(샌드박스 없음)를 사용한다.
+#   --no-daemon은 공유 daemon 환경의 훅이 세션 ID를 다른 pane으로 보고하는 것을 막는다.
 #   검토 결과 폴더는 저장소 밖에 두며, 저장소 쓰기·commit 금지는 검토 지시서로 지킨다.
 # 아무것도 덮어쓰지 않는다: 이미 다른 pane이 쓰는 이름은 건드리지 않고, 작업공간 label은 비었거나 폴더명(Herdr 기본값)일 때만 설정한다.
 set -u
@@ -199,7 +200,7 @@ for p in panes:
 		[ -n "$pane" ] || { echo "Codex pane split failed" >&2; return 1; }
 	fi
 	herdr pane rename "$pane" "$CRITIC_LABEL" >/dev/null || return 1
-	if ! herdr agent start "$CRITIC_NAME" --kind codex --pane "$pane" --timeout 60000 -- --yolo -m "$CODEX_MODEL" -C "$workdir"; then
+	if ! herdr agent start "$CRITIC_NAME" --kind codex --pane "$pane" --timeout 60000 -- --no-daemon --yolo -m "$CODEX_MODEL" -C "$workdir"; then
 		echo "Codex start failed for $pane" >&2
 		return 1
 	fi
