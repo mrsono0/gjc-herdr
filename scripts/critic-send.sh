@@ -121,15 +121,54 @@ print("" if value is None else value)' "$1"
 now_ms() { printf '%s\n' "$((SECONDS * 1000))"; }
 
 # 마지막 입력란이 빈 placeholder인 경우만 허용한다(이전 대화의 echo와 구별).
-screen_matches() { # 화면, empty|fresh|typing|new
+screen_matches() { # 화면, empty|readable|fresh|typing|new
 	printf '%s' "$1" | python3 -c 'import re,sys
 s=sys.stdin.read()
-prompts=re.findall(r"(?m)^\s*› ([^\n]*)$",s)
-empty=bool(prompts) and prompts[-1].strip()=="Ask Codex to do anything"
-fresh=empty and "OpenAI Codex" in s and "Context 100% left" in s and "0 in · 0 out" in s
-typing=bool(prompts) and prompts[-1].strip() not in ("", "Ask Codex to do anything")
-new=bool(prompts) and prompts[-1].strip()=="/new"
-sys.exit(0 if {"empty":empty,"fresh":fresh,"typing":typing,"new":new}[sys.argv[1]] else 1)' "$2"
+# 들여쓴 ›는 이어지는 draft 내용일 수 있으므로 0번째 칸만 후보로 본다.
+prompts=list(re.finditer(r"(?m)^›([^\n]*)$",s))
+last=prompts[-1].group(1).strip() if prompts else None
+empty=last=="Ask Codex to do anything"
+footer=[line.strip() for line in s[prompts[-1].end():].splitlines() if line.strip()] if prompts else []
+hint="← for agents · ? for shortcuts"
+hint_line=footer[1] if len(footer)==2 else ""
+warning=re.search(r"(?:^|[ \t]+)(⚠.*)$",hint_line)
+warning_ok=False
+if warning:
+    badge=warning.group(1)
+    badge=badge[:-1].rstrip() if badge.endswith("…") else badge
+    count=re.match(r"⚠ ([0-9]+)",badge)
+    warning_ok=badge=="⚠" or (bool(count) and any(
+        ("⚠ "+count.group(1)+" "+word+" · f2 to view").startswith(badge) for word in ("warning","warnings")))
+    hint_line=hint_line[:warning.start()].rstrip()
+hint_prefix=hint_line[:-1].rstrip() if hint_line.endswith("…") else hint_line
+guide_ok=bool(hint_prefix) and hint.startswith(hint_prefix)
+hint_ok=len(footer)==1 or (len(footer)==2 and (guide_ok or (bool(warning) and not hint_prefix)) and (not warning or warning_ok))
+status=re.fullmatch(r".* · Context (\d+)% left · (\d+(?:\.\d+)?[KM]?) in( ·.*| …|…)?",footer[0]) if footer else None
+tail=(status.group(3) or "") if status else ""
+output=re.fullmatch(r" · (\d+(?:\.\d+)?[KM]?) out",tail)
+clipped=re.fullmatch(r"(?: ·(?: ?…| \d+(?:\.\d*)?[KM]?(?: (?:o|ou|out)?)?…)| …|…)",tail)
+readable=bool(last) and hint_ok and bool(status) and (not tail or bool(clipped) or bool(output))
+# 누적 입력 0으로 이전 대화와 구별한다. 헤더·잘린 출력 카운터에 의존하지 않는다.
+fresh=empty and readable and status.group(1)=="100" and status.group(2)=="0" and (not output or output.group(1)=="0")
+typing=last is not None and last not in ("", "Ask Codex to do anything")
+new=last=="/new"
+sys.exit(0 if {"empty":empty,"readable":readable,"fresh":fresh,"typing":typing,"new":new}[sys.argv[1]] else 1)' "$2"
+}
+
+screen_size_failure() {
+	local details dimensions
+	[ -z "${1:-}" ] || printf '%s\n' "$1" >&2
+	details="$(herdr pane layout --pane "$pane" | python3 -c 'import json,sys
+p=next(p for p in json.load(sys.stdin)["result"]["layout"]["panes"] if p["pane_id"]==sys.argv[1])
+w,h=p["rect"]["width"],p["rect"]["height"]
+print(str(w)+"×"+str(h)+(" small" if w<56 or h<10 else " format"))' "$pane")" || details='확인 불가 format'
+	dimensions="${details% *}"
+	if [ "${details##* }" = small ]; then
+		fail "pane이 작습니다(현재 $dimensions). 이 환경에서 확인한 56×10 이상으로 키우세요(모델 이름에 따라 폭 추가 필요). draft는 자동 삭제하지 않습니다. 지시서는 보내지 않았습니다."
+	fi
+	printf '상태 줄·안내 줄 형식을 판정할 수 없습니다(pane %s). 마지막 화면 6줄:\n' "$dimensions" >&2
+	printf '%s' "${screen:-}" | python3 -c 'import sys; print("\n".join(sys.stdin.read().splitlines()[-6:]))' >&2
+	fail '빈 placeholder와 현재 상태 줄·알려진 안내 줄 형식을 확인하세요. draft는 자동 삭제하지 않습니다. 지시서는 보내지 않았습니다.'
 }
 
 # 전송 시도 뒤 어느 실패 경로로 중단해도 같은 복구 안내를 남긴다.
@@ -174,7 +213,8 @@ ready_deadline=$(( $(now_ms) + 30000 ))
 agent="$(herdr agent get "$CRITIC_NAME")" || fail '새 대화 전 대상 확인 실패.'
 validate_agent "$agent" 1 1 || exit 1
 screen="$(herdr pane read "$pane" --source visible)" || fail '전송 전 입력란 확인 실패.'
-screen_matches "$screen" empty || fail '입력란에 draft가 있거나 화면 형식이 불확실합니다. 아무 입력도 보내지 않았습니다.'
+screen_matches "$screen" empty || screen_size_failure '입력란에 draft가 있거나 입력란 형식이 불확실합니다.'
+screen_matches "$screen" readable || screen_size_failure
 delivery_kind=""
 trap 'delivery_followup "$?"' EXIT
 trap 'exit 130' INT
@@ -209,7 +249,10 @@ else
 # 기존 대화에서만 /new를 보낸다. 이전 화면과 다른 새 빈 화면과 상태를 함께 확인한다.
 draft_reads=0
 while :; do
-	[ "$(now_ms)" -lt "$ready_deadline" ] || fail '새 입력란 준비 확인 timeout. 지시서는 보내지 않았습니다.'
+	if [ "$(now_ms)" -ge "$ready_deadline" ]; then
+		screen_matches "$screen" readable || screen_size_failure
+		fail '새 입력란 준비 확인 timeout. 지시서는 보내지 않았습니다.'
+	fi
 	agent="$(herdr agent get "$pane")" || fail '새 입력란 상태 확인 실패. 지시서는 보내지 않았습니다.'
 	validate_agent "$agent" 0 1 || exit 1
 	focused="$(printf '%s' "$agent" | jget result.agent.focused)"
@@ -239,6 +282,7 @@ fi
 agent="$(herdr agent get "$CRITIC_NAME")" || fail '전송 직전 이름 확인 실패.'
 validate_agent "$agent" 1 1 || exit 1
 screen="$(herdr pane read "$pane" --source visible)" || fail '전송 직전 입력란 확인 실패.'
+screen_matches "$screen" readable || screen_size_failure
 screen_matches "$screen" fresh || fail '전송 직전 새 입력란이 더 이상 비어 있지 않거나 준비되지 않았습니다. 지시서는 보내지 않았습니다.'
 # 최종 관측이 늦게 반환된 경우도 준비 한도를 다시 확인한다.
 observed_ms="$(now_ms)"
