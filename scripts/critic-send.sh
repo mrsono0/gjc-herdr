@@ -101,7 +101,10 @@ if [ -n "$compare" ]; then
 fi
 [ -n "$brief" ] && [ -r "$brief" ] && [ -f "$brief" ] || fail '읽을 수 있는 지시서 파일이 필요합니다.'
 case "$timeout" in ''|*[!0-9]*) fail '--timeout은 양의 정수(ms)여야 합니다.' ;; esac
-[ "$timeout" -gt 0 ] || fail '--timeout은 양의 정수(ms)여야 합니다.'
+[ "${#timeout}" -le 9 ] || fail '--timeout은 1–86400000ms(24시간) 범위여야 합니다(최대 9자리).'
+[ "$timeout" -gt 0 ] && [ "$timeout" -le 86400000 ] || fail '--timeout은 1–86400000ms(24시간) 범위여야 합니다.'
+# bash 3.2의 SECONDS 해상도에 맞춰 ms 인자를 초 단위로 올림한다.
+timeout=$(( (10#$timeout + 999) / 1000 * 1000 ))
 [ "${HERDR_ENV:-}" = 1 ] && [ -n "${HERDR_WORKSPACE_ID:-}" ] && [ -n "${HERDR_PANE_ID:-}" ] || fail 'Herdr workspace 안에서 실행합니다.'
 command -v herdr >/dev/null || fail 'herdr가 필요합니다.'
 WORKDIR="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$WORKDIR")"
@@ -114,16 +117,19 @@ for key in sys.argv[1].split("."):
     value=value.get(key) if isinstance(value,dict) else None
 print("" if value is None else value)' "$1"
 }
-now_ms() { python3 -c 'import time; print(time.monotonic_ns() // 1000000)'; }
+# command substitution도 같은 bash 시작 시각을 상속한다(별도 Python clock을 쓰지 않음).
+now_ms() { printf '%s\n' "$((SECONDS * 1000))"; }
 
 # 마지막 입력란이 빈 placeholder인 경우만 허용한다(이전 대화의 echo와 구별).
-screen_matches() { # 화면, empty|fresh
+screen_matches() { # 화면, empty|fresh|typing|new
 	printf '%s' "$1" | python3 -c 'import re,sys
 s=sys.stdin.read()
 prompts=re.findall(r"(?m)^\s*› ([^\n]*)$",s)
 empty=bool(prompts) and prompts[-1].strip()=="Ask Codex to do anything"
 fresh=empty and "OpenAI Codex" in s and "Context 100% left" in s and "0 in · 0 out" in s
-sys.exit(0 if (empty if sys.argv[1]=="empty" else fresh) else 1)' "$2"
+typing=bool(prompts) and prompts[-1].strip() not in ("", "Ask Codex to do anything")
+new=bool(prompts) and prompts[-1].strip()=="/new"
+sys.exit(0 if {"empty":empty,"fresh":fresh,"typing":typing,"new":new}[sys.argv[1]] else 1)' "$2"
 }
 
 # 전송 시도 뒤 어느 실패 경로로 중단해도 같은 복구 안내를 남긴다.
@@ -171,6 +177,8 @@ screen="$(herdr pane read "$pane" --source visible)" || fail '전송 전 입력�
 screen_matches "$screen" empty || fail '입력란에 draft가 있거나 화면 형식이 불확실합니다. 아무 입력도 보내지 않았습니다.'
 delivery_kind=""
 trap 'delivery_followup "$?"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 if screen_matches "$screen" fresh; then
 	echo '이미 빈 새 대화입니다. /new 전송 생략.'
 else
@@ -179,10 +187,27 @@ else
 	[ -n "$revision" ] && [ -n "$sequence" ] || fail '새 대화 준비 관측용 revision·상태 seq가 없습니다.'
 	delivery_kind='/new'
 	herdr pane send-text "$pane" '/new' || { echo '/new 입력 결과가 불확실합니다.' >&2; exit 2; }
+	# 입력 반영을 관측한 뒤 Enter 한 번만 보낸다. 전체 준비/대기 한도도 넘기지 않는다.
+	new_text_deadline=$(( $(now_ms) + 5000 ))
+	[ "$new_text_deadline" -le "$ready_deadline" ] || new_text_deadline="$ready_deadline"
+	while :; do
+		[ "$(now_ms)" -lt "$new_text_deadline" ] || { echo '/new 입력 반영 확인 timeout. Enter와 지시서는 보내지 않았습니다.' >&2; exit 2; }
+		agent="$(herdr agent get "$pane")" || fail 'Enter 전 대상 확인 실패.'
+		validate_agent "$agent" 1 1 || exit 1
+		screen="$(herdr pane read "$pane" --source visible)" || fail 'Enter 전 /new 입력란 확인 실패.'
+		if screen_matches "$screen" new; then break; fi
+		if screen_matches "$screen" typing; then
+			echo 'Enter 전 입력란에 /new와 다른 글이 있습니다. Enter와 지시서는 보내지 않았습니다.' >&2
+			exit 2
+		fi
+		sleep 1
+	done
+	[ "$(now_ms)" -lt "$new_text_deadline" ] || { echo '/new 입력 반영 확인 timeout. Enter와 지시서는 보내지 않았습니다.' >&2; exit 2; }
 	herdr pane send-keys "$pane" enter || { echo '/new 제출 결과가 불확실합니다.' >&2; exit 2; }
-	echo '/new 제출 완료. 새 입력란 준비를 확인합니다.'
+	echo '/new·Enter 전송 요청 완료. 새 입력란 준비를 확인합니다.'
 
 # 기존 대화에서만 /new를 보낸다. 이전 화면과 다른 새 빈 화면과 상태를 함께 확인한다.
+draft_reads=0
 while :; do
 	[ "$(now_ms)" -lt "$ready_deadline" ] || fail '새 입력란 준비 확인 timeout. 지시서는 보내지 않았습니다.'
 	agent="$(herdr agent get "$pane")" || fail '새 입력란 상태 확인 실패. 지시서는 보내지 않았습니다.'
@@ -192,11 +217,20 @@ while :; do
 	status="$(printf '%s' "$agent" | jget result.agent.agent_status)"
 	case "$status" in blocked|unknown) fail "새 입력란 상태=$status. 지시서를 보내지 않았습니다." ;; esac
 	screen="$(herdr pane read "$pane" --source visible)" || fail '새 대화 화면 확인 실패.'
+	# 한 번의 과도 화면만으로 단정하지 않고 1초 간격 두 관측에서 글이 남으면 중단한다.
+	if screen_matches "$screen" typing; then
+		draft_reads=$((draft_reads + 1))
+		[ "$draft_reads" -lt 2 ] || { echo '/new 뒤 입력란에 미제출 글이 남았습니다. 지시서는 보내지 않았습니다. 자동 Enter 재전송·삭제 없음.' >&2; exit 2; }
+	else
+		draft_reads=0
+	fi
 	if printf '%s' "$agent" | python3 -c 'import json,sys
 a=json.load(sys.stdin)["result"]["agent"]
 changed=str(a.get("revision"))!=sys.argv[1] or str(a.get("state_change_seq"))!=sys.argv[2]
 sys.exit(0 if changed and a.get("agent_status") in ("idle","done") and a.get("interactive_ready") is True else 1)' "$revision" "$sequence" \
 		&& screen_matches "$screen" fresh; then
+		observed_ms="$(now_ms)"
+		[ "$observed_ms" -lt "$ready_deadline" ] && [ "$observed_ms" -lt "$deadline" ] || fail '새 입력란 준비 확인 timeout. 지시서는 보내지 않았습니다.'
 		break
 	fi
 	sleep 1
@@ -206,7 +240,10 @@ agent="$(herdr agent get "$CRITIC_NAME")" || fail '전송 직전 이름 확인 �
 validate_agent "$agent" 1 1 || exit 1
 screen="$(herdr pane read "$pane" --source visible)" || fail '전송 직전 입력란 확인 실패.'
 screen_matches "$screen" fresh || fail '전송 직전 새 입력란이 더 이상 비어 있지 않거나 준비되지 않았습니다. 지시서는 보내지 않았습니다.'
-remaining=$(( deadline - $(now_ms) ))
+# 최종 관측이 늦게 반환된 경우도 준비 한도를 다시 확인한다.
+observed_ms="$(now_ms)"
+[ "$observed_ms" -lt "$ready_deadline" ] || fail '새 입력란 준비 확인 timeout. 지시서는 보내지 않았습니다.'
+remaining=$(( deadline - observed_ms ))
 [ "$remaining" -gt 0 ] || fail '전송 전 timeout. 지시서는 보내지 않았습니다.'
 accept_timeout=10000
 [ "$accept_timeout" -le "$remaining" ] || accept_timeout="$remaining"
@@ -234,6 +271,7 @@ while :; do
 	agent="$(herdr agent get "$pane")" || fail '완료 상태 확인 실패. 공개 상태와 스냅숏을 확인하세요.'
 	validate_agent "$agent" 0 0 || exit 1
 	status="$(printf '%s' "$agent" | jget result.agent.agent_status)"
+	# 완료를 관측하면 늦게 반환됐어도 비교한다. 아직 미완료일 때만 아래 한도를 적용한다.
 	case "$status" in
 		idle|done) break ;;
 		blocked|unknown) fail "완료 대기 중 상태=$status. 대화상자에 응답하지 않습니다." ;;
