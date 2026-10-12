@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # gjc-herdr 팀 구성 보조. 기본: 이 pane의 이름·label만 맞춘다(pane 생성 없음).
-#   scripts/team-up.sh --hook    SessionStart hook용. 즉시 반환하고 백그라운드에서 --spawn 동작을 수행
+#   scripts/team-up.sh --hook    SessionStart hook용. 백그라운드에서 clear는 기본 동작, 그 외는 --spawn 수행
 #   scripts/team-up.sh           기본 동작을 지금 수행
 #   scripts/team-up.sh --spawn   기본 동작 + 없는 GJC 팀원·선택 Codex 검토 구성(남은 빈 셸 pane 재사용)
 #   GJCH_TEAM_CODEX=0은 Codex 생성을 끈다. Codex는 사용자 지시로 --yolo(샌드박스 없음)를 사용한다.
@@ -32,7 +32,27 @@ command -v herdr >/dev/null || exit 0
 command -v python3 >/dev/null || exit 0
 
 if [ "$mode" = "--hook" ]; then
-	nohup "$0" --spawn >/dev/null 2>&1 &
+	hook_source=""
+	if [ ! -t 0 ]; then
+		hook_source="$(python3 -c 'import json,os,select,sys,time
+deadline=time.monotonic()+2
+raw=bytearray()
+try:
+    while True:
+        remaining=deadline-time.monotonic()
+        if remaining<=0 or not select.select([sys.stdin],[],[],remaining)[0]: sys.exit(0)
+        chunk=os.read(sys.stdin.fileno(),65536)
+        if not chunk: break
+        raw.extend(chunk)
+    value=json.loads(raw)
+    if isinstance(value,dict) and value.get("source")=="clear": print("clear")
+except (OSError, ValueError): pass')"
+	fi
+	if [ "$hook_source" = clear ]; then
+		nohup "$0" >/dev/null 2>&1 &
+	else
+		nohup "$0" --spawn >/dev/null 2>&1 &
+	fi
 	exit 0
 fi
 
