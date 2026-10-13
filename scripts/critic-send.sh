@@ -1,23 +1,26 @@
 #!/usr/bin/env bash
 # Codex 검토 전송: 저장소 루트의 검토 pane에서 새 대화 준비·전송 수락·완료를 관측한다.
 # timeout·전송 불확실 뒤에는 재전송하지 않는다. 저장소 전후 비교·스냅숏은 만들지 않는다.
+# --result를 주면 idle/done 뒤 그 결과 파일이 전송 전보다 새로 쓰였는지로 완료를 판정한다(아니면 rc 4).
 set -eu
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 CRITIC_NAME="${GJCH_CRITIC_NAME:-gjc-herdr-critic}"
 timeout=1800000 # 기본 30분, 준비 확인은 최대 30초
 no_wait=0
+result_file=""
 brief=""
 argument_count="$#"
 
 usage() {
-	printf '사용법: %s [--timeout <ms>] [--no-wait] <지시서 파일>\n' "$0"
+	printf '사용법: %s [--timeout <ms>] [--no-wait | --result <결과 파일>] <지시서 파일>\n' "$0"
 }
 fail() { echo "$*" >&2; exit 1; }
 while [ "$#" -gt 0 ]; do
 	case "$1" in
 		--timeout) [ "$#" -ge 2 ] || fail '--timeout 값이 필요합니다.'; timeout="$2"; shift 2 ;;
 		--no-wait) no_wait=1; shift ;;
+		--result) [ "$#" -ge 2 ] && [ -n "$2" ] || fail '--result 값이 필요합니다.'; result_file="$2"; shift 2 ;;
 		-h|--help) [ "$argument_count" -eq 1 ] || fail '도움말은 단독으로 사용합니다.'; usage; exit 0 ;;
 		--) shift; [ "$#" -eq 1 ] || fail '지시서 파일 하나가 필요합니다.'; brief="$1"; shift ;;
 		-*) usage >&2; exit 1 ;;
@@ -26,6 +29,11 @@ while [ "$#" -gt 0 ]; do
 done
 command -v python3 >/dev/null || fail 'python3가 필요합니다.'
 [ -n "$brief" ] && [ -r "$brief" ] && [ -f "$brief" ] || fail '읽을 수 있는 지시서 파일이 필요합니다.'
+if [ -n "$result_file" ]; then
+	[ "$no_wait" -eq 0 ] || fail '--result와 --no-wait는 함께 쓸 수 없음.'
+	case "$result_file" in /*) ;; *) result_file="$ROOT/$result_file" ;; esac
+	[ ! -d "$result_file" ] || fail "--result 경로가 디렉터리입니다: $result_file"
+fi
 case "$timeout" in ''|*[!0-9]*) fail '--timeout은 양의 정수(ms)여야 합니다.' ;; esac
 [ "${#timeout}" -le 9 ] || fail '--timeout은 1–86400000ms(24시간) 범위여야 합니다(최대 9자리).'
 [ "$timeout" -gt 0 ] && [ "$timeout" -le 86400000 ] || fail '--timeout은 1–86400000ms(24시간) 범위여야 합니다.'
@@ -144,9 +152,27 @@ print(str(w)+"×"+str(h)+(" small" if w<56 or h<10 else " format"))' "$pane")" |
 	fail '빈 placeholder와 현재 상태 줄·알려진 안내 줄 형식을 확인하세요. draft는 자동 삭제하지 않습니다. 지시서는 보내지 않았습니다.'
 }
 
+# 결과 파일 상태: 없으면 "없음", 있으면 "<st_mtime_ns> <st_size>". 링크는 따라가지 않는다(lstat).
+result_state() { # 경로
+	python3 -c 'import os,sys
+try: st=os.lstat(sys.argv[1])
+except FileNotFoundError: print("없음"); sys.exit(0)
+print(st.st_mtime_ns,st.st_size)' "$1"
+}
+# 경로 자체가 비어 있지 않은 일반 파일(심볼릭 링크 제외)이며 전송 전 상태(result_state 출력)와 달라야 통과한다.
+result_written() { # 경로, 전송 전 상태
+	python3 -c 'import os,stat,sys
+path,before=sys.argv[1:]
+try: st=os.lstat(path)
+except OSError: sys.exit(1)
+if not stat.S_ISREG(st.st_mode) or st.st_size==0: sys.exit(1)
+sys.exit(0 if before=="없음" or before!=str(st.st_mtime_ns)+" "+str(st.st_size) else 1)' "$1" "$2"
+}
+
 # 전송 시도 뒤 어느 실패 경로로 중단해도 같은 복구 안내를 남긴다.
+# rc 4(idle 복귀·결과 파일 미작성)는 턴이 끝났으므로 재전송 금지 안내에서 뺀다.
 delivery_followup() {
-	if [ "$1" -ne 0 ] && [ -n "$delivery_kind" ]; then
+	if [ "$1" -ne 0 ] && [ "$1" -ne 4 ] && [ -n "$delivery_kind" ]; then
 		echo "$delivery_kind 전송을 이미 시도했습니다(전송됨/결과 불확실). 자동 재전송·/new 재입력 금지. 원격 작업은 계속될 수 있습니다." >&2
 	fi
 }
@@ -279,6 +305,9 @@ remaining=$(( deadline - observed_ms ))
 [ "$remaining" -gt 0 ] || fail '전송 전 timeout. 지시서는 보내지 않았습니다.'
 accept_timeout=10000
 [ "$accept_timeout" -le "$remaining" ] || accept_timeout="$remaining"
+if [ -n "$result_file" ]; then
+	result_before="$(result_state "$result_file")" || fail '결과 파일 전송 전 상태 기록 실패. 지시서는 보내지 않았습니다.'
+fi
 # --until working으로 수락을 관측한다. timeout/stalled는 미전달 증거가 아니다.
 delivery_kind='지시서'
 if ! herdr agent prompt "$pane" "$prompt" --wait --until working --timeout "$accept_timeout"; then
@@ -312,4 +341,14 @@ while :; do
 	sleep 1
 done
 echo "완료(idle/done) 확인: $CRITIC_NAME ($pane)"
-exit 0
+[ -n "$result_file" ] || exit 0
+if result_written "$result_file" "$result_before"; then
+	echo "완료·결과 파일 확인: $result_file"
+	exit 0
+fi
+{
+	echo "Codex가 idle로 돌아왔지만 결과 파일이 새로 쓰이지 않았습니다: $result_file"
+	herdr pane read "$pane" --source visible | python3 -c 'import sys; print("\n".join(sys.stdin.read().splitlines()[-8:]))' || true
+	echo '원인을 확인한 뒤 같은 지시서를 다시 보낼 수 있습니다(이번 회차는 완료됨).'
+} >&2
+exit 4
