@@ -3,6 +3,7 @@
 #   scripts/team-up.sh --hook    SessionStart hook용. 백그라운드에서 clear는 기본 동작, 그 외는 --spawn 수행
 #   scripts/team-up.sh           기본 동작을 지금 수행
 #   scripts/team-up.sh --spawn   기본 동작 + 없는 GJC 팀원·선택 Codex 검토 구성(남은 빈 셸 pane 재사용)
+#   GJCH_MATE_PRESET은 팀원 프리셋(기본 opus5-codex56-pro)이며, 빈 값이면 프리셋 없이 실행한다.
 #   GJCH_TEAM_CODEX=0은 Codex 생성을 끈다. Codex는 사용자 지시로 --yolo(샌드박스 없음)를 사용한다.
 #   --no-daemon은 공유 daemon 환경의 훅이 세션 ID를 다른 pane으로 보고하는 것을 막는다.
 #   Codex는 저장소 루트에서 실행하며, 파일 수정은 먼저 팀장 허락을 받는다는 규칙(AGENTS.md·지시서)으로 지킨다.
@@ -16,6 +17,7 @@ LEAD_LABEL="GJCH 팀장 · Claude"
 MATE_LABEL="GJCH 팀원 · GJC"
 CRITIC_LABEL="GJCH 검토·조사 · Codex"
 CODEX_MODEL="${GJCH_CODEX_MODEL:-gpt-6.1-sol}"
+MATE_PRESET="${GJCH_MATE_PRESET-opus5-codex56-pro}"
 WS_LABEL="GJCH · gjc-herdr"
 RETRIES="${GJCH_RETRIES:-30}"   # 2초 간격 → 최대 약 60초
 
@@ -110,13 +112,21 @@ fi
 # --- 팀원 GJC pane (이미 있으면 생성하지 않음) ---
 mate_pane=""
 spawn_mate() {
-local existing pane
+local existing pane mate_command
 existing="$(herdr agent get "$MATE_NAME" 2>/dev/null | jget result.agent.pane_id)"
 if [ -n "$existing" ]; then
 	mate_pane="$existing"
 	echo "mate already exists at $existing; nothing spawned"
 	return 0
 fi
+# 새로 실행할 때만 프리셋을 검사한다(셸에 문자열로 입력되므로 허용 문자만).
+case "$MATE_PRESET" in
+	*[!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-]*)
+		echo 'GJCH_MATE_PRESET은 비워 두거나 영문자·숫자·점·밑줄·하이픈만 사용할 수 있습니다.' >&2
+		return 1 ;;
+esac
+mate_command="gjc"
+[ -z "$MATE_PRESET" ] || mate_command="gjc --mpreset $MATE_PRESET"
 # 재시작 후 남은 팀원 pane(label 일치·이 프로젝트 cwd·agent 없음 = 빈 셸)이 있으면 재사용한다.
 pane="$(herdr pane list 2>/dev/null | python3 -c 'import sys,json,os
 root,ws,label=sys.argv[1:4]
@@ -132,7 +142,7 @@ if [ -z "$pane" ]; then
 fi
 mate_pane="$pane"
 herdr pane rename "$pane" "$MATE_LABEL" >/dev/null 2>&1
-herdr pane run "$pane" gjc >/dev/null 2>&1 || { echo "pane run failed for $pane" >&2; return 1; }
+herdr pane run "$pane" "$mate_command" >/dev/null 2>&1 || { echo "pane run failed for $pane" >&2; return 1; }
 if ! retry claim_name "$pane" "$MATE_NAME"; then
 	echo "spawned pane $pane but agent name was not claimed within the retry window" >&2
 	return 1

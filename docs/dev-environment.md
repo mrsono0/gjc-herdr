@@ -18,6 +18,7 @@
 | `GJCH_MATE_NAME` | `gjc-herdr-mate` |
 | `GJCH_CRITIC_NAME` | `gjc-herdr-critic` |
 | `GJCH_TEAM_CODEX` | `1`; `0`이면 Codex 자동 구성을 끈다 |
+| `GJCH_MATE_PRESET` | `opus5-codex56-pro`(GJC 커스텀 프리셋: Opus 5.5 메인). 팀원을 `gjc --mpreset <값>`으로 실행하며 사용자 기본 프리셋은 바꾸지 않는다. 빈 값이면 `gjc`(사용자 기본 모델). 영문자·숫자·`._-`만 허용 |
 | `GJCH_CODEX_MODEL` | `gpt-6.1-sol` |
 | `GJCH_RETRIES` | `30`; GJC 이름·준비 상태 등을 2초 간격으로 재확인 |
 
@@ -30,7 +31,7 @@
 3. `startup`의 `team-up.sh --spawn`이 다음을 순서대로 수행한다. 각 단계는 조건이 맞을 때만 실행되고 아무것도 덮어쓰지 않는다.
    - 가드: Herdr 안(`HERDR_ENV=1`)·`herdr`/`python3` 존재·이 pane의 실제 cwd가 프로젝트 안·`GJCH_TEAM_ROLE` 미설정일 때만 진행한다. 아니면 조용히 종료한다.
    - 이 pane의 agent 이름을 `gjc-herdr-lead`로 확보(이미 다른 pane이 쓰면 건드리지 않음)하고 pane label과, 폴더명 기본값인 작업공간 label을 바꾼다. Claude 감지 지연 때문에 최대 약 60초 재시도한다.
-   - 팀원 pane이 없으면 `pane split --no-focus`로 만들고(재시작 후 남은 빈 셸 pane은 재사용) `gjc`를 실행해 `gjc-herdr-mate`로 이름을 붙인다.
+   - 팀원 pane이 없으면 `pane split --no-focus`로 만들고(재시작 후 남은 빈 셸 pane은 재사용) `gjc --mpreset <GJCH_MATE_PRESET>`을 실행해 `gjc-herdr-mate`로 이름을 붙인다. 구현(GJC, Opus 5.5)과 검토(Codex, GPT)를 다른 모델로 두어 검토 독립성을 높이고 한 제공자 과부하에 함께 멈추지 않게 한다.
    - GJC가 idle이고 `gjc_herdr_session_id` token이 발행되면 `/rename GJCH 팀원 · GJC`를 입력해 세션 이름을 맞춘다. 준비가 안 되면 수동 안내만 출력한다.
    - 선택 Codex 단계: `GJCH_TEAM_CODEX=0`·`codex` 없음·기존 critic 이름 점유 시 생략한다. 그 외에는 저장소 루트 cwd·검토 label인 같은 workspace 빈 셸 pane을 재사용하거나, 같은 workspace의 팀원 오른쪽(팀원이 없으면 현재 pane 아래)에 no-focus로 만들고 `herdr agent start ... -- --no-daemon --yolo -m <모델> -C <저장소 루트>`로 시작한다. 공유 daemon 환경에서 실행된 훅이 세션 ID를 다른 pane으로 보고할 수 있어 `--no-daemon`으로 해당 pane의 환경을 사용한다. GJC 단계 실패 시에도 Codex 단계는 별도로 시도하며, 실패한 단계가 있으면 종료 코드는 비0이다.
 4. 사용자의 focus·다른 pane·설정은 바꾸지 않는다.
