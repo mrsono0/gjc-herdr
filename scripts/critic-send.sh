@@ -46,7 +46,7 @@ print("" if value is None else value)' "$1"
 now_ms() { printf '%s\n' "$((SECONDS * 1000))"; }
 
 # 마지막 입력란이 빈 placeholder인 경우만 허용한다(이전 대화의 echo와 구별).
-screen_matches() { # 화면, empty|readable|fresh|typing|new
+screen_matches() { # 화면, empty|readable|fresh|typing|new|worktree_menu|worktree
 	printf '%s' "$1" | python3 -c 'import re,sys
 raw=sys.stdin.read()
 # src/input.ts와 같은 SGR 0·2·22 및 색상 인자 처리. 글자별 dim 상태를 보존한다.
@@ -116,7 +116,16 @@ readable=bool(last) and hint_ok and bool(status) and (not tail or bool(clipped) 
 fresh=empty and readable and status.group(1)=="100" and status.group(2)=="0" and (not output or output.group(1)=="0")
 typing=last is not None and last!="" and not empty
 new=last=="/new"
-sys.exit(0 if {"empty":empty,"readable":readable,"fresh":fresh,"typing":typing,"new":new}[sys.argv[1]] else 1)' "$2"
+# 화면 최하단 블록만 메뉴로 본다: 마지막 비지 않은 줄이 안내 줄이고, 그 위 가장 가까운 질문 줄과
+# 안내 줄 사이에 0번째 칸 › 선택 줄이 정확히 하나 있어야 한다(옛 화면·draft와 구별).
+rows=[line.rstrip(" \t\r") for line in s.split("\n")]
+filled=[i for i,line in enumerate(rows) if line.strip()]
+hint_at=filled[-1] if filled and rows[filled[-1]].strip()=="enter select · esc back" else None
+ask_at=next((i for i in range(hint_at-1,-1,-1) if rows[i].strip()=="Where should the new conversation run?"),None) if hint_at is not None else None
+picks=[rows[i] for i in range(ask_at+1,hint_at) if rows[i].startswith("›")] if ask_at is not None else []
+worktree_menu=ask_at is not None and len(picks)==1
+worktree=worktree_menu and bool(re.match(r"› 1\. Use current Git worktree(?:[ \t]|$)",picks[0]))
+sys.exit(0 if {"empty":empty,"readable":readable,"fresh":fresh,"typing":typing,"new":new,"worktree_menu":worktree_menu,"worktree":worktree}[sys.argv[1]] else 1)' "$2"
 }
 
 screen_size_failure() {
@@ -207,6 +216,7 @@ else
 
 # 기존 대화에서만 /new를 보낸다. 이전 화면과 다른 새 빈 화면과 상태를 함께 확인한다.
 draft_reads=0
+worktree_enter_sent=0
 while :; do
 	if [ "$(now_ms)" -ge "$ready_deadline" ]; then
 		screen_matches "$screen" readable || screen_size_failure
@@ -219,6 +229,25 @@ while :; do
 	status="$(printf '%s' "$agent" | jget result.agent.agent_status)"
 	case "$status" in blocked|unknown) fail "새 입력란 상태=$status. 지시서를 보내지 않았습니다." ;; esac
 	screen="$(herdr pane read "$pane" --source visible --format ansi)" || fail '새 대화 화면 확인 실패.'
+	# Git worktree 메뉴는 현재 폴더 선택에만 Enter를 한 번 허용한다.
+	if screen_matches "$screen" worktree_menu; then
+		# Enter 직후의 과도 화면을 감안해 1초 간격 세 관측 동안 메뉴가 남을 때만 중단한다.
+		if [ "$worktree_enter_sent" -ne 0 ]; then
+			worktree_enter_sent=$((worktree_enter_sent + 1))
+			[ "$worktree_enter_sent" -le 3 ] || { echo '/new 뒤 worktree 메뉴가 계속 남았습니다. 지시서는 보내지 않았습니다. 자동 Esc·Enter 재전송 없음.' >&2; exit 2; }
+			sleep 1
+			continue
+		fi
+		screen_matches "$screen" worktree || { echo '/new 뒤 worktree 메뉴의 선택이 1번(현재 worktree)이 아닙니다. 지시서는 보내지 않았습니다. 자동 Esc·Enter 없음.' >&2; exit 2; }
+		agent="$(herdr agent get "$pane")" || fail 'worktree 선택 전 대상 확인 실패. 지시서는 보내지 않았습니다.'
+		validate_agent "$agent" 1 1 || exit 1
+		[ "$(now_ms)" -lt "$ready_deadline" ] || fail '새 입력란 준비 확인 timeout. 지시서는 보내지 않았습니다.'
+		worktree_enter_sent=1
+		herdr pane send-keys "$pane" enter || { echo 'worktree 선택 Enter 결과가 불확실합니다. 지시서는 보내지 않았습니다.' >&2; exit 2; }
+		draft_reads=0
+		sleep 1
+		continue
+	fi
 	# 한 번의 과도 화면만으로 단정하지 않고 1초 간격 두 관측에서 글이 남으면 중단한다.
 	if screen_matches "$screen" typing; then
 		draft_reads=$((draft_reads + 1))
