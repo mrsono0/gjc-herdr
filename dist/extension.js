@@ -19396,6 +19396,38 @@ function claudeBox(lines) {
 `)).replace(/^\s*\u276F/, "").trim();
   return typed ? "typing" : "empty";
 }
+function agyBox(lines) {
+  const plain = lines.map((line) => strip(line).trim());
+  const rules = lines.map((line) => RULE.test(strip(line).trimEnd()));
+  let bottom = -1;
+  for (let i = plain.length - 1;i >= 0; i--) {
+    if (rules[i]) {
+      bottom = i;
+      break;
+    }
+  }
+  if (bottom < 0)
+    return;
+  if (plain.slice(bottom + 1).filter(Boolean).length > MAX_LINES_BELOW_BOX) {
+    return;
+  }
+  let top = -1;
+  for (let i = bottom - 1;i >= 0; i--) {
+    if (rules[i]) {
+      top = i;
+      break;
+    }
+  }
+  if (top < 0 || bottom - top < 2 || !strip(lines[top + 1]).startsWith(">"))
+    return "typing";
+  const typed = brightText(lines.slice(top + 1, bottom).join(`
+`)).replace(/^>/, "").trim();
+  return typed ? "typing" : "empty";
+}
+function agyShaped(screen) {
+  return agyBox(screen.replace(/\s+$/, "").split(`
+`)) === "empty";
+}
 function gjcBox(lines) {
   const plain = lines.map((line) => strip(line).trim());
   let bottom = -1;
@@ -19432,28 +19464,63 @@ function gjcBox(lines) {
     return "empty";
   return "typing";
 }
-function classifyInput(screen) {
+function classifyInput(screen, kind) {
   const lines = screen.replace(/\s+$/, "").split(`
 `);
-  return claudeBox(lines) ?? gjcBox(lines) ?? "unknown";
+  const ruled = kind === "agy" ? agyBox(lines) : claudeBox(lines);
+  return ruled ?? gjcBox(lines) ?? "unknown";
 }
-async function readInputState(deps, paneId, signal, timeoutMs = READ_TIMEOUT_MS) {
+async function readInputState(deps, paneId, signal, timeoutMs = READ_TIMEOUT_MS, kind) {
   const timeout = Math.floor(timeoutMs);
   if (timeout < 1)
     return "typing";
+  const now = deps.now ?? (() => performance.now());
+  const startedAt = now();
   try {
     const result = await deps.exec(deps.herdrBin, ["pane", "read", paneId, "--source", "visible", "--lines", READ_LINES, "--format", "ansi"], { timeout, signal });
     if (result.killed || result.code !== 0)
       return "unknown";
-    return classifyInput(result.stdout);
+    let resolvedKind = kind;
+    if (resolvedKind === undefined && deps.agentKind && agyShaped(result.stdout)) {
+      const elapsed = now() - startedAt;
+      const remaining = timeoutMs - elapsed;
+      if (!signal?.aborted && Math.floor(remaining) >= 1) {
+        try {
+          resolvedKind = await deps.agentKind(remaining, signal, elapsed);
+        } catch {
+          resolvedKind = undefined;
+        }
+      }
+    }
+    return classifyInput(result.stdout, resolvedKind);
   } catch {
     return "unknown";
   }
 }
-async function waitForEmptyInput(deps, paneId, maxWaitMs, signal) {
+async function waitForEmptyInput(deps, paneId, maxWaitMs, signal, kind) {
   const sleep = deps.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
   const now = deps.now ?? (() => performance.now());
   const startedAt = now();
+  let kindResolved = false;
+  let cachedKind;
+  const guardDeps = deps.agentKind ? {
+    ...deps,
+    agentKind: async (budgetMs, s) => {
+      if (!kindResolved) {
+        const waited = now() - startedAt;
+        const remaining = maxWaitMs > 0 ? Math.min(budgetMs, maxWaitMs - waited) : budgetMs;
+        if (s?.aborted || Math.floor(remaining) < 1)
+          return;
+        kindResolved = true;
+        try {
+          cachedKind = await deps.agentKind(remaining, s, waited);
+        } catch {
+          cachedKind = undefined;
+        }
+      }
+      return cachedKind;
+    }
+  } : deps;
   let state = "unknown";
   for (;; ) {
     let waitedMs = now() - startedAt;
@@ -19463,7 +19530,7 @@ async function waitForEmptyInput(deps, paneId, maxWaitMs, signal) {
     const readBudget = maxWaitMs > 0 ? Math.min(READ_TIMEOUT_MS, maxWaitMs - waitedMs) : READ_TIMEOUT_MS;
     if (readBudget < 1)
       return { state: "typing", waitedMs };
-    state = await readInputState(deps, paneId, signal, readBudget);
+    state = await readInputState(guardDeps, paneId, signal, readBudget, kind);
     waitedMs = now() - startedAt;
     if (state !== "typing" || waitedMs >= maxWaitMs || signal?.aborted) {
       return { state, waitedMs };
@@ -19542,6 +19609,7 @@ async function resolveTargetPane(deps, target) {
   return {
     paneId: pane.pane_id,
     tokens: record(pane.tokens) ?? {},
+    agent: typeof pane.agent === "string" ? pane.agent : undefined,
     agentStatus: typeof pane.agent_status === "string" ? pane.agent_status : undefined,
     focused: pane.focused === true
   };
@@ -19744,7 +19812,7 @@ async function deliverPrompt(deps, request, sender, signal) {
     if (pane.paneId === sender.pane) {
       return fail("Cannot send raw input to the current Herdr pane.", pane.paneId);
     }
-    const guard = await waitForEmptyInput(deps, pane.paneId, deps.inputWaitMs ?? inputWaitMs(), signal);
+    const guard = await waitForEmptyInput(deps, pane.paneId, deps.inputWaitMs ?? inputWaitMs(), signal, pane.agent);
     const waited = guard.waitedMs > 0 ? { waitedMs: guard.waitedMs } : {};
     if (signal?.aborted) {
       return { ...fail("Raw delivery aborted before sending.", pane.paneId), ...waited };
@@ -20009,7 +20077,7 @@ function usageFailure(result, phase) {
 }
 async function resolveTargetPaneId(deps, target, deadline, signal) {
   if (PANE_ID2.test(target))
-    return target;
+    return { paneId: target };
   const result = await runHerdr(deps, ["agent", "list"], Math.min(LOOKUP_TIMEOUT_MS, deadline - (deps.now?.() ?? performance.now())), signal, "lookup");
   if (result.code === 2)
     throw usageFailure(result, "agent list");
@@ -20059,7 +20127,21 @@ async function resolveTargetPaneId(deps, target, deadline, signal) {
       }
     });
   }
-  return paneId;
+  const agentKind = typeof matches[0]?.agent === "string" ? matches[0].agent : undefined;
+  return { paneId, agentKind };
+}
+async function readAgentKind(deps, paneId, budgetMs, deadline, signal) {
+  const remaining = Math.min(LOOKUP_TIMEOUT_MS, budgetMs, deadline - (deps.now?.() ?? performance.now()));
+  if (Math.floor(remaining) < 1)
+    return;
+  const result = await runHerdr(deps, ["agent", "get", paneId], remaining, signal, "lookup");
+  if (result.code !== 0)
+    return;
+  const response = record2(record2(parseJson2(result.stdout))?.result);
+  const agent = record2(response?.agent);
+  if (response?.type !== "agent_info" || agent?.pane_id !== paneId)
+    return;
+  return typeof agent.agent === "string" ? agent.agent : undefined;
 }
 var AGENT_STATES = new Set([
   "idle",
@@ -20265,7 +20347,7 @@ async function callRegisteredAgent(deps, request, senderPane, signal) {
     });
   }
   try {
-    const paneId = await resolveTargetPaneId(deps, target, deadline, signal);
+    const { paneId, agentKind } = await resolveTargetPaneId(deps, target, deadline, signal);
     if (paneId === senderPane) {
       return finish({
         status: "not_sent",
@@ -20290,7 +20372,13 @@ async function callRegisteredAgent(deps, request, senderPane, signal) {
     }
     deps.inFlight.add(paneId);
     try {
-      const guard = await waitForEmptyInput({ exec: deps.exec, herdrBin: deps.herdrBin, sleep: deps.sleep, now }, paneId, deps.inputWaitMs ?? inputWaitMs(), signal);
+      const guard = await waitForEmptyInput({
+        exec: deps.exec,
+        herdrBin: deps.herdrBin,
+        sleep: deps.sleep,
+        now,
+        agentKind: async (budgetMs, s, waited = 0) => agentKind ?? await readAgentKind(deps, paneId, budgetMs, deadline + waited, s)
+      }, paneId, deps.inputWaitMs ?? inputWaitMs(), signal);
       waitedMs = guard.waitedMs;
       deadline += guard.waitedMs;
       if (signal?.aborted) {

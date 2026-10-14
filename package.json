@@ -1,6 +1,6 @@
 {
 	"name": "gjc-herdr",
-	"version": "0.3.4",
+	"version": "0.3.5",
 	"description": "Herdr model/session metadata, pane-to-pane prompt delivery, and detected-agent calls for GJC",
 	"type": "module",
 	"license": "MIT",
@@ -23,7 +23,7 @@
 		]
 	},
 	"engines": {
-		"bun": "1.4.2"
+		"bun": "1.4.3"
 	},
 	"scripts": {
 		"build": "bun scripts/build.ts",

@@ -30,6 +30,11 @@ const gjc = (row: string) =>
 	`${E}[0m${E}[38;2;248;119;166m╭${"─".repeat(70)}╮${E}[0m\n${row}\n${E}[0m${E}[38;2;248;119;166m╰${"─".repeat(70)}╯${E}[0m\n\n ⠇ Working\n ⬢ opus-5.5`;
 const gjcRow = (body: string) =>
 	`${E}[0m${E}[38;2;248;119;166m│ ${E}[0m${E}[38;2;94;200;255m>${E}[0m ${body}${E}[38;2;248;119;166m │${E}[0m`;
+const agy = (
+	inputRow: string,
+	below = `${E}[0m${E}[38;2;131;148;150m? for shortcuts                                                 Gemini 4 Argon · hig${E}[0m`,
+) =>
+	`  ${E}[0m${E}[38;2;181;137;0m┃${E}[0m ${E}[0m${E}[38;2;131;148;150mesc to dismiss${E}[0m\n${E}[0m${E}[38;2;7;54;66m${RULE}${E}[0m\n${inputRow}\n${E}[0m${E}[38;2;7;54;66m${RULE}${E}[0m\n${below}`;
 
 test("Claude Code input box: empty, dim placeholder, and real text", () => {
 	assert.equal(classifyInput(claude(`❯${E}[0m `)), "empty");
@@ -64,6 +69,40 @@ test("Claude dim state persists across input rows until reset", () => {
 	assert.equal(classifyInput(claude(`❯ ${E}[2mhint\n${E}[22mreal draft`)), "typing");
 });
 
+test("Antigravity CLI (agy) input box: empty, dim placeholder, typing, multi-line, and status line", () => {
+	const modelStatus = `                                                                ${E}[0m${E}[38;2;131;148;150mGemini 4 Argon · hig${E}[0m`;
+	assert.equal(classifyInput(agy(`${E}[0m${E}[38;2;38;139;210m>${E}[0m`), "agy"), "empty");
+	assert.equal(classifyInput(agy(`${E}[0m${E}[38;2;38;139;210m> ${E}[0m`, modelStatus), "agy"), "empty");
+	assert.equal(classifyInput(agy(`${E}[0m${E}[38;2;38;139;210m> ${E}[0m${E}[2mplaceholder${E}[0m`), "agy"), "empty");
+	assert.equal(
+		classifyInput(agy(`${E}[0m${E}[38;2;38;139;210m> ${E}[0mdraft sample text`, modelStatus), "agy"),
+		"typing",
+	);
+	assert.equal(
+		classifyInput(agy(`${E}[0m${E}[38;2;38;139;210m> ${E}[0mfirst line\n  second line`, modelStatus), "agy"),
+		"typing",
+	);
+	assert.equal(
+		classifyInput(agy(`${E}[0m${E}[38;2;38;139;210m>${E}[0m\n  second line`, modelStatus), "agy"),
+		"typing",
+	);
+	assert.equal(
+		classifyInput(agy(`  ${E}[0m${E}[38;2;38;139;210m>${E}[0m`, modelStatus), "agy"),
+		"typing",
+	);
+});
+
+test("`>` between horizontal rules is typing unless kind is agy", () => {
+	assert.equal(classifyInput(`${RULE}\n  >\n${RULE}\n  -- INSERT --`), "typing");
+	assert.equal(classifyInput(`${RULE}\n>\n${RULE}\n  -- INSERT --`), "typing");
+	assert.equal(classifyInput(claude("  >")), "typing");
+	assert.equal(classifyInput(claude(">")), "typing");
+	assert.equal(classifyInput(claude(">   ")), "typing");
+	assert.equal(classifyInput(agy(`${E}[0m${E}[38;2;38;139;210m>${E}[0m`)), "typing");
+	assert.equal(classifyInput(agy(`${E}[0m${E}[38;2;38;139;210m>   ${E}[0m`)), "typing");
+	assert.equal(classifyInput(agy(`${E}[0m${E}[38;2;38;139;210m>${E}[0m`), "claude"), "typing");
+});
+
 test("GJC input box: placeholder, empty, and real text", () => {
 	assert.equal(
 		classifyInput(gjc(gjcRow(`${E}[38;2;85;112;138mType your message... ⌥Q: Queue (busy) · ⇧⇥: Thinking${E}[0m`))),
@@ -87,6 +126,8 @@ test("GJC placeholder prefixes in user text are typing unless the hint suffix is
 test("visible lower input boundaries with clipped upper rows are conservatively typing", () => {
 	const longClaude = claude(`❯ draft\n${Array(70).fill("  more draft").join("\n")}`);
 	assert.equal(classifyInput(longClaude.split("\n").slice(-60).join("\n")), "typing");
+	const longAgy = agy(`> draft\n${Array(70).fill("  more draft").join("\n")}`);
+	assert.equal(classifyInput(longAgy.split("\n").slice(-60).join("\n"), "agy"), "typing");
 	const longGjc = gjc(`${gjcRow("draft")}\n${Array(70).fill("│ more draft │").join("\n")}`);
 	assert.equal(classifyInput(longGjc.split("\n").slice(-60).join("\n")), "typing");
 	assert.equal(classifyInput(`${RULE}\nnot an input row\n${RULE}`), "typing");
@@ -229,4 +270,79 @@ test("sub-ms input wait budgets refuse without exec or an unknown fallback", asy
 	assert.deepEqual(await waitForEmptyInput(r.deps, "w1:p1", 0.75), { state: "typing", waitedMs: 0 });
 	assert.equal(r.reads(), 0);
 	assert.deepEqual(r.timeouts, []);
+});
+
+test("lazy agentKind callback resolves empty agy candidates, skips typing drafts, and bounds budget", async () => {
+	const emptyAgy = agy(`${E}[0m${E}[38;2;38;139;210m>${E}[0m`);
+	const typingAgy = agy(`${E}[0m${E}[38;2;38;139;210m> ${E}[0mdraft`);
+	const multiLineAgy = agy(`${E}[0m${E}[38;2;38;139;210m>${E}[0m\n  second line`);
+
+	let typingLookups = 0;
+	const stuckTyping = reader([typingAgy, multiLineAgy]);
+	stuckTyping.deps.agentKind = async () => {
+		typingLookups++;
+		return "agy";
+	};
+	assert.deepEqual(await waitForEmptyInput(stuckTyping.deps, "w1:p1", 2_000), { state: "typing", waitedMs: 2_000 });
+	assert.equal(typingLookups, 0);
+
+	let lookups = 0;
+	const polled = reader([typingAgy, typingAgy, emptyAgy]);
+	polled.deps.agentKind = async () => {
+		assert.equal(polled.reads(), 3);
+		lookups++;
+		return "agy";
+	};
+	assert.deepEqual(await waitForEmptyInput(polled.deps, "w1:p1", 60_000), { state: "empty", waitedMs: 4_000 });
+	assert.equal(lookups, 1);
+
+	for (const outcome of ["claude", undefined, new Error("lookup failed")] as const) {
+		let count = 0;
+		const r = reader([emptyAgy, emptyAgy]);
+		r.deps.agentKind = async () => {
+			count++;
+			if (outcome instanceof Error) throw outcome;
+			return outcome;
+		};
+		assert.deepEqual(await waitForEmptyInput(r.deps, "w1:p1", 2_000), { state: "typing", waitedMs: 2_000 });
+		assert.equal(count, 1);
+	}
+
+	const budgets: number[] = [];
+	const bounded = reader([emptyAgy], 90);
+	bounded.deps.agentKind = async (budgetMs) => {
+		budgets.push(budgetMs);
+		return "agy";
+	};
+	assert.deepEqual(await waitForEmptyInput(bounded.deps, "w1:p1", 100), { state: "empty", waitedMs: 90 });
+	assert.deepEqual(budgets, [10]);
+
+	let exhaustedLookups = 0;
+	const exhausted = reader([emptyAgy], 99.5);
+	exhausted.deps.agentKind = async () => {
+		exhaustedLookups++;
+		return "agy";
+	};
+	assert.deepEqual(await waitForEmptyInput(exhausted.deps, "w1:p1", 100), { state: "typing", waitedMs: 100 });
+	assert.equal(exhausted.reads(), 1);
+	assert.equal(exhaustedLookups, 0);
+
+	let nonAgyLookups = 0;
+	for (const screen of [
+		claude("❯"),
+		claude("❯ draft"),
+		typingAgy,
+		multiLineAgy,
+		gjc(gjcRow("")),
+		gjc(gjcRow("draft")),
+		"$ shell",
+	]) {
+		const r = reader([screen]);
+		r.deps.agentKind = async () => {
+			nonAgyLookups++;
+			return "agy";
+		};
+		await readInputState(r.deps, "w1:p1");
+	}
+	assert.equal(nonAgyLookups, 0);
 });

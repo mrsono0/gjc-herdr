@@ -249,8 +249,8 @@ async function resolveTargetPaneId(
 	target: string,
 	deadline: number,
 	signal?: AbortSignal,
-): Promise<string> {
-	if (PANE_ID.test(target)) return target;
+): Promise<{ paneId: string; agentKind?: string }> {
+	if (PANE_ID.test(target)) return { paneId: target };
 	const result = await runHerdr(
 		deps,
 		["agent", "list"],
@@ -306,7 +306,30 @@ async function resolveTargetPaneId(
 			},
 		});
 	}
-	return paneId;
+	const agentKind = typeof matches[0]?.agent === "string" ? matches[0].agent : undefined;
+	return { paneId, agentKind };
+}
+
+/** Lazy read-only `agent get` used only when the input box is an empty agy candidate and kind is not yet known. */
+async function readAgentKind(
+	deps: AgentCallDeps,
+	paneId: string,
+	budgetMs: number,
+	deadline: number,
+	signal?: AbortSignal,
+): Promise<string | undefined> {
+	const remaining = Math.min(
+		LOOKUP_TIMEOUT_MS,
+		budgetMs,
+		deadline - (deps.now?.() ?? performance.now()),
+	);
+	if (Math.floor(remaining) < 1) return undefined;
+	const result = await runHerdr(deps, ["agent", "get", paneId], remaining, signal, "lookup");
+	if (result.code !== 0) return undefined;
+	const response = record(record(parseJson(result.stdout))?.result);
+	const agent = record(response?.agent);
+	if (response?.type !== "agent_info" || agent?.pane_id !== paneId) return undefined;
+	return typeof agent.agent === "string" ? agent.agent : undefined;
 }
 
 const AGENT_STATES = new Set([
@@ -576,7 +599,7 @@ export async function callRegisteredAgent(
 	}
 
 	try {
-		const paneId = await resolveTargetPaneId(deps, target, deadline, signal);
+		const { paneId, agentKind } = await resolveTargetPaneId(deps, target, deadline, signal);
 		if (paneId === senderPane) {
 			return finish({
 				status: "not_sent",
@@ -603,7 +626,15 @@ export async function callRegisteredAgent(
 		try {
 			// Waiting for a person's or agent's half-typed input does not eat the call budget.
 			const guard = await waitForEmptyInput(
-				{ exec: deps.exec, herdrBin: deps.herdrBin, sleep: deps.sleep, now },
+				{
+					exec: deps.exec,
+					herdrBin: deps.herdrBin,
+					sleep: deps.sleep,
+					now,
+					agentKind: async (budgetMs, s, waited = 0) =>
+						agentKind ??
+						(await readAgentKind(deps, paneId, budgetMs, deadline + waited, s)),
+				},
 				paneId,
 				deps.inputWaitMs ?? inputWaitMs(),
 				signal,

@@ -776,3 +776,108 @@ test("positive sub-ms lookup budget uses timeout refusal instead of spawning wit
 	assert.equal(result.error?.code, "timeout");
 	assert.equal(calls.length, 0);
 });
+
+test("agy-shaped input box is accepted for agy targets and kept typing for non-agy targets", async () => {
+	const emptyAgy = `${RULE_LINE}\n>\n${RULE_LINE}\n? for shortcuts                                                 Gemini 4 Argon · hig`;
+
+	let requestId = "";
+	const byPane = fakeExec({
+		"herdr pane read": () => ({ stdout: emptyAgy }),
+		"herdr agent get": () => agentGet("idle", { agent: "agy" }),
+		"herdr agent prompt": (args) => {
+			requestId = /GJC_HERDR_BEGIN_([0-9a-f-]{36})/.exec(args[3])![1]!;
+			return agentPrompted("done");
+		},
+		"herdr agent read": () => answerScreen(requestId, "agy ok"),
+	});
+	const paneResult = await callRegisteredAgent(byPane.deps, { target: TARGET_PANE, text: "hi" }, SENDER_PANE);
+	assert.equal(paneResult.ok, true);
+	assert.equal(paneResult.status, "answered");
+	assert.equal(paneResult.answer, "agy ok");
+
+	let namedRequestId = "";
+	const byName = fakeExec({
+		"herdr agent list": () =>
+			ok({ result: { agents: [{ name: "agy-mate", pane_id: TARGET_PANE, agent: "agy" }] } }),
+		"herdr pane read": () => ({ stdout: emptyAgy }),
+		"herdr agent get": () => agentGet("idle", { agent: "agy" }),
+		"herdr agent prompt": (args) => {
+			namedRequestId = /GJC_HERDR_BEGIN_([0-9a-f-]{36})/.exec(args[3])![1]!;
+			return agentPrompted("done");
+		},
+		"herdr agent read": () => answerScreen(namedRequestId, "named agy ok"),
+	});
+	const namedResult = await callRegisteredAgent(byName.deps, { target: "agy-mate", text: "hi" }, SENDER_PANE);
+	assert.equal(namedResult.ok, true);
+	assert.equal(byName.count("herdr agent get"), 1);
+
+	const claudeTarget = fakeExec({
+		"herdr pane read": () => ({ stdout: emptyAgy }),
+		"herdr agent get": () => agentGet("idle", { agent: "claude" }),
+	});
+	claudeTarget.deps.inputWaitMs = 0;
+	const refused = await callRegisteredAgent(claudeTarget.deps, { target: TARGET_PANE, text: "hi" }, SENDER_PANE);
+	assert.equal(refused.ok, false);
+	assert.equal(refused.status, "not_sent");
+	assert.equal(refused.error?.code, "target_typing");
+	assert.equal(claudeTarget.count("herdr agent prompt"), 0);
+
+	for (const draftScreen of [
+		`${RULE_LINE}\n> draft\n${RULE_LINE}\n? for shortcuts`,
+		`${RULE_LINE}\n> first line\n  second line\n${RULE_LINE}\n? for shortcuts`,
+		`${RULE_LINE}\n>\n  second line\n${RULE_LINE}\n? for shortcuts`,
+	]) {
+		const typingAgy = fakeExec({
+			"herdr pane read": () => ({ stdout: draftScreen }),
+		});
+		typingAgy.deps.inputWaitMs = 4_000;
+		const typingResult = await callRegisteredAgent(typingAgy.deps, { target: TARGET_PANE, text: "hi" }, SENDER_PANE);
+		assert.equal(typingResult.ok, false);
+		assert.equal(typingResult.status, "not_sent");
+		assert.equal(typingResult.error?.code, "target_typing");
+		assert.equal(typingAgy.count("herdr agent get"), 0);
+		assert.equal(typingAgy.count("herdr agent prompt"), 0);
+	}
+});
+
+test("lazy agy kind lookup is bounded by remaining input-wait budget and excludes input wait from call deadline", async () => {
+	const emptyAgy = `${RULE_LINE}\n>\n${RULE_LINE}\n? for shortcuts                                                 Gemini 4 Argon · hig`;
+
+	const shortWait = fakeExec({
+		"herdr pane read": () => {
+			shortWait.advance(90);
+			return { stdout: emptyAgy };
+		},
+		"herdr agent get": (_args, options) => {
+			shortWait.advance(options?.timeout ?? 0);
+			return { killed: true, code: 0, stdout: "", stderr: "" };
+		},
+	});
+	shortWait.deps.inputWaitMs = 100;
+	const shortResult = await callRegisteredAgent(shortWait.deps, { target: TARGET_PANE, text: "hi" }, SENDER_PANE);
+	const getCall = shortWait.calls.find(({ args }) => args[0] === "agent" && args[1] === "get");
+	assert.equal(getCall?.options?.timeout, 10);
+	assert.equal(shortResult.status, "not_sent");
+	assert.equal(shortResult.error?.code, "target_typing");
+	assert.equal(shortResult.waitedMs, 100);
+	assert.equal(shortResult.elapsedMs, 100);
+
+	const screens = [...Array(35).fill(TYPING_CLAUDE), emptyAgy];
+	let requestId = "";
+	const longWait = fakeExec({
+		"herdr pane read": () => ({ stdout: screens.shift() ?? emptyAgy }),
+		"herdr agent get": () => agentGet("idle", { agent: "agy" }),
+		"herdr agent prompt": (args) => {
+			requestId = /GJC_HERDR_BEGIN_([0-9a-f-]{36})/.exec(args[3])![1]!;
+			return agentPrompted("done");
+		},
+		"herdr agent read": () => answerScreen(requestId, "after 70s wait"),
+	});
+	longWait.deps.inputWaitMs = 120_000;
+	const longResult = await callRegisteredAgent(longWait.deps, { target: TARGET_PANE, text: "hi" }, SENDER_PANE);
+	assert.equal(longResult.ok, true);
+	assert.equal(longResult.status, "answered");
+	assert.equal(longResult.waitedMs, 70_000);
+	assert.equal(longResult.answer, "after 70s wait");
+	assert.equal(longWait.count("herdr agent get"), 2);
+});

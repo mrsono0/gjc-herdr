@@ -12,6 +12,8 @@ export interface InputGuardDeps {
 	sleep?: (ms: number) => Promise<void>;
 	/** Monotonic clock used to measure the complete wait, including reads. */
 	now?: () => number;
+	/** Lazy target agent kind lookup; called at most once when the screen is an empty agy box candidate. */
+	agentKind?: (budgetMs: number, signal?: AbortSignal, waitedMs?: number) => Promise<string | undefined>;
 }
 
 export interface InputWaitResult {
@@ -98,6 +100,40 @@ function claudeBox(lines: string[]): InputState | undefined {
 	return typed ? "typing" : "empty";
 }
 
+/** Antigravity CLI (agy): the column-0 `>` row(s) between the last two horizontal rules. */
+function agyBox(lines: string[]): InputState | undefined {
+	const plain = lines.map((line) => strip(line).trim());
+	const rules = lines.map((line) => RULE.test(strip(line).trimEnd()));
+	let bottom = -1;
+	for (let i = plain.length - 1; i >= 0; i--) {
+		if (rules[i]) {
+			bottom = i;
+			break;
+		}
+	}
+	if (bottom < 0) return undefined;
+	if (plain.slice(bottom + 1).filter(Boolean).length > MAX_LINES_BELOW_BOX) {
+		return undefined;
+	}
+	let top = -1;
+	for (let i = bottom - 1; i >= 0; i--) {
+		if (rules[i]) {
+			top = i;
+			break;
+		}
+	}
+	if (top < 0 || bottom - top < 2 || !strip(lines[top + 1]).startsWith(">")) return "typing";
+	const typed = brightText(lines.slice(top + 1, bottom).join("\n"))
+		.replace(/^>/, "")
+		.trim();
+	return typed ? "typing" : "empty";
+}
+
+/** True when the last two horizontal rules frame an empty column-0 `>` box that would be empty if the target is agy. */
+export function agyShaped(screen: string): boolean {
+	return agyBox(screen.replace(/\s+$/, "").split("\n")) === "empty";
+}
+
 /** GJC: the rounded `╭ │ > … │ ╰` box. */
 function gjcBox(lines: string[]): InputState | undefined {
 	const plain = lines.map((line) => strip(line).trim());
@@ -136,9 +172,10 @@ function gjcBox(lines: string[]): InputState | undefined {
 }
 
 /** Classifies the input box in an ANSI `pane read --source visible` snapshot. */
-export function classifyInput(screen: string): InputState {
+export function classifyInput(screen: string, kind?: string): InputState {
 	const lines = screen.replace(/\s+$/, "").split("\n");
-	return claudeBox(lines) ?? gjcBox(lines) ?? "unknown";
+	const ruled = kind === "agy" ? agyBox(lines) : claudeBox(lines);
+	return ruled ?? gjcBox(lines) ?? "unknown";
 }
 
 /** One read-only read; failures are unknown, exhausted budgets conservatively count as typing. */
@@ -147,9 +184,12 @@ export async function readInputState(
 	paneId: string,
 	signal?: AbortSignal,
 	timeoutMs = READ_TIMEOUT_MS,
+	kind?: string,
 ): Promise<InputState> {
 	const timeout = Math.floor(timeoutMs);
 	if (timeout < 1) return "typing";
+	const now = deps.now ?? (() => performance.now());
+	const startedAt = now();
 	try {
 		const result = await deps.exec(
 			deps.herdrBin,
@@ -157,7 +197,19 @@ export async function readInputState(
 			{ timeout, signal },
 		);
 		if (result.killed || result.code !== 0) return "unknown";
-		return classifyInput(result.stdout);
+		let resolvedKind = kind;
+		if (resolvedKind === undefined && deps.agentKind && agyShaped(result.stdout)) {
+			const elapsed = now() - startedAt;
+			const remaining = timeoutMs - elapsed;
+			if (!signal?.aborted && Math.floor(remaining) >= 1) {
+				try {
+					resolvedKind = await deps.agentKind(remaining, signal, elapsed);
+				} catch {
+					resolvedKind = undefined;
+				}
+			}
+		}
+		return classifyInput(result.stdout, resolvedKind);
 	} catch {
 		return "unknown";
 	}
@@ -172,11 +224,34 @@ export async function waitForEmptyInput(
 	paneId: string,
 	maxWaitMs: number,
 	signal?: AbortSignal,
+	kind?: string,
 ): Promise<InputWaitResult> {
 	const sleep =
 		deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
 	const now = deps.now ?? (() => performance.now());
 	const startedAt = now();
+	let kindResolved = false;
+	let cachedKind: string | undefined;
+	const guardDeps: InputGuardDeps = deps.agentKind
+		? {
+				...deps,
+				agentKind: async (budgetMs, s) => {
+					if (!kindResolved) {
+						const waited = now() - startedAt;
+						const remaining =
+							maxWaitMs > 0 ? Math.min(budgetMs, maxWaitMs - waited) : budgetMs;
+						if (s?.aborted || Math.floor(remaining) < 1) return undefined;
+						kindResolved = true;
+						try {
+							cachedKind = await deps.agentKind!(remaining, s, waited);
+						} catch {
+							cachedKind = undefined;
+						}
+					}
+					return cachedKind;
+				},
+			}
+		: deps;
 	let state: InputState = "unknown";
 	for (;;) {
 		let waitedMs = now() - startedAt;
@@ -185,7 +260,7 @@ export async function waitForEmptyInput(
 		}
 		const readBudget = maxWaitMs > 0 ? Math.min(READ_TIMEOUT_MS, maxWaitMs - waitedMs) : READ_TIMEOUT_MS;
 		if (readBudget < 1) return { state: "typing", waitedMs };
-		state = await readInputState(deps, paneId, signal, readBudget);
+		state = await readInputState(guardDeps, paneId, signal, readBudget, kind);
 		waitedMs = now() - startedAt;
 		if (state !== "typing" || waitedMs >= maxWaitMs || signal?.aborted) {
 			return { state, waitedMs };

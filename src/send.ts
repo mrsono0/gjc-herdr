@@ -67,6 +67,7 @@ export interface Sender {
 export interface TargetPane {
 	paneId: string;
 	tokens: Json;
+	agent?: string;
 	agentStatus?: string;
 	focused?: boolean;
 }
@@ -157,6 +158,7 @@ export async function resolveTargetPane(
 	return {
 		paneId: pane.pane_id,
 		tokens: record(pane.tokens) ?? {},
+		agent: typeof pane.agent === "string" ? pane.agent : undefined,
 		agentStatus:
 			typeof pane.agent_status === "string" ? pane.agent_status : undefined,
 		focused: pane.focused === true,
@@ -433,6 +435,7 @@ export async function deliverPrompt(
 			pane.paneId,
 			deps.inputWaitMs ?? inputWaitMs(),
 			signal,
+			pane.agent,
 		);
 		const waited = guard.waitedMs > 0 ? { waitedMs: guard.waitedMs } : {};
 		if (signal?.aborted) {

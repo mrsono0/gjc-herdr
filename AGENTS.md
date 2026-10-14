@@ -27,7 +27,7 @@
 
 ## 프로젝트 구조 요약
 
-- 제품: GJC 확장 플러그인 `gjc-herdr`(Bun 1.4.2 고정, TypeScript, MIT). 진입점 `dist/extension.js`는 빌드 산출물이며 `src/`와 version이 일치할 때만 commit한다.
+- 제품: GJC 확장 플러그인 `gjc-herdr`(Bun 1.4.3 고정, TypeScript, MIT). 진입점 `dist/extension.js`는 빌드 산출물이며 `src/`와 version이 일치할 때만 commit한다.
 - `src/extension.ts` 등록·수명 주기, `src/metadata.ts` model/session/session_id 표시 token, `src/send.ts` `/herdr-send`·`herdr_send`(pane→GJC 프롬프트 전달), `src/input.ts` 입력란 판정, `src/call.ts` `/herdr-call`·`herdr_agent_call`(감지 agent 호출·답변 회수). 테스트는 `test/*.test.ts`, 빌드는 `scripts/build.ts`.
 - 팀 운영 스크립트: `scripts/team-up.sh`(팀 이름·label·팀원 pane 구성), `scripts/critic-send.sh`(Codex 검토 전송), `scripts/check-env.sh`(읽기 전용 환경 점검).
 - 검증: `npm run check`(tsc), `npm test`, `bun scripts/build.ts`.
