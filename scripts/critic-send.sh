@@ -213,6 +213,7 @@ delivery_kind=""
 trap 'delivery_followup "$?"' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+new_sent=0
 if screen_matches "$screen" fresh; then
 	echo '이미 빈 새 대화입니다. /new 전송 생략.'
 else
@@ -239,10 +240,24 @@ else
 	[ "$(now_ms)" -lt "$new_text_deadline" ] || { echo '/new 입력 반영 확인 timeout. Enter와 지시서는 보내지 않았습니다.' >&2; exit 2; }
 	herdr pane send-keys "$pane" enter || { echo '/new 제출 결과가 불확실합니다.' >&2; exit 2; }
 	echo '/new·Enter 전송 요청 완료. 새 입력란 준비를 확인합니다.'
+	new_sent=1
+fi
 
-# 기존 대화에서만 /new를 보낸다. 이전 화면과 다른 새 빈 화면과 상태를 함께 확인한다.
+# /new 뒤 새 빈 대화 준비를 기다린다. 이전 화면과 다른 새 빈 화면과 상태를 함께 확인한다.
+# Codex는 새 빈 화면(idle)을 보인 뒤 잠깐 working이 됐다가 done으로 돌아온다(실측: 약 0.5초 뒤 시작, 약 1초).
+# 그 전에 준비로 보면 전송 직전 확인이 working을 보고 거부하므로, 새 빈 화면·idle/done·같은 상태 seq를
+# 1초 간격 세 번 연속 관측해야 준비로 본다. 대기는 준비 확인 한도(ready_deadline) 안에서만 한다.
 draft_reads=0
 worktree_enter_sent=0
+# /new 뒤 재대기 예외: 상태가 working이고 대상·비포커스가 맞을 때만 참이다(interactive_ready 값은 보지 않는다).
+# working이 아니면 호출한 쪽의 validate 거부로 끝낸다: blocked·unknown, idle/done인데 interactive_ready=False 등.
+new_working() { # JSON
+	[ "$(printf '%s' "$1" | jget result.agent.agent_status)" = working ] \
+		&& [ "$(printf '%s' "$1" | jget result.agent.focused)" = False ] \
+		&& validate_agent "$1" 0 1 2>/dev/null
+}
+wait_new_conversation() {
+local stable=0 key="" now_key
 while :; do
 	if [ "$(now_ms)" -ge "$ready_deadline" ]; then
 		screen_matches "$screen" readable || screen_size_failure
@@ -257,6 +272,9 @@ while :; do
 	screen="$(herdr pane read "$pane" --source visible --format ansi)" || fail '새 대화 화면 확인 실패.'
 	# Git worktree 메뉴는 현재 폴더 선택에만 Enter를 한 번 허용한다.
 	if screen_matches "$screen" worktree_menu; then
+		# 메뉴 관측은 준비 판정이 아니므로 연속 관측 횟수를 끊는다.
+		stable=0
+		key=""
 		# Enter 직후의 과도 화면을 감안해 1초 간격 세 관측 동안 메뉴가 남을 때만 중단한다.
 		if [ "$worktree_enter_sent" -ne 0 ]; then
 			worktree_enter_sent=$((worktree_enter_sent + 1))
@@ -266,6 +284,11 @@ while :; do
 		fi
 		screen_matches "$screen" worktree || { echo '/new 뒤 worktree 메뉴의 선택이 1번(현재 worktree)이 아닙니다. 지시서는 보내지 않았습니다. 자동 Esc·Enter 없음.' >&2; exit 2; }
 		agent="$(herdr agent get "$pane")" || fail 'worktree 선택 전 대상 확인 실패. 지시서는 보내지 않았습니다.'
+		# 대상·비포커스는 맞고 상태만 working이면 Enter 없이 기다린다. 그 밖의 실패는 거부한다.
+		if new_working "$agent"; then
+			sleep 1
+			continue
+		fi
 		validate_agent "$agent" 1 1 || exit 1
 		[ "$(now_ms)" -lt "$ready_deadline" ] || fail '새 입력란 준비 확인 timeout. 지시서는 보내지 않았습니다.'
 		worktree_enter_sent=1
@@ -286,21 +309,39 @@ a=json.load(sys.stdin)["result"]["agent"]
 changed=str(a.get("revision"))!=sys.argv[1] or str(a.get("state_change_seq"))!=sys.argv[2]
 sys.exit(0 if changed and a.get("agent_status") in ("idle","done") and a.get("interactive_ready") is True else 1)' "$revision" "$sequence" \
 		&& screen_matches "$screen" fresh; then
-		observed_ms="$(now_ms)"
-		[ "$observed_ms" -lt "$ready_deadline" ] && [ "$observed_ms" -lt "$deadline" ] || fail '새 입력란 준비 확인 timeout. 지시서는 보내지 않았습니다.'
-		break
+		now_key="$status $(printf '%s' "$agent" | jget result.agent.state_change_seq)"
+		if [ "$now_key" = "$key" ]; then stable=$((stable + 1)); else key="$now_key"; stable=1; fi
+		if [ "$stable" -ge 3 ]; then
+			observed_ms="$(now_ms)"
+			[ "$observed_ms" -lt "$ready_deadline" ] && [ "$observed_ms" -lt "$deadline" ] || fail '새 입력란 준비 확인 timeout. 지시서는 보내지 않았습니다.'
+			return 0
+		fi
+	else
+		stable=0
+		key=""
 	fi
 	sleep 1
 done
-fi
-agent="$(herdr agent get "$CRITIC_NAME")" || fail '전송 직전 이름 확인 실패.'
-validate_agent "$agent" 1 1 || exit 1
-screen="$(herdr pane read "$pane" --source visible --format ansi)" || fail '전송 직전 입력란 확인 실패.'
-screen_matches "$screen" readable || screen_size_failure
-screen_matches "$screen" fresh || fail '전송 직전 새 입력란이 더 이상 비어 있지 않거나 준비되지 않았습니다. 지시서는 보내지 않았습니다.'
-# 최종 관측이 늦게 반환된 경우도 준비 한도를 다시 확인한다.
-observed_ms="$(now_ms)"
-[ "$observed_ms" -lt "$ready_deadline" ] || fail '새 입력란 준비 확인 timeout. 지시서는 보내지 않았습니다.'
+}
+while :; do
+	[ "$new_sent" -eq 0 ] || wait_new_conversation
+	agent="$(herdr agent get "$CRITIC_NAME")" || fail '전송 직전 이름 확인 실패.'
+	# /new를 보낸 뒤에는 준비 확인과 이 확인 사이에 working이 다시 시작될 수 있다.
+	# 대상·이름·비포커스는 맞고 상태만 working이면 거부하지 않고 준비 대기로 돌아간다(한도는 그대로).
+	# 세 관측 뒤에 시작되는 working을 미리 막지는 못하며, 이 확인과 prompt 사이도 원자적이지 않다.
+	if [ "$new_sent" -eq 1 ] && new_working "$agent"; then
+		echo '/new 뒤 Codex 상태=working. 새 입력란 준비를 다시 기다립니다.'
+		continue
+	fi
+	validate_agent "$agent" 1 1 || exit 1
+	screen="$(herdr pane read "$pane" --source visible --format ansi)" || fail '전송 직전 입력란 확인 실패.'
+	screen_matches "$screen" readable || screen_size_failure
+	screen_matches "$screen" fresh || fail '전송 직전 새 입력란이 더 이상 비어 있지 않거나 준비되지 않았습니다. 지시서는 보내지 않았습니다.'
+	# 최종 관측이 늦게 반환된 경우도 준비 한도를 다시 확인한다.
+	observed_ms="$(now_ms)"
+	[ "$observed_ms" -lt "$ready_deadline" ] || fail '새 입력란 준비 확인 timeout. 지시서는 보내지 않았습니다.'
+	break
+done
 remaining=$(( deadline - observed_ms ))
 [ "$remaining" -gt 0 ] || fail '전송 전 timeout. 지시서는 보내지 않았습니다.'
 accept_timeout=10000

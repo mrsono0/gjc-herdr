@@ -513,7 +513,7 @@ for p in panes:
 		fi
 	fi
 	herdr pane rename "$pane" "$CRITIC_LABEL" >/dev/null || return 1
-	if ! herdr agent start "$CRITIC_NAME" --kind codex --pane "$pane" --timeout 60000 -- --no-daemon --yolo -m "$CODEX_MODEL" -C "$workdir"; then
+	if ! herdr agent start "$CRITIC_NAME" --kind codex --pane "$pane" --timeout 60000 -- --no-daemon --yolo -m "$CODEX_MODEL" -C "$workdir" --disable worktrees; then
 		echo "Codex start failed for $pane" >&2
 		return 1
 	fi
