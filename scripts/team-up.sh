@@ -2,13 +2,13 @@
 # gjc-herdr 팀 구성 보조. 기본: 이 pane의 이름·label만 맞춘다(pane 생성 없음).
 #   scripts/team-up.sh --hook    SessionStart hook용. 백그라운드에서 clear는 기본 동작, 그 외는 --spawn 수행
 #   scripts/team-up.sh           기본 동작을 지금 수행
-#   scripts/team-up.sh --spawn   기본 동작 + 없는 GJC 팀원·선택 Codex 검토 구성(남은 빈 셸 pane 재사용) + 마지막에 목표 배치 보정
+#   scripts/team-up.sh --spawn   기본 동작 + 없는 agy 팀원·선택 Codex 검토 구성(남은 빈 셸 pane 재사용) + 마지막에 목표 배치 보정
 #                                (팀원이 팀장 탭에 없는 등 조건이 안 맞으면 옮기지 않고 건너뜀, 조회 실패는 비0,
 #                                 검토는 선택 Codex가 켜져 있고 같은 탭일 때만 포함)
 #   scripts/team-up.sh --layout  기본 동작 + 기존 팀장·팀원·검토 pane을 목표 배치로 재배치(조건이 안 맞으면 오류)
-#   목표 배치(공식 기준): 팀장 위(높이 60%), 그 아래 왼쪽 팀원 GJC | 오른쪽 검토 Codex(반반). 검토가 없으면 팀장 60% / 팀원 아래.
+#   목표 배치(공식 기준): 팀장 위(높이 60%), 그 아래 왼쪽 팀원 agy | 오른쪽 검토 Codex(반반). 검토가 없으면 팀장 60% / 팀원 아래.
 #   Sidebar 등 다른 pane은 건드리지 않는다(임시 탭에 자동 생성된 agent 없는 Sidebar만 탭 닫기로 함께 정리).
-#   GJCH_MATE_PRESET은 팀원 프리셋(기본 opus5-codex56-pro)이며, 빈 값이면 프리셋 없이 실행한다.
+#   GJCH_MATE_MODEL은 팀원 agy 모델(기본 gemini-4-argon-high)이며, 영문자·숫자·점·밑줄·하이픈만 허용한다.
 #   GJCH_TEAM_CODEX=0은 Codex 생성을 끈다. Codex는 사용자 지시로 --yolo(샌드박스 없음)를 사용한다.
 #   --no-daemon은 공유 daemon 환경의 훅이 세션 ID를 다른 pane으로 보고하는 것을 막는다.
 #   Codex는 저장소 루트에서 실행하며, 파일 수정은 먼저 팀장 허락을 받는다는 규칙(AGENTS.md·지시서)으로 지킨다.
@@ -19,10 +19,10 @@ LEAD_NAME="${GJCH_LEAD_NAME:-gjc-herdr-lead}"
 MATE_NAME="${GJCH_MATE_NAME:-gjc-herdr-mate}"
 CRITIC_NAME="${GJCH_CRITIC_NAME:-gjc-herdr-critic}"
 LEAD_LABEL="GJCH 팀장 · Claude"
-MATE_LABEL="GJCH 팀원 · GJC"
+MATE_LABEL="GJCH 팀원 · agy"
 CRITIC_LABEL="GJCH 검토·조사 · Codex"
 CODEX_MODEL="${GJCH_CODEX_MODEL:-gpt-6.1-sol}"
-MATE_PRESET="${GJCH_MATE_PRESET-opus5-codex56-pro}"
+MATE_MODEL="${GJCH_MATE_MODEL:-gemini-4-argon-high}"
 WS_LABEL="GJCH · gjc-herdr"
 RETRIES="${GJCH_RETRIES:-30}"   # 2초 간격 → 최대 약 60초
 
@@ -380,28 +380,56 @@ if [ "$mode" = "--layout" ]; then
 fi
 [ "$mode" = "--spawn" ] || exit 0
 
-# --- 팀원 GJC pane (이미 있으면 생성하지 않음) ---
+# --- 팀원 agy pane (이미 있으면 생성하지 않음) ---
 mate_pane=""
 layout_status=0   # 배치 실패(기동 실패와 별도). 이동 단계의 비0은 마지막 배치 보정이 성공해도 그대로 둔다.
 spawn_mate() {
-local existing pane mate_command lead_tab critic critic_tab
-existing="$(agent_pane "$MATE_NAME")" || {
+local existing mate_out mate_rc mate_state pane lead_tab critic critic_tab start_out start_info err_code err_detail pane_out pane_status
+mate_out="$(herdr agent get "$MATE_NAME" 2>&1)"; mate_rc=$?
+mate_state="$(printf '%s' "$mate_out" | python3 -c 'import sys,json
+try: d=json.load(sys.stdin)
+except Exception: sys.exit(1)
+a=(d.get("result") or {}).get("agent") or {}
+p=a.get("pane_id") if isinstance(a,dict) else None
+if sys.argv[1]=="0":
+    if not p: sys.exit(1)
+    s=a.get("agent_status") or ""
+    r=a.get("interactive_ready")
+    if s=="blocked": print("blocked|"+p)
+    elif s=="working" or (s in ("idle","done") and r is True): print("ready|"+p)
+    elif s: print("not_ready|"+p+"|"+s)
+    else: sys.exit(1)
+elif ((d.get("error") or {}).get("code"))!="agent_not_found":
+    sys.exit(1)' "$mate_rc")" || {
 	echo "could not look up agent '$MATE_NAME'; mate not spawned" >&2
 	return 1
 }
-if [ -n "$existing" ]; then
+if [ -n "$mate_state" ]; then
+	existing="${mate_state#*|}"
+	existing="${existing%%|*}"
 	mate_pane="$existing"
-	echo "mate already exists at $existing; nothing spawned"
-	return 0
+	case "${mate_state%%|*}" in
+		ready)
+			echo "mate already exists at $existing; nothing spawned"
+			return 0 ;;
+		blocked)
+			echo "agy가 시작 중 멈췄습니다($existing, status=blocked). 폴더 신뢰 창이나 다른 질문일 수 있으니 그 pane에서 사용자가 확인한 뒤 scripts/team-up.sh --spawn을 다시 실행하세요." >&2
+			return 1 ;;
+		*)
+			echo "existing mate '$MATE_NAME' at $existing is not ready (status=${mate_state##*|}); check the pane and re-run scripts/team-up.sh --spawn" >&2
+			return 1 ;;
+	esac
 fi
-# 새로 실행할 때만 프리셋을 검사한다(셸에 문자열로 입력되므로 허용 문자만).
-case "$MATE_PRESET" in
-	*[!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-]*)
-		echo 'GJCH_MATE_PRESET은 비워 두거나 영문자·숫자·점·밑줄·하이픈만 사용할 수 있습니다.' >&2
+# 새로 실행할 때만 모델 값을 검사한다(영문자·숫자·점·밑줄·하이픈만 허용).
+case "$MATE_MODEL" in
+	""|*[!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-]*)
+		echo 'GJCH_MATE_MODEL은 영문자·숫자·점·밑줄·하이픈만 사용할 수 있습니다.' >&2
 		return 1 ;;
 esac
-mate_command="gjc"
-[ -z "$MATE_PRESET" ] || mate_command="gjc --mpreset $MATE_PRESET"
+if ! command -v agy >/dev/null; then
+	echo "agy not found; mate not spawned" >&2
+	return 1
+fi
 # 재시작 후 남은 팀원 pane(label 일치·이 프로젝트 cwd·agent 없음 = 빈 셸)이 있으면 재사용한다.
 pane="$(herdr pane list 2>/dev/null | python3 -c 'import sys,json,os
 root,ws,label=sys.argv[1:4]
@@ -439,38 +467,39 @@ if [ -z "$pane" ]; then
 fi
 mate_pane="$pane"
 herdr pane rename "$pane" "$MATE_LABEL" >/dev/null 2>&1
-herdr pane run "$pane" "$mate_command" >/dev/null 2>&1 || { echo "pane run failed for $pane" >&2; return 1; }
-if ! retry claim_name "$pane" "$MATE_NAME"; then
-	echo "spawned pane $pane but agent name was not claimed within the retry window" >&2
+if ! start_out="$(herdr agent start "$MATE_NAME" --kind agy --pane "$pane" --timeout 60000 -- --model "$MATE_MODEL" --mode auto 2>&1)"; then
+	start_info="$(printf '%s' "$start_out" | python3 -c 'import sys,json
+raw=sys.stdin.read().strip()
+try: d=json.loads(raw)
+except Exception:
+    print("-|"+raw.replace("\n"," "))
+    sys.exit(0)
+err=(d.get("error") if isinstance(d,dict) else None) or {}
+if not isinstance(err,dict): err={}
+code=err.get("code") if isinstance(err.get("code"),str) else ""
+msg=err.get("message") if isinstance(err.get("message"),str) else ""
+detail=code+": "+msg if code and msg else code or msg or raw
+print((code or "-")+"|"+detail.replace("\n"," "))')"
+	err_code="${start_info%%|*}"
+	err_detail="${start_info#*|}"
+	pane_status=""
+	if [ "$err_code" = agent_not_ready ]; then
+		if pane_out="$(herdr pane get "$pane" 2>/dev/null)"; then
+			pane_status="$(printf '%s' "$pane_out" | jget result.pane.agent_status)" || pane_status=""
+		fi
+		if [ "$pane_status" = blocked ]; then
+			echo "agy가 시작 중 멈췄습니다($pane, status=blocked${err_detail:+, $err_detail}). 폴더 신뢰 창이나 다른 질문일 수 있으니 그 pane에서 사용자가 확인한 뒤 scripts/team-up.sh --spawn을 다시 실행하세요." >&2
+			return 1
+		fi
+	fi
+	echo "agy start failed for $pane${pane_status:+ (status=$pane_status)}${err_detail:+: $err_detail}" >&2
 	return 1
 fi
-echo "spawned $MATE_NAME at $pane"
-
-# 사이드바는 pane label이 아니라 GJC 세션 이름을 보인다. GJC가 idle이고 플러그인 session_id token이
-# 발행된 뒤(= 세션이 시작되어 입력을 받을 수 있음)에만 /rename을 입력하고, 아니면 수동 안내만 남긴다.
-mate_ready() {
-	herdr pane get "$pane" 2>/dev/null | python3 -c 'import sys,json
-p=json.load(sys.stdin)["result"]["pane"]
-sys.exit(0 if p.get("agent_status")=="idle" and p.get("tokens",{}).get("gjc_herdr_session_id") else 1)' 2>/dev/null
-}
-mate_renamed() {
-	[ "$(herdr pane get "$pane" 2>/dev/null | jget result.pane.tokens.gjc_herdr_session)" = "$MATE_LABEL" ]
-}
-if retry mate_ready; then
-	herdr pane send-text "$pane" "/rename $MATE_LABEL" >/dev/null 2>&1
-	herdr pane send-keys "$pane" enter >/dev/null 2>&1
-	if retry mate_renamed; then
-		echo "session renamed to '$MATE_LABEL'"
-	else
-		echo "typed /rename but the session name token did not update; check the GJC input box" >&2
-	fi
-else
-	echo "GJC not ready for input; run /rename '$MATE_LABEL' in the GJC input box manually" >&2
-fi
+echo "spawned $MATE_NAME at $pane (cwd $ROOT)"
 return 0
 }
 
-# --- 독립 검토 Codex (GJC 단계 성공 여부와 무관하게 수행) ---
+# --- 독립 검토 Codex (팀원 단계 성공 여부와 무관하게 수행) ---
 spawn_critic() {
 	local existing workdir pane anchor direction ratio lead_tab
 	if [ "${GJCH_TEAM_CODEX:-1}" = 0 ]; then

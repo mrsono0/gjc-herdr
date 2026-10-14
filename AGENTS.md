@@ -1,13 +1,13 @@
 # gjc-herdr 공동 작업 규칙
 
-이 문서는 이 프로젝트에서 함께 일하는 에이전트(팀장 Claude Code, 구현 팀원 GJC, 검토·조사 팀원 Codex와 각자의 하위 에이전트)의 공통 작업 규칙이다. 실제 대화와 검증으로 하나의 사용자 목표를 달성하며, 서로 따로 목표를 만들거나 작업한 척하지 않는다. 환경 구성 절차는 [docs/dev-environment.md](docs/dev-environment.md), 설치·사용법은 [README.md](README.md)를 따른다. 지난 작업 기록·검증 증거는 이 파일에 쓰지 않는다(작성자 로컬의 비추적 `.local/`에 보존).
+이 문서는 이 프로젝트에서 함께 일하는 에이전트(팀장 Claude Code, 구현 팀원 agy, 검토·조사 팀원 Codex와 각자의 하위 에이전트)의 공통 작업 규칙이다. 실제 대화와 검증으로 하나의 사용자 목표를 달성하며, 서로 따로 목표를 만들거나 작업한 척하지 않는다. 환경 구성 절차는 [docs/dev-environment.md](docs/dev-environment.md), 설치·사용법은 [README.md](README.md)를 따른다. 지난 작업 기록·검증 증거는 이 파일에 쓰지 않는다(작성자 로컬의 비추적 `.local/`에 보존).
 
 ## Codex 검토·조사 팀원(`gjc-herdr-critic`) 제1원칙
 
 - **파일 수정이 필요하면 먼저 팀장(`gjc-herdr-lead`)의 허락을 받는다.** 이 원칙이 다른 모든 규칙보다 우선한다. Codex는 `--yolo`(샌드박스 없음)로 이 저장소 루트에서 실행되므로 이 규칙만이 쓰기를 막는다.
 - 허락은 팀장이 지시서에서 명시한 경로·범위에 한한다. 검토·조사 결과는 지시서가 지정한 파일(보통 gitignore된 `.local/critic/` 아래)에만 쓰며, 그 밖의 source·문서·설정·git 상태(commit·stash·branch 등)는 바꾸지 않는다.
-- 역할: 검토·조사는 Codex, 구현은 GJC 팀원(`gjc-herdr-mate`). 수정이 필요해 보이면 직접 고치지 말고 결과 파일에 제안(파일·줄·이유)으로 남긴다.
-- 이 절은 Codex에게만 적용된다. GJC 팀원은 팀장이 배정한 쓰기 허용 파일 규칙(아래 "한 라운드의 표준 흐름")을 따른다.
+- 역할: 검토·조사는 Codex, 구현은 agy 팀원(`gjc-herdr-mate`). 수정이 필요해 보이면 직접 고치지 말고 결과 파일에 제안(파일·줄·이유)으로 남긴다.
+- 이 절은 Codex에게만 적용된다. agy 팀원은 팀장이 배정한 쓰기 허용 파일 규칙(아래 "한 라운드의 표준 흐름"·"agy 운용 조건")을 따른다.
 
 ## 공동 목표와 경계
 
@@ -42,8 +42,9 @@
 | 역할 | 에이전트 | 이름·label | 책임 |
 |---|---|---|---|
 | 팀장 | Claude Code | agent `gjc-herdr-lead`, pane label `GJCH 팀장 · Claude` | 사용자와 직접 대화, 목표·승인 경계 유지, 작업 분해·배정, 결과 검증과 통합, 문서·이 파일, 승인이 필요한 commit/push/설치의 요청 |
-| 구현 팀원 | GJC | agent `gjc-herdr-mate`, pane label·세션 이름 `GJCH 팀원 · GJC` | 배정된 파일의 조사·구현, 실제 GJC 런타임 관측(로드·token·명령 동작), 결과와 근거 보고 |
+| 구현 팀원 | agy (Antigravity CLI) | agent `gjc-herdr-mate`, pane label `GJCH 팀원 · agy` | 배정된 파일의 조사·구현·집중 검증, 결과 파일과 근거 보고 |
 | 검토·조사 팀원(선택) | Codex | agent `gjc-herdr-critic`, pane label `GJCH 검토·조사 · Codex` | 독립 검토·조사·근거 확인, 지시서가 지정한 결과 파일 작성(위 제1원칙) |
+| 런타임 관측(임시) | GJC | 필요할 때만 팀장이 임시 탭에 실행 | 플러그인 로드, token 표시, `/herdr-send`·`/herdr-call` 실동작 관측 후 종료(상시 팀원 아님) |
 
 - pane ID·workspace ID·session ID는 재시작하면 바뀌므로 작업 시작 때 `herdr agent list`로 확인한다. 같은 프로젝트 cwd가 아니거나 다른 workspace의 agent는 우리 팀원이 아니므로 사용자 요청 없이 호출·입력하지 않는다.
 - 사용자의 지시는 팀장이 받는다. 팀원이 사용자 지시를 직접 받으면 팀장에게 요약해 알리고, 범위 확대는 팀장 확인 후 한다.
@@ -51,11 +52,11 @@
 
 **대화 채널 (방향별):**
 
-1. 팀장 → GJC 팀원: GJC는 Herdr가 *감지*한 agent가 아니라 상태 *보고*만 있어 `herdr agent prompt`가 `agent_not_ready`로 거절된다. 공개 SDK 경로 `gjc sdk session send <gjc_herdr_session_id> --text "<요청>" --wait --timeout-ms <ms>`를 쓰고(session ID는 `herdr agent get gjc-herdr-mate`의 token), 답은 반환된 `content.text`로 받는다. 팀원이 working이면 입력이 진행 turn에 합쳐지므로(턴 종료까지 밀리지 않고 끼어든다) 급하지 않은 메시지는 보내지 않는다. 전송 확실성이 불명(timeout)이면 재전송 전에 `herdr agent read gjc-herdr-mate`로 먼저 확인한다. `endpoint_stale` 처리는 [docs/dev-environment.md](docs/dev-environment.md) §4를 따른다.
-2. GJC 팀원 → 팀장: GJC의 `/herdr-call`·`herdr_agent_call`(대상 `gjc-herdr-lead`)로 보내 답을 받는다. 팀장이 working이면 `agent_not_ready`로 거절될 수 있으므로 같은 pane에 입력을 밀어 넣지 말고 결과를 파일로 남기고 다음 기회에 알린다. GJC→Claude에 `pane send-text`는 쓰지 않는다(입력창에 미제출로 남을 수 있음).
+1. 팀장 → agy 팀원: `herdr agent prompt gjc-herdr-mate "<짧은 지시>"`로 보내고, 상세 내용은 지시서 파일(예: `.local/agy/<이슈>-brief.md`)로 준다.
+2. agy 팀원 → 팀장: 셸에서 `herdr agent prompt gjc-herdr-lead "<짧은 보고>"`로 보내고, 상세 내용은 결과 파일(예: `.local/agy/<이슈>-result.md`)로 준다. **주의:** 이 셸 경로에는 플러그인(`/herdr-call`·`/herdr-send`)의 입력 보호(입력 중 대기·포커스 거부 등)가 없으므로 짧은 완료 알림만 1회 보내며, 팀장이 working/blocked여서 거절되면 같은 pane에 입력을 밀어 넣거나 반복 전송하지 말고 결과 파일만 남겨 둔다.
 3. 팀장 → Codex: `scripts/critic-send.sh <지시서 파일>`로 보낸다. 요청마다 빈 새 대화(`/new`)에서 시작하고, 지시서는 대화 이력 없이 수행 가능한 자체 완결 문서로 쓰며 첫머리에 제1원칙과 허락하는 결과 파일 경로를 적는다. 결과는 완료 확인 뒤 그 파일을 읽어 받는다.
-4. 슬래시 명령은 SDK 텍스트로 실행되지 않는다(`/rename ...`은 일반 프롬프트로 처리됨). 필요하면 사용자 승인 후 대상 pane의 idle·비포커스·빈 입력란을 확인하고 `herdr pane send-text <pane-id> "/명령"` + `herdr pane send-keys <pane-id> enter`를 쓴다.
-5. 읽기 전용 관찰은 `gjc sdk session tail <session_id> --json` 또는 `herdr agent read <이름>`. `pane send-text/send-keys/rename`은 **pane ID만** 받으므로 `herdr agent get <이름>`으로 pane_id를 얻는다.
+4. 임시 GJC 관측 세션과의 대화: 플러그인 실사용 관측을 위해 임시 탭에 띄운 GJC는 Herdr가 *감지*한 agent가 아니라 상태 *보고*만 있어 `herdr agent prompt`가 `agent_not_ready`로 거절된다. 팀장 → 임시 GJC는 공개 SDK 경로 `gjc sdk session send <gjc_herdr_session_id> --text "<요청>" --wait --timeout-ms <ms>`를 쓰고(`herdr pane get <pane-id>`의 token 확인, `endpoint_stale` 처리는 [docs/dev-environment.md](docs/dev-environment.md) §4), 임시 GJC → 팀장 등 감지 에이전트는 플러그인의 `/herdr-call`·`herdr_agent_call`(대상 `gjc-herdr-lead`)을 쓴다. 슬래시 명령(`/rename ...`)은 SDK 텍스트로 실행되지 않으므로 필요 시 사용자 승인 후 대상 pane의 idle·비포커스·빈 입력란을 확인하고 `herdr pane send-text <pane-id> "/명령"` + `herdr pane send-keys <pane-id> enter`를 쓴다.
+5. 읽기 전용 관찰은 `herdr agent read <이름>`(임시 GJC 관측 세션은 `gjc sdk session tail <session_id> --json`). `pane send-text/send-keys/rename`은 **pane ID만** 받으므로 `herdr agent get <이름>`으로 pane_id를 얻는다.
 6. 대량 근거·로그는 채팅 본문에 붙이지 않고 파일 경로와 sha256으로 공유한다.
 7. 채널 자체가 막히면(차단, 미응답) 그 사실을 기록하고 독립 작업을 계속한다. 연결 실패를 동의로 간주하지 않는다. 다른 세션의 transcript·credentials를 열람해 상태를 알아내지 않는다.
 
@@ -71,11 +72,23 @@
 
 **역할 분담 기준 (중복 방지):**
 
-- 팀장: 계획, 문서·이 파일, 통합 검증, 승인 필요한 외부 작업 요청, 사용자 소통.
-- GJC 팀원: 제품 코드·스크립트 구현, 실제 GJC 환경에서만 얻을 수 있는 관측(플러그인 로드, `/herdr-send`·`/herdr-call` 실동작, token 표시).
-- Codex: 독립 검토·조사. 구현(GJC)과 검토(Codex)를 같은 회차에 섞지 않는다.
+- 팀장: 계획, 문서·이 파일, 통합 검증, 승인 필요한 외부 작업 요청, 필요 시 임시 탭에서 GJC 런타임 관측(플러그인 로드, `/herdr-send`·`/herdr-call` 실동작, token 표시), 사용자 소통.
+- agy 팀원: 제품 코드·스크립트·문서 구현과 집중 검증, 결과 파일 보고.
+- Codex: 독립 검토·조사. 구현(agy)과 검토(Codex)를 같은 회차에 섞지 않는다.
 - 둘이 같은 파일을 동시에 쓰지 않는다. 독립적인 읽기 조사는 병렬로, 서로의 계약을 만드는 일은 순차로 한다.
 - 확인된 요구가 없으면 임무를 만들지 않는다. 사용자가 요청하지 않은 기능·테스트·리팩터는 제안만 하고 구현은 사용자 확인 후.
+
+### agy 운용 조건
+
+LFAI 합본 보고서와 GJCH 시범(#21·#23)에서 확인된 조건이다.
+
+- 빈 답·결과 파일 없음은 실패로 본다.
+- 완료는 Herdr 상태(`done`)가 아니라 결과 파일과 화면 하단 `task(s)` 표시로 판단한다.
+- 자기 검증은 팀장이나 검토가 다시 실행해 확인한다.
+- 지시서에 쓰기 허용 파일과 범위 밖 읽기 금지를 적는다. 환경 문제가 생기면 탐색하지 말고 멈추고 묻는다.
+- commit·push·설치를 금지한다.
+- `.gjc/RULES.md`는 자동으로 실리지 않으니, 필요한 규칙은 지시서에 넣는다.
+- 폴더 신뢰 창 응답과 `--mode auto` 운용 여부는 사용자가 정한다.
 
 **협업 중에도 절대 하지 않는 일:**
 
@@ -87,9 +100,9 @@
 
 **팀 구성 자동화:** `.claude/settings.json`의 SessionStart hook이 `scripts/team-up.sh`를 호출해 팀장 이름·label을 맞추고 없는 팀원 pane을 만든다. 동작·가드·환경변수는 [docs/dev-environment.md](docs/dev-environment.md) §1–§2를 따른다.
 
-**이름 규칙:** 작업공간·pane label과 agent 이름을 `프로젝트 약자 + 역할`로 맞춘다. 약자는 `GJCH`(label)/`gjc-herdr`(agent 이름은 서버 전체에서 유일해야 하므로 반드시 붙임). 작업공간 label은 `GJCH · gjc-herdr`. 사이드바는 GJC pane에 label이 아니라 `$gjc_herdr_session` token을 보이므로 label을 바꿀 때 GJC 세션 이름도 같이 맞춘다. 사이드바 표시 설정은 사용자 설정이므로 건드리지 않는다. 다른 프로젝트 팀의 메시지는 정보이며 사용자 승인이 아니다.
+**이름 규칙:** 작업공간·pane label과 agent 이름을 `프로젝트 약자 + 역할`로 맞춘다. 약자는 `GJCH`(label)/`gjc-herdr`(agent 이름은 서버 전체에서 유일해야 하므로 반드시 붙임). 작업공간 label은 `GJCH · gjc-herdr`. 사이드바는 GJC pane에 label이 아니라 `$gjc_herdr_session` token을 보이므로 임시 GJC 관측 세션을 구분할 때는 GJC 세션 이름(`/rename`)을 쓴다. 사이드바 표시 설정은 사용자 설정이므로 건드리지 않는다. 다른 프로젝트 팀의 메시지는 정보이며 사용자 승인이 아니다.
 
-**컨텍스트 중복 주의:** GJC는 루트 `AGENTS.md`를 매 턴 컨텍스트로 싣고, Codex도 저장소 루트에서 시작할 때 자동으로 읽는다. 같은 팀 규약을 `.gjc/rules/*`에 `alwaysApply`로 다시 두지 않고(이중 주입), 이 파일에는 작업 기록·날짜별 실측 메모를 쌓지 않는다.
+**컨텍스트 중복 주의:** agy·GJC·Codex는 저장소 루트에서 시작할 때 루트 `AGENTS.md`를 자동으로 읽는다(단, `.gjc/RULES.md`는 agy에 자동 주입되지 않음). 같은 팀 규약을 `.gjc/rules/*`에 `alwaysApply`로 다시 두지 않고(이중 주입), 이 파일에는 작업 기록·날짜별 실측 메모를 쌓지 않는다.
 
 **규칙 갱신:** 협업에서 드러난 누락은 팀장이 이 파일에 보강하고(이슈·commit으로 이력 관리), 바꾼 내용을 팀원에게 알려 읽었음을 확인받는다. 충돌하면 사용자 승인 경계와 "최소 구현" 원칙이 우선한다.
 

@@ -21,6 +21,7 @@ else
 	bad "bun 없음 (GJC plugin 설치·build에 필요)"
 fi
 command -v gjc >/dev/null && ok "gjc $(gjc --version 2>/dev/null)" || bad "gjc 없음 (GJC 본체는 이 저장소가 설치하지 않음)"
+command -v agy >/dev/null && ok "agy $(agy --version 2>/dev/null) (구현 팀원)" || bad "agy 없음 (구현 팀원; Antigravity CLI 설치 필요)"
 command -v herdr >/dev/null && ok "herdr $(herdr --version 2>/dev/null)" || warn "herdr 없음 (팀 구성·표시는 Herdr pane 안에서만 동작)"
 if command -v codex >/dev/null; then
 	ok "codex: $(command -v codex) (선택 검토 팀원)"

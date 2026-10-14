@@ -4,9 +4,9 @@ GJC의 native 상태·세션/resume 처리를 유지하면서 Herdr sidebar에 *
 
 배포 정책: **npm registry에는 발행하지 않는다.** 이 Git 저장소에서 직접 설치한다. 실행 파일 `dist/extension.js`는 저장소에 포함되어 있어 설치 시 build가 필요 없다.
 
-## 새 컴퓨터 빠른 시작 (Herdr + Claude Code 팀장 + GJC 팀원 + 선택 Codex 검토)
+## 새 컴퓨터 빠른 시작 (Herdr + Claude Code 팀장 + agy 팀원 + 선택 Codex 검토)
 
-Herdr 안에서 Claude Code(팀장)가 GJC(구현 팀원)와 선택 Codex(독립 검토·조사 팀원)에 역할을 나눠 개발하는 환경을 구성할 수 있다. AI가 읽고 따를 수 있게 준비되어 있다. Codex 자동 구성은 `GJCH_TEAM_CODEX=0`으로 끌 수 있다. Codex는 **`--yolo`(승인·샌드박스 없음)** 로 저장소 루트에서 실행되므로, "파일 수정이 필요하면 먼저 팀장 허락을 받는다"는 제1원칙을 규칙 파일·지시서로 지킨다.
+Herdr 안에서 Claude Code(팀장)가 agy(구현 팀원)와 선택 Codex(독립 검토·조사 팀원)에 역할을 나눠 개발하는 환경을 구성할 수 있다. GJC는 이 플러그인의 설치·관측 대상이며, 실사용 관측이 필요할 때 팀장이 임시 탭에 띄운다. AI가 읽고 따를 수 있게 준비되어 있다. Codex 자동 구성은 `GJCH_TEAM_CODEX=0`으로 끌 수 있다. Codex는 **`--yolo`(승인·샌드박스 없음)** 로 저장소 루트에서 실행되므로, "파일 수정이 필요하면 먼저 팀장 허락을 받는다"는 제1원칙을 규칙 파일·지시서로 지킨다.
 
 **사람이 할 일**
 
@@ -18,7 +18,7 @@ Herdr 안에서 Claude Code(팀장)가 GJC(구현 팀원)와 선택 Codex(독립
    claude
    ```
 3. Claude에게 **"안내대로 환경 설정해줘"** 라고 말한다. 루트 `CLAUDE.md`가 자동으로 읽혀, Claude가 `scripts/check-env.sh`(읽기 전용 점검)를 실행하고 부족한 항목만 [docs/dev-environment.md](docs/dev-environment.md) 절차대로 해결한다. `gjc-herdr` 플러그인 설치와 `~/.config/herdr/config.toml` 같은 사용자 설정 변경은 승인을 요청한다.
-4. 설정이 끝나면 Claude를 한 번 재시작한다. `.claude/settings.json`의 SessionStart(`startup|clear`) hook이 `scripts/team-up.sh --hook`을 실행한다. `startup`에서는 팀장(`gjc-herdr-lead`) pane 이름을 정하고 팀원 GJC(`gjc-herdr-mate`) pane을 만든다. `codex`가 있고 끄지 않았으면 저장소 루트에서 실행되는 선택 검토 Codex(agent `gjc-herdr-critic`, pane label `GJCH 검토·조사 · Codex`)도 구성한다. `/clear` 뒤에는 팀장 이름·pane label과, 비었거나 폴더명 기본값인 작업공간 label만 복구하며, 팀원·검토 pane이 없어도 새로 만들지 않는다. `herdr agent list`로 구성 예정인 agent가 보이는지 확인한다. 배치 공식 기준은 팀장 위(높이 60%), 아래 왼쪽 팀원 GJC | 오른쪽 검토 Codex(반반)이고, 검토가 없거나 꺼져 있거나 다른 탭이면 팀장 60% / 팀원 아래다(꺼 둔 검토가 같은 탭에 남아 있으면 팀 구성 보정은 옮기지 않고 건너뛴다). Sidebar 등 다른 pane은 건드리지 않는다(단, 임시 탭 경유 이동 때 그 임시 탭에 자동 생성된 agent 없는 Sidebar는 탭 닫기로 함께 정리한다). 적용 시점은 팀 구성·복구(`--spawn`, 그것을 부르는 `startup` 훅) 끝과 수동 `scripts/team-up.sh --layout`이며 `/clear` 훅은 배치를 건드리지 않는다. 팀 구성 때는 팀원이 팀장과 다른 탭에 있는 등 조건이 안 맞는 것이 확인되면 옮기지 않고 이유만 남기고(재사용한 빈 셸 pane도 팀장 탭에 있을 때만 보정 대상), Herdr 조회가 실패하면 옮기지 않고 실패로 끝내며, 배치 실패는 agent 기동을 막지 않고 종료 코드와 `--layout` 안내만 남긴다. 자세한 기준·조건은 [docs/dev-environment.md](docs/dev-environment.md) §2 "배치 공식 기준".
+4. 설정이 끝나면 Claude를 한 번 재시작한다. `.claude/settings.json`의 SessionStart(`startup|clear`) hook이 `scripts/team-up.sh --hook`을 실행한다. `startup`에서는 팀장(`gjc-herdr-lead`) pane 이름을 정하고 팀원 agy(`gjc-herdr-mate`, pane label `GJCH 팀원 · agy`) pane을 만든다(`agy`가 폴더 신뢰 창이나 다른 질문으로 시작 중 멈춰 `blocked` 안내가 나오면 사용자가 그 pane에서 확인·응답한 뒤 `scripts/team-up.sh --spawn`을 다시 실행한다). `codex`가 있고 끄지 않았으면 저장소 루트에서 실행되는 선택 검토 Codex(agent `gjc-herdr-critic`, pane label `GJCH 검토·조사 · Codex`)도 구성한다. `/clear` 뒤에는 팀장 이름·pane label과, 비었거나 폴더명 기본값인 작업공간 label만 복구하며, 팀원·검토 pane이 없어도 새로 만들지 않는다. `herdr agent list`로 구성 예정인 agent가 보이는지 확인한다. 배치 공식 기준은 팀장 위(높이 60%), 아래 왼쪽 팀원 agy | 오른쪽 검토 Codex(반반)이고, 검토가 없거나 꺼져 있거나 다른 탭이면 팀장 60% / 팀원 아래다(꺼 둔 검토가 같은 탭에 남아 있으면 팀 구성 보정은 옮기지 않고 건너뛴다). Sidebar 등 다른 pane은 건드리지 않는다(단, 임시 탭 경유 이동 때 그 임시 탭에 자동 생성된 agent 없는 Sidebar는 탭 닫기로 함께 정리한다). 적용 시점은 팀 구성·복구(`--spawn`, 그것을 부르는 `startup` 훅) 끝과 수동 `scripts/team-up.sh --layout`이며 `/clear` 훅은 배치를 건드리지 않는다. 팀 구성 때는 팀원이 팀장과 다른 탭에 있는 등 조건이 안 맞는 것이 확인되면 옮기지 않고 이유만 남기고(재사용한 빈 셸 pane도 팀장 탭에 있을 때만 보정 대상), Herdr 조회가 실패하면 옮기지 않고 실패로 끝내며, 배치 실패는 agent 기동을 막지 않고 종료 코드와 `--layout` 안내만 남긴다. 자세한 기준·조건은 [docs/dev-environment.md](docs/dev-environment.md) §2 "배치 공식 기준".
 
 **필요한 프로그램**
 
@@ -26,7 +26,8 @@ Herdr 안에서 Claude Code(팀장)가 GJC(구현 팀원)와 선택 Codex(독립
 |---|---|---|---|
 | [Herdr](https://herdr.dev) | agent pane 관리자. 팀 구성과 sidebar 표시의 바탕 (0.9.3에서 검증) | `brew install herdr` 또는 `curl -fsSL https://herdr.dev/install.sh \| sh` | `herdr --version` |
 | [Claude Code CLI](https://docs.claude.com/en/docs/claude-code) | 팀장 (2.1.295에서 사용) | `brew install --cask claude-code@latest` 또는 공식 문서의 설치 방법 | `claude --version` |
-| [GJC (Gajae Code)](https://github.com/Yeachan-Heo/gajae-code) | 팀원이자 이 플러그인의 대상 (0.18.8에서 사용, 설치 검증은 0.18.7) | 해당 저장소의 [설치 문서](https://github.com/Yeachan-Heo/gajae-code/blob/main/docs/install.md)에서 태그된 설치 스크립트를 내려받아 실행 | `gjc --version` |
+| Antigravity CLI (`agy`) | 구현 팀원 (`gjc-herdr-mate`, `--mode auto`) | Antigravity CLI 설치 안내 참조 | `agy --version` |
+| [GJC (Gajae Code)](https://github.com/Yeachan-Heo/gajae-code) | 이 플러그인의 설치·관측 대상 (0.18.8에서 사용, 설치 검증은 0.18.7) | 해당 저장소의 [설치 문서](https://github.com/Yeachan-Heo/gajae-code/blob/main/docs/install.md)에서 태그된 설치 스크립트를 내려받아 실행 | `gjc --version` |
 | [Codex CLI](https://github.com/openai/codex) (선택) | 독립 검토·조사 팀원. `GJCH_TEAM_CODEX=0`으로 끌 수 있음 | 공식 설치 안내 또는 `npm install -g @openai/codex` | `codex --version` |
 | [Bun](https://bun.sh) 1.4.3 | GJC가 Git 플러그인을 설치할 때 필요, build는 1.4.3 고정 | `curl -fsSL https://bun.sh/install \| bash` (특정 버전은 Bun 문서 참조) | `bun --version` |
 | git, python3 | clone, `team-up.sh`의 JSON 처리 | macOS는 보통 기본 포함 또는 `brew install git python` | `git --version`, `python3 --version` |
@@ -242,7 +243,7 @@ gjc
 
 ## 개발
 
-> Herdr + 팀장(Claude Code) + 팀원(GJC) 개발 환경과 새 컴퓨터에서의 AI 자동 구축 절차는 [docs/dev-environment.md](docs/dev-environment.md), 환경 점검은 `scripts/check-env.sh`.
+> Herdr + 팀장(Claude Code) + 팀원(agy) 개발 환경과 새 컴퓨터에서의 AI 자동 구축 절차는 [docs/dev-environment.md](docs/dev-environment.md), 환경 점검은 `scripts/check-env.sh`.
 
 ```sh
 git clone https://github.com/mrsono0/gjc-herdr.git
