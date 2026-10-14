@@ -124,6 +124,7 @@ GJC는 Herdr가 *감지*한 agent가 아니라 상태 *보고*만 있어, `herdr
 |---|---|
 | 팀원 pane이 안 생김 | hook이 가드에서 종료됨(Herdr 밖, cwd가 프로젝트 밖, `GJCH_TEAM_ROLE` 설정, `herdr`/`python3` 없음). `scripts/check-env.sh`와 `scripts/team-up.sh --spawn` 출력 확인 |
 | Codex pane이 안 생김 | `codex` 없음 또는 `GJCH_TEAM_CODEX=0`이면 선택 단계 생략. 기존 critic이 있으면 새 pane을 만들지 않음. `scripts/team-up.sh --spawn`의 stderr를 확인 |
+| 조회 실패(`could not look up agent ...`)로 팀원·검토를 만들지 않음 | `herdr agent get` 조회나 JSON 파싱이 실패하면 부재(`agent_not_found`)로 추정하지 않고 그 단계를 비0으로 끝낸다. `herdr agent list`로 Herdr 상태를 확인한 뒤 `scripts/team-up.sh --spawn`을 다시 실행한다 |
 | Codex가 "Trust and continue" 화면에서 멈춤 | 처음 저장소 폴더에서 실행하면 Codex가 폴더 신뢰를 묻는다(Herdr 상태는 idle로 보일 수 있음). 사용자 설정(`~/.codex/config.toml`)에 기록되므로 사용자 승인 후 선택한다. 그 전에는 `critic-send.sh`가 형식 판정 불가로 거부한다 |
 | `critic-send.sh`가 `/new` 직후 "대상 거부: … 상태=working" | `/new` 뒤 Codex의 일시적인 working을 준비 전에 본 옛 버전(#22 이전) 증상이다. 화면이 이미 새 빈 대화(`Context 100% left · 0 in · 0 out`)이고 idle/done이면 같은 명령을 다시 실행해도 `/new` 없이 보낸다(지시서는 아직 보내지 않은 상태). 현재 버전은 준비 한도 안에서 기다린다 |
 | `critic-send.sh`가 `/new` 뒤 "새 입력란 준비 확인 timeout" | `/new` 뒤 Codex가 30초 넘게 working이었다. 실측 1회는 Codex 경고 `MCP client for codex_apps failed to start: … timed out awaiting tools/list after 30s`와 함께였다(보통 1–4초). 지시서는 보내지 않았으므로, done/idle과 새 빈 대화를 확인한 뒤 다시 실행하면 `/new` 없이 보낸다 |

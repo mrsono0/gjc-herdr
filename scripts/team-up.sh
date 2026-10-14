@@ -71,10 +71,26 @@ print("" if d is None else d)' "$1"; }
 
 realpath() { python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$1"; }
 
-# 이름이 비었거나 이 pane 소유일 때만 rename (이미 다른 pane이 쓰면 건드리지 않음)
+# agent 이름 → pane ID. agent_not_found로 확인되면 빈 값(rc 0), 조회·파싱 실패면 rc 1.
+# herdr는 오류 JSON을 stderr로 내므로 함께 읽는다.
+# herdr 자체의 rc도 본다: rc 0이면 pane_id가 있어야 하고, 비0이면 agent_not_found일 때만 부재다.
+agent_pane() { # name
+	local out rc
+	out="$(herdr agent get "$1" 2>&1)"; rc=$?
+	printf '%s' "$out" | python3 -c 'import sys,json
+try: d=json.load(sys.stdin)
+except Exception: sys.exit(1)
+p=((d.get("result") or {}).get("agent") or {}).get("pane_id")
+if sys.argv[1]=="0":
+    if not p: sys.exit(1)
+    print(p)
+elif ((d.get("error") or {}).get("code"))!="agent_not_found": sys.exit(1)' "$rc"
+}
+
+# 이름이 비었거나 이 pane 소유일 때만 rename (이미 다른 pane이 쓰면 건드리지 않음, 조회 실패면 rc 1)
 claim_name() { # pane name
 	local owner
-	owner="$(herdr agent get "$2" 2>/dev/null | jget result.agent.pane_id)"
+	owner="$(agent_pane "$2")" || return 1
 	if [ -z "$owner" ] || [ "$owner" = "$1" ]; then
 		herdr agent rename "$1" "$2" >/dev/null 2>&1
 	else
@@ -272,22 +288,6 @@ sys.exit(0 if abs(float(r[0])-0.6)<=0.01 and (len(r)<2 or abs(float(r[1])-0.5)<=
 	return "$fail"
 }
 
-# agent 이름 → pane ID. agent_not_found로 확인되면 빈 값(rc 0), 조회·파싱 실패면 rc 1.
-# herdr는 오류 JSON을 stderr로 내므로 함께 읽는다.
-# herdr 자체의 rc도 본다: rc 0이면 pane_id가 있어야 하고, 비0이면 agent_not_found일 때만 부재다.
-agent_pane() { # name
-	local out rc
-	out="$(herdr agent get "$1" 2>&1)"; rc=$?
-	printf '%s' "$out" | python3 -c 'import sys,json
-try: d=json.load(sys.stdin)
-except Exception: sys.exit(1)
-p=((d.get("result") or {}).get("agent") or {}).get("pane_id")
-if sys.argv[1]=="0":
-    if not p: sys.exit(1)
-    print(p)
-elif ((d.get("error") or {}).get("code"))!="agent_not_found": sys.exit(1)' "$rc"
-}
-
 # pane의 "<tab_id> in|out"(cwd가 저장소 안/밖). 조회·파싱 실패나 tab·cwd 없음이면 rc 1.
 pane_place() { # pane
 	local out
@@ -385,7 +385,10 @@ mate_pane=""
 layout_status=0   # 배치 실패(기동 실패와 별도). 이동 단계의 비0은 마지막 배치 보정이 성공해도 그대로 둔다.
 spawn_mate() {
 local existing pane mate_command lead_tab critic critic_tab
-existing="$(herdr agent get "$MATE_NAME" 2>/dev/null | jget result.agent.pane_id)"
+existing="$(agent_pane "$MATE_NAME")" || {
+	echo "could not look up agent '$MATE_NAME'; mate not spawned" >&2
+	return 1
+}
 if [ -n "$existing" ]; then
 	mate_pane="$existing"
 	echo "mate already exists at $existing; nothing spawned"
@@ -478,7 +481,10 @@ spawn_critic() {
 		echo "codex not found; optional reviewer skipped (GJCH_TEAM_CODEX=0 disables it)" >&2
 		return 0
 	fi
-	existing="$(herdr agent get "$CRITIC_NAME" 2>/dev/null | jget result.agent.pane_id)"
+	existing="$(agent_pane "$CRITIC_NAME")" || {
+		echo "could not look up agent '$CRITIC_NAME'; critic not spawned" >&2
+		return 1
+	}
 	if [ -n "$existing" ]; then
 		echo "critic already exists at $existing; nothing spawned"
 		return 0
