@@ -3,6 +3,8 @@
 #   scripts/team-up.sh --hook    SessionStart hook용. 백그라운드에서 clear는 기본 동작, 그 외는 --spawn 수행
 #   scripts/team-up.sh           기본 동작을 지금 수행
 #   scripts/team-up.sh --spawn   기본 동작 + 없는 GJC 팀원·선택 Codex 검토 구성(남은 빈 셸 pane 재사용)
+#   scripts/team-up.sh --layout  기본 동작 + 기존 팀장·팀원·검토 pane을 목표 배치로 재배치(수동 전용, hook에서는 실행하지 않음)
+#   목표 배치: 팀장 위(높이 60%), 그 아래 왼쪽 팀원 GJC | 오른쪽 검토 Codex(반반). Sidebar 등 다른 pane은 건드리지 않는다.
 #   GJCH_MATE_PRESET은 팀원 프리셋(기본 opus5-codex56-pro)이며, 빈 값이면 프리셋 없이 실행한다.
 #   GJCH_TEAM_CODEX=0은 Codex 생성을 끈다. Codex는 사용자 지시로 --yolo(샌드박스 없음)를 사용한다.
 #   --no-daemon은 공유 daemon 환경의 훅이 세션 ID를 다른 pane으로 보고하는 것을 막는다.
@@ -85,6 +87,37 @@ retry() { # 감지·보고 지연을 기다리며 명령을 반복
 	done
 }
 
+# --- 배치 보조 ---
+# 같은 탭 안 pane move는 same_tab으로 무시되므로 임시 탭을 거친다. pane swap은 source pane에 focus를 주고
+# 그 탭을 활성화하므로 쓰지 않고, 모든 move는 --no-focus로 사용자 focus를 유지한다.
+
+# 스크립트가 만든 임시 탭은 남은 pane이 모두 agent 없는 pane(사용자 설정이 자동으로 만든 Sidebar 등)일 때만 닫는다.
+close_temp_tab() { # tab
+	local left
+	left="$(herdr pane list 2>/dev/null | python3 -c 'import sys,json
+try: panes=json.load(sys.stdin)["result"]["panes"]
+except Exception: print("unknown"); sys.exit(0)
+ps=[p for p in panes if p.get("tab_id")==sys.argv[1]]
+print("agent" if any(p.get("agent") for p in ps) else "ok" if ps else "gone")' "$1")"
+	case "$left" in
+		ok) herdr tab close "$1" >/dev/null 2>&1 || echo "could not close temporary tab $1" >&2 ;;
+		gone) ;;
+		*) echo "temporary tab $1 left open (it has an agent pane or could not be listed)" >&2 ;;
+	esac
+}
+
+# pane을 임시 탭으로 뺐다가 tab의 target 옆(split 방향, target 몫 ratio)에 되돌린다.
+move_via_temp_tab() { # pane tab target split ratio
+	local tmp
+	tmp="$(herdr pane move "$1" --new-tab --no-focus 2>/dev/null | jget result.move_result.created_tab.tab_id)"
+	[ -n "$tmp" ] || { echo "could not confirm moving $1 to a temporary tab; check herdr tab list" >&2; return 1; }
+	if [ "$(herdr pane move "$1" --tab "$2" --target-pane "$3" --split "$4" --ratio "$5" --no-focus 2>/dev/null | jget result.move_result.changed)" != True ]; then
+		echo "could not move $1 back from temporary tab $tmp; move it manually" >&2
+		return 1
+	fi
+	close_temp_tab "$tmp"
+}
+
 # --- 팀장(이 pane) ---
 # 이 pane의 실제 cwd가 프로젝트 안일 때, 그리고 이름을 이 pane이 확보했을 때만 label을 바꾼다.
 # (다른 프로젝트 pane에서 실행되거나 이름이 다른 pane 소유면 이름·pane label·작업공간 label 모두 건드리지 않는다)
@@ -107,12 +140,110 @@ else
 	echo "agent name '$LEAD_NAME' not claimed by $HERDR_PANE_ID; labels left unchanged" >&2
 fi
 
+# --- 재배치(--layout): 기존 팀장·팀원·검토 pane을 목표 배치로 ---
+# 출력: "ok <팀장/아래 비율> [<팀원/검토 비율>]"(목표 모양) | "move"(아님) | 빈 값(layout 읽기 실패)
+layout_state() { # mate [critic]
+	herdr pane layout --pane "$HERDR_PANE_ID" 2>/dev/null | python3 -c 'import sys,json
+lead,mate,critic=sys.argv[1:4]
+try: l=json.load(sys.stdin)["result"]["layout"]
+except Exception: sys.exit(0)
+r={p["pane_id"]:p["rect"] for p in l["panes"]}
+def rect(p):
+    q=r.get(p)
+    return q and (q["x"],q["y"],q["width"],q["height"])
+def ratio(d,box):
+    for s in l["splits"]:
+        q=s["rect"]
+        if s["direction"]==d and (q["x"],q["y"],q["width"],q["height"])==box: return s["ratio"]
+L,M,C=rect(lead),rect(mate),rect(critic) if critic else None
+ok=bool(L and M and (C or not critic)) and M[0]==L[0] and M[1]==L[1]+L[3]
+if ok and C: ok=C[0]==M[0]+M[2] and C[1]==M[1] and C[3]==M[3] and M[2]+C[2]==L[2]
+elif ok: ok=M[2]==L[2]
+down=ok and ratio("down",(L[0],L[1],L[2],L[3]+M[3]))
+right=ok and C and ratio("right",(M[0],M[1],M[2]+C[2],M[3]))
+print("move" if down is None or not ok or (C and right is None) else "ok %s %s" % (down, right if C else ""))' "$HERDR_PANE_ID" "$1" "${2:-}"
+}
+
+# split 비율을 target으로 맞춘다. 늘릴 때는 첫 pane을 경계 쪽으로, 줄일 때는 둘째 pane을 경계 쪽으로 resize한다(amount = 비율 차).
+set_ratio() { # current target first_pane grow_dir second_pane shrink_dir
+	local d
+	d="$(python3 -c 'import sys; d=float(sys.argv[2])-float(sys.argv[1]); print("" if abs(d)<0.005 else "%+.4f" % d)' "$1" "$2")" || return 1
+	case "$d" in
+		"") return 0 ;;
+		+*) herdr pane resize --pane "$3" --direction "$4" --amount "${d#+}" >/dev/null 2>&1 ;;
+		*) herdr pane resize --pane "$5" --direction "$6" --amount "${d#-}" >/dev/null 2>&1 ;;
+	esac
+}
+
+# 목표 모양이면 팀장/아래 0.6, 팀원/검토 0.5로 맞추고 다시 읽어 확인한다.
+# 반환: 0 맞춘 비율 확인, 1 resize 실패 또는 미도달(stderr에 읽은 비율), 2 목표 모양이 아님(layout 읽기 실패 포함)
+# 비교는 rect가 아니라 split ratio 값이라 행·열 반올림의 영향을 받지 않으므로 허용 오차는 0.01이다.
+fit_ratios() { # mate [critic]
+	local mate="$1" critic="${2:-}" fail=0
+	# shellcheck disable=SC2046
+	set -- $(layout_state "$mate" "$critic")
+	[ "${1:-}" = ok ] || return 2
+	set_ratio "$2" 0.6 "$HERDR_PANE_ID" down "$mate" up || fail=1
+	if [ -n "$critic" ]; then
+		set_ratio "$3" 0.5 "$mate" right "$critic" left || fail=1
+	fi
+	# shellcheck disable=SC2046
+	set -- $(layout_state "$mate" "$critic")
+	[ "${1:-}" = ok ] || { echo "layout changed while resizing; not in the target layout" >&2; return 1; }
+	python3 -c 'import sys
+r=sys.argv[1:]
+sys.exit(0 if abs(float(r[0])-0.6)<=0.01 and (len(r)<2 or abs(float(r[1])-0.5)<=0.01) else 1)' "$2" ${3:+"$3"} || fail=1
+	[ "$fail" = 0 ] || echo "resize failed or not reached: lead/below $2${3:+, mate/critic $3} (target 0.6${critic:+/0.5})" >&2
+	return "$fail"
+}
+
+apply_layout() {
+	local lead="$HERDR_PANE_ID" lead_tab mate critic p why state
+	if [ "$(herdr agent get "$LEAD_NAME" 2>/dev/null | jget result.agent.pane_id)" != "$lead" ]; then
+		echo "--layout: agent '$LEAD_NAME' is not this pane ($lead); nothing moved" >&2; return 1
+	fi
+	mate="$(herdr agent get "$MATE_NAME" 2>/dev/null | jget result.agent.pane_id)"
+	[ -n "$mate" ] || { echo "--layout: agent '$MATE_NAME' not found; nothing moved" >&2; return 1; }
+	# 검토는 있으면 함께 배치하고, 없으면 팀장 60% / 팀원 아래만 맞춘다.
+	critic="$(herdr agent get "$CRITIC_NAME" 2>/dev/null | jget result.agent.pane_id)"
+	lead_tab="$(herdr pane get "$lead" 2>/dev/null | jget result.pane.tab_id)"
+	[ -n "$lead_tab" ] || { echo "--layout: could not read the tab of $lead; nothing moved" >&2; return 1; }
+	for p in "$mate" ${critic:+"$critic"}; do
+		why="$(herdr pane get "$p" 2>/dev/null | python3 -c 'import sys,json,os
+root,tab=sys.argv[1:3]
+try: p=json.load(sys.stdin)["result"]["pane"]
+except Exception: print("could not be read"); sys.exit(0)
+cwd=p.get("foreground_cwd") or p.get("cwd")
+if p.get("tab_id")!=tab: print("is not in the lead tab "+tab)
+elif not cwd or not (os.path.realpath(cwd).rstrip("/")+"/").startswith(root.rstrip("/")+"/"): print("cwd is outside "+root)' "$ROOT" "$lead_tab")"
+		[ -z "$why" ] || { echo "--layout: pane $p $why; nothing moved" >&2; return 1; }
+	done
+	state="$(layout_state "$mate" "$critic")"
+	[ -n "$state" ] || { echo "--layout: could not read the layout of $lead_tab; nothing moved" >&2; return 1; }
+	if [ "$state" = move ]; then
+		move_via_temp_tab "$mate" "$lead_tab" "$lead" down 0.6 || return 1
+		if [ -n "$critic" ]; then
+			move_via_temp_tab "$critic" "$lead_tab" "$mate" right 0.5 || return 1
+		fi
+	fi
+	fit_ratios "$mate" "$critic"
+	case $? in
+		0) echo "layout: lead $lead on top (60%), mate $mate${critic:+ | critic $critic} below" ;;
+		2) echo "--layout: $lead_tab is not in the target layout; check herdr pane layout" >&2; return 1 ;;
+		*) echo "--layout: panes are in place but the split ratios are not 60%/50%; check herdr pane layout" >&2; return 1 ;;
+	esac
+}
+
+if [ "$mode" = "--layout" ]; then
+	apply_layout
+	exit $?
+fi
 [ "$mode" = "--spawn" ] || exit 0
 
 # --- 팀원 GJC pane (이미 있으면 생성하지 않음) ---
 mate_pane=""
 spawn_mate() {
-local existing pane mate_command
+local existing pane mate_command lead_tab critic critic_tab layout_status=0
 existing="$(herdr agent get "$MATE_NAME" 2>/dev/null | jget result.agent.pane_id)"
 if [ -n "$existing" ]; then
 	mate_pane="$existing"
@@ -136,9 +267,35 @@ for p in panes:
     cwd=p.get("foreground_cwd") or p.get("cwd")
     if p.get("workspace_id")==ws and p.get("label")==label and not p.get("agent") and cwd and (os.path.realpath(cwd).rstrip("/")+"/").startswith(root.rstrip("/")+"/"):
         print(p["pane_id"]); break' "$ROOT" "${HERDR_WORKSPACE_ID:-}" "$MATE_LABEL")"
+# 새로 만들 때만 위치를 정한다(재사용하는 pane은 옮기지 않음). 포커스가 아니라 팀장 pane(HERDR_PANE_ID) 기준이다.
 if [ -z "$pane" ]; then
-	pane="$(herdr pane split --current --direction down --cwd "$ROOT" --no-focus 2>/dev/null | jget result.pane.pane_id)"
-	[ -n "$pane" ] || { echo "pane split failed" >&2; return 1; }
+	lead_tab="$(herdr pane get "$HERDR_PANE_ID" 2>/dev/null | jget result.pane.tab_id)"
+	critic="$(herdr agent get "$CRITIC_NAME" 2>/dev/null | jget result.agent.pane_id)"
+	if [ -n "$critic" ] && [ -n "$lead_tab" ] && [ "$(herdr pane get "$critic" 2>/dev/null | jget result.pane.tab_id)" = "$lead_tab" ]; then
+		# 검토가 같은 탭에 있으면 검토를 반으로 나눠 만들고, 검토를 새 pane 오른쪽으로 옮긴다(팀원 왼쪽).
+		pane="$(herdr pane split --pane "$critic" --direction right --ratio 0.5 --cwd "$ROOT" --no-focus 2>/dev/null | jget result.pane.pane_id)"
+		[ -n "$pane" ] || { echo "pane split failed" >&2; return 1; }
+		# 배치 실패는 팀원 시작을 막지 않지만 최종 상태는 실패(비0)로 남긴다. hook에서 전체 재배치는 하지 않는다.
+		if move_via_temp_tab "$critic" "$lead_tab" "$pane" right 0.5; then
+			fit_ratios "$pane" "$critic"
+			case $? in
+				0) ;;
+				2) layout_status=1; echo "mate pane $pane was created but $lead_tab is not in the target layout; run scripts/team-up.sh --layout" >&2 ;;
+				*) layout_status=1; echo "mate pane $pane was created but the split ratios are not 60%/50%; run scripts/team-up.sh --layout" >&2 ;;
+			esac
+		else
+			layout_status=1
+			critic_tab="$(herdr pane get "$critic" 2>/dev/null | jget result.pane.tab_id)"
+			if [ "$critic_tab" = "$lead_tab" ]; then
+				echo "mate pane $pane is right of $CRITIC_NAME ($critic); run scripts/team-up.sh --layout to fix it" >&2
+			else
+				echo "$CRITIC_NAME ($critic) is not back in $lead_tab (now in ${critic_tab:-an unknown tab}); move it back manually first, --layout refuses panes outside the lead tab" >&2
+			fi
+		fi
+	else
+		pane="$(herdr pane split --pane "$HERDR_PANE_ID" --direction down --ratio 0.6 --cwd "$ROOT" --no-focus 2>/dev/null | jget result.pane.pane_id)"
+		[ -n "$pane" ] || { echo "pane split failed" >&2; return 1; }
+	fi
 fi
 mate_pane="$pane"
 herdr pane rename "$pane" "$MATE_LABEL" >/dev/null 2>&1
@@ -170,12 +327,12 @@ if retry mate_ready; then
 else
 	echo "GJC not ready for input; run /rename '$MATE_LABEL' in the GJC input box manually" >&2
 fi
-return 0
+return "$layout_status"
 }
 
 # --- 독립 검토 Codex (GJC 단계 성공 여부와 무관하게 수행) ---
 spawn_critic() {
-	local existing workdir pane anchor direction mate_workspace
+	local existing workdir pane anchor direction ratio lead_tab layout_status=0
 	if [ "${GJCH_TEAM_CODEX:-1}" = 0 ]; then
 		echo "Codex reviewer disabled (GJCH_TEAM_CODEX=0)"
 		return 0
@@ -199,17 +356,29 @@ for p in panes:
     if p.get("workspace_id")==ws and p.get("label")==label and not p.get("agent") and cwd and os.path.realpath(cwd)==workdir:
         print(p["pane_id"]); break' "$workdir" "${HERDR_WORKSPACE_ID:-}" "$CRITIC_LABEL")"
 	if [ -z "$pane" ]; then
+		# 팀원이 팀장과 같은 탭이면 팀원 오른쪽(반반), 아니면 팀장 아래(팀장 60%, 나중에 만드는 팀원이 검토 왼쪽에 들어감)
 		anchor="$HERDR_PANE_ID"
 		direction=down
-		if [ -n "$mate_pane" ] && [ -n "${HERDR_WORKSPACE_ID:-}" ]; then
-			mate_workspace="$(herdr pane get "$mate_pane" | jget result.pane.workspace_id)"
-			if [ "$mate_workspace" = "$HERDR_WORKSPACE_ID" ]; then
+		ratio=0.6
+		if [ -n "$mate_pane" ]; then
+			lead_tab="$(herdr pane get "$HERDR_PANE_ID" | jget result.pane.tab_id)"
+			if [ -n "$lead_tab" ] && [ "$(herdr pane get "$mate_pane" | jget result.pane.tab_id)" = "$lead_tab" ]; then
 				anchor="$mate_pane"
 				direction=right
+				ratio=0.5
 			fi
 		fi
-		pane="$(herdr pane split --pane "$anchor" --direction "$direction" --cwd "$workdir" --no-focus | jget result.pane.pane_id)"
+		pane="$(herdr pane split --pane "$anchor" --direction "$direction" --ratio "$ratio" --cwd "$workdir" --no-focus | jget result.pane.pane_id)"
 		[ -n "$pane" ] || { echo "Codex pane split failed" >&2; return 1; }
+		# 팀원 옆에 만들었으면 Codex 시작 전에 팀장 60%·반반을 맞춘다(실패해도 시작은 계속하고 최종 비0).
+		if [ "$direction" = right ]; then
+			fit_ratios "$mate_pane" "$pane"
+			case $? in
+				0) ;;
+				2) layout_status=1; echo "critic pane $pane was created but $lead_tab is not in the target layout; run scripts/team-up.sh --layout" >&2 ;;
+				*) layout_status=1; echo "critic pane $pane was created but the split ratios are not 60%/50%; run scripts/team-up.sh --layout" >&2 ;;
+			esac
+		fi
 	fi
 	herdr pane rename "$pane" "$CRITIC_LABEL" >/dev/null || return 1
 	if ! herdr agent start "$CRITIC_NAME" --kind codex --pane "$pane" --timeout 60000 -- --no-daemon --yolo -m "$CODEX_MODEL" -C "$workdir"; then
@@ -217,6 +386,7 @@ for p in panes:
 		return 1
 	fi
 	echo "spawned $CRITIC_NAME at $pane (cwd $ROOT)"
+	return "$layout_status"
 }
 
 mate_status=0

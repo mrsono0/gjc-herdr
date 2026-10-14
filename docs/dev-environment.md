@@ -31,12 +31,13 @@
 3. `startup`의 `team-up.sh --spawn`이 다음을 순서대로 수행한다. 각 단계는 조건이 맞을 때만 실행되고 아무것도 덮어쓰지 않는다.
    - 가드: Herdr 안(`HERDR_ENV=1`)·`herdr`/`python3` 존재·이 pane의 실제 cwd가 프로젝트 안·`GJCH_TEAM_ROLE` 미설정일 때만 진행한다. 아니면 조용히 종료한다.
    - 이 pane의 agent 이름을 `gjc-herdr-lead`로 확보(이미 다른 pane이 쓰면 건드리지 않음)하고 pane label과, 폴더명 기본값인 작업공간 label을 바꾼다. Claude 감지 지연 때문에 최대 약 60초 재시도한다.
-   - 팀원 pane이 없으면 `pane split --no-focus`로 만들고(재시작 후 남은 빈 셸 pane은 재사용) `gjc --mpreset <GJCH_MATE_PRESET>`을 실행해 `gjc-herdr-mate`로 이름을 붙인다. 구현(GJC, Opus 5.5)과 검토(Codex, GPT)를 다른 모델로 두어 검토 독립성을 높이고 한 제공자 과부하에 함께 멈추지 않게 한다.
+   - 팀원 pane이 없으면 `pane split --no-focus`로 만들고(재시작 후 남은 빈 셸 pane은 재사용, 재사용 pane은 옮기지 않음) `gjc --mpreset <GJCH_MATE_PRESET>`을 실행해 `gjc-herdr-mate`로 이름을 붙인다. 구현(GJC, Opus 5.5)과 검토(Codex, GPT)를 다른 모델로 두어 검토 독립성을 높이고 한 제공자 과부하에 함께 멈추지 않게 한다.
+   - 새 pane의 위치는 목표 배치(팀장 위 높이 60%, 아래 왼쪽 팀원 | 오른쪽 검토 반반)를 따른다. 포커스가 아니라 팀장 pane(`HERDR_PANE_ID`) 기준이다. 검토가 같은 탭에 있으면 검토를 반으로 나눌 새 pane을 만들고 검토를 임시 탭 경유 `pane move --no-focus`로 그 오른쪽에 되돌린다(`pane swap`은 focus를 옮기므로 쓰지 않는다). 이어서 팀장/아래 비율을 0.6, 팀원/검토를 0.5로 맞추고 다시 읽어 확인한다. 없으면 팀장 아래를 나눠 팀장을 60%로 둔다. 배치가 목표에 못 미치거나 검토를 되돌리지 못하면 팀원은 그대로 시작하되 종료 코드를 비0으로 두고 안내를 남긴다(검토가 임시 탭에 남았으면 그 pane·tab ID와 수동 복귀 필요를 알린다. 같은 탭에 돌아오기 전에는 `--layout`이 거부한다).
    - GJC가 idle이고 `gjc_herdr_session_id` token이 발행되면 `/rename GJCH 팀원 · GJC`를 입력해 세션 이름을 맞춘다. 준비가 안 되면 수동 안내만 출력한다.
-   - 선택 Codex 단계: `GJCH_TEAM_CODEX=0`·`codex` 없음·기존 critic 이름 점유 시 생략한다. 그 외에는 저장소 루트 cwd·검토 label인 같은 workspace 빈 셸 pane을 재사용하거나, 같은 workspace의 팀원 오른쪽(팀원이 없으면 현재 pane 아래)에 no-focus로 만들고 `herdr agent start ... -- --no-daemon --yolo -m <모델> -C <저장소 루트>`로 시작한다. 공유 daemon 환경에서 실행된 훅이 세션 ID를 다른 pane으로 보고할 수 있어 `--no-daemon`으로 해당 pane의 환경을 사용한다. GJC 단계 실패 시에도 Codex 단계는 별도로 시도하며, 실패한 단계가 있으면 종료 코드는 비0이다.
+   - 선택 Codex 단계: `GJCH_TEAM_CODEX=0`·`codex` 없음·기존 critic 이름 점유 시 생략한다. 그 외에는 저장소 루트 cwd·검토 label인 같은 workspace 빈 셸 pane을 재사용하거나, 팀장과 같은 탭의 팀원 오른쪽(반반, 팀원이 없거나 다른 탭이면 팀장 아래 팀장 60%)에 no-focus로 만들고(팀원 오른쪽에 만든 경우 Codex 시작 전에 팀장/아래 0.6·팀원/검토 0.5로 맞추고 다시 읽어 확인하며, 실패·모양 미달이면 시작은 계속하되 종료 코드를 비0으로 두고 `--layout` 안내를 남긴다) `herdr agent start ... -- --no-daemon --yolo -m <모델> -C <저장소 루트>`로 시작한다. 공유 daemon 환경에서 실행된 훅이 세션 ID를 다른 pane으로 보고할 수 있어 `--no-daemon`으로 해당 pane의 환경을 사용한다. GJC 단계 실패 시에도 Codex 단계는 별도로 시도하며, 실패한 단계가 있으면 종료 코드는 비0이다.
 4. 사용자의 focus·다른 pane·설정은 바꾸지 않는다.
 
-수동 실행: `scripts/team-up.sh`(이름·label만), `scripts/team-up.sh --spawn`(구현·선택 검토 팀원 포함). `GJCH_TEAM_CODEX=0 scripts/team-up.sh --spawn`이면 GJC만 구성한다. `herdr agent start`는 pane이 빈 셸 프롬프트 상태여야 하며, 성공은 예상 agent가 감지되고 입력 준비가 됐다는 뜻이다.
+수동 실행: `scripts/team-up.sh`(이름·label만), `scripts/team-up.sh --spawn`(구현·선택 검토 팀원 포함). `GJCH_TEAM_CODEX=0 scripts/team-up.sh --spawn`이면 GJC만 구성한다. `scripts/team-up.sh --layout`(팀장 pane에서 수동 실행 전용. hook·`--spawn`은 이 전체 재배치를 하지 않으며, 새 팀원을 만들 때 기존 검토 pane을 임시 탭 경유로 옮겨 좌우를 맞추는 것만 한다)은 기본 동작 뒤 기존 팀장·팀원·검토 pane을 목표 배치로 재배치한다. 팀장 이름이 이 pane이고, 팀원(그리고 있으면 검토)이 팀장과 같은 탭이며 cwd가 저장소 안일 때만 동작하고, 아니면 아무것도 옮기지 않고 stderr에 이유를 남긴다. 검토가 없으면 팀장 60% / 팀원 아래만 맞춘다. 이미 목표 모양(`pane layout`의 rect)이면 `pane resize`로 비율만 맞추고(끝에 split 비율을 다시 읽어 0.6/0.5에서 0.01 안인지 확인하며, resize 실패·미도달이면 성공 메시지 없이 비0), 아니면 같은 탭 안 `pane move`가 `same_tab`으로 무시되므로 팀원·검토를 차례로 임시 탭에 뺐다가 `--no-focus`로 되돌린다. 임시 탭은 남은 pane이 모두 agent 없는 pane(사용자 설정이 자동으로 만드는 Sidebar 등)일 때만 닫고, 아니면 tab ID를 안내한다. `herdr agent start`는 pane이 빈 셸 프롬프트 상태여야 하며, 성공은 예상 agent가 감지되고 입력 준비가 됐다는 뜻이다.
 
 ## 3. 새 컴퓨터에서 AI가 따를 환경 구축 절차
 
@@ -115,6 +116,7 @@ GJC는 Herdr가 *감지*한 agent가 아니라 상태 *보고*만 있어, `herdr
 | Codex가 "Trust and continue" 화면에서 멈춤 | 처음 저장소 폴더에서 실행하면 Codex가 폴더 신뢰를 묻는다(Herdr 상태는 idle로 보일 수 있음). 사용자 설정(`~/.codex/config.toml`)에 기록되므로 사용자 승인 후 선택한다. 그 전에는 `critic-send.sh`가 형식 판정 불가로 거부한다 |
 | `critic-send.sh`가 "대상 거부" | critic의 cwd가 저장소 루트가 아니면 거부한다(예: 이전 버전이 만든 `../gjc-herdr-codex-work`의 critic). 사용자 승인 후 그 Codex를 정상 종료하고 `scripts/team-up.sh --spawn`으로 다시 띄운다 |
 | `/clear` 뒤 팀장 이름(`gjc-herdr-lead`)이 사라짐 | 셸에서 실행한 Claude에 붙인 이름은 `/clear`로 세션 ID가 바뀌면 Herdr가 지운다. 이제 `clear` SessionStart hook이 팀장 이름·label만 다시 붙이며, 팀원·검토 pane은 새로 만들지 않는다. 복구되지 않으면 `scripts/team-up.sh`를 수동 실행해 이름·label을 되찾는다 |
+| 팀장·팀원·검토가 세로로 쌓이는 등 배치가 어긋남 | 팀장 pane에서 `scripts/team-up.sh --layout`을 실행한다. "nothing moved"면 이유(다른 탭·cwd·이름 없음)를 고친 뒤 다시 실행한다. "could not move ... back from temporary tab"이면 안내된 임시 탭의 pane을 수동으로 되돌린다 |
 | agent 이름이 이미 사용 중 | 다른 pane이 점유 중이라 label을 건드리지 않음(의도된 동작). 이름은 pane 종료·교체 시 사라짐 |
 | sidebar에 모델·세션이 안 보임 | 플러그인 설치됨 ≠ 로드됨 ≠ 표시됨. 실행 중이던 GJC를 재시작하고 `herdr pane get <pane-id>`의 token을 확인, 이후 README "Sidebar 설정" |
 | `agent_not_ready` | 대상이 감지되지 않았거나 working/blocked. GJC 대상은 위 SDK 경로를 쓴다 |

@@ -18,7 +18,7 @@ Herdr 안에서 Claude Code(팀장)가 GJC(구현 팀원)와 선택 Codex(독립
    claude
    ```
 3. Claude에게 **"안내대로 환경 설정해줘"** 라고 말한다. 루트 `CLAUDE.md`가 자동으로 읽혀, Claude가 `scripts/check-env.sh`(읽기 전용 점검)를 실행하고 부족한 항목만 [docs/dev-environment.md](docs/dev-environment.md) 절차대로 해결한다. `gjc-herdr` 플러그인 설치와 `~/.config/herdr/config.toml` 같은 사용자 설정 변경은 승인을 요청한다.
-4. 설정이 끝나면 Claude를 한 번 재시작한다. `.claude/settings.json`의 SessionStart(`startup|clear`) hook이 `scripts/team-up.sh --hook`을 실행한다. `startup`에서는 팀장(`gjc-herdr-lead`) pane 이름을 정하고 팀원 GJC(`gjc-herdr-mate`) pane을 만든다. `codex`가 있고 끄지 않았으면 저장소 루트에서 실행되는 선택 검토 Codex(agent `gjc-herdr-critic`, pane label `GJCH 검토·조사 · Codex`)도 구성한다. `/clear` 뒤에는 팀장 이름·pane label과, 비었거나 폴더명 기본값인 작업공간 label만 복구하며, 팀원·검토 pane이 없어도 새로 만들지 않는다. `herdr agent list`로 구성 예정인 agent가 보이는지 확인한다.
+4. 설정이 끝나면 Claude를 한 번 재시작한다. `.claude/settings.json`의 SessionStart(`startup|clear`) hook이 `scripts/team-up.sh --hook`을 실행한다. `startup`에서는 팀장(`gjc-herdr-lead`) pane 이름을 정하고 팀원 GJC(`gjc-herdr-mate`) pane을 만든다. `codex`가 있고 끄지 않았으면 저장소 루트에서 실행되는 선택 검토 Codex(agent `gjc-herdr-critic`, pane label `GJCH 검토·조사 · Codex`)도 구성한다. `/clear` 뒤에는 팀장 이름·pane label과, 비었거나 폴더명 기본값인 작업공간 label만 복구하며, 팀원·검토 pane이 없어도 새로 만들지 않는다. `herdr agent list`로 구성 예정인 agent가 보이는지 확인한다. 새 pane은 팀장 위(높이 60%), 아래 왼쪽 팀원 | 오른쪽 검토(반반)로 놓인다. 배치가 어긋났으면 팀장 pane에서 `scripts/team-up.sh --layout`을 수동 실행해 같은 탭의 세 pane을 다시 배치한다(hook은 전체 `--layout` 재배치를 하지 않는다. 다만 새 팀원을 만들 때 기존 검토 pane을 임시 탭 경유로 옮겨 좌우를 맞추고, 새 pane을 만든 경우 팀장/아래 비율을 맞춘다).
 
 **필요한 프로그램**
 
