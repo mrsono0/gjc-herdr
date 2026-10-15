@@ -32,8 +32,15 @@ fi
 # --- Herdr pane 여부 ---
 if [ "${HERDR_ENV:-}" = 1 ] && [ -n "${HERDR_PANE_ID:-}" ]; then
 	ok "Herdr pane 안: $HERDR_PANE_ID (workspace ${HERDR_WORKSPACE_ID:-?})"
+elif [ "${GJCH_EXTERNAL_LEAD:-}" = 1 ]; then
+	ok "외부 팀장 모드(herdr pane 밖, GJCH_EXTERNAL_LEAD=1)"
 else
 	warn "Herdr pane 밖 (team-up hook·표시 token은 동작하지 않음 — 정상일 수 있음)"
+fi
+if lead_status="$(/bin/bash "$ROOT/scripts/team-lead.sh" status 2>/dev/null)"; then
+	ok "팀장 잠금: $lead_status"
+else
+	warn "팀장 잠금 상태 확인 실패"
 fi
 
 # --- 저장소 파일 ---

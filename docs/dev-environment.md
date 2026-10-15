@@ -6,18 +6,23 @@
 
 | 역할 | 에이전트 | 이름·label | 하는 일 | 하지 않는 일 |
 |---|---|---|---|---|
-| 팀장 | Claude Code | agent `gjc-herdr-lead`, pane label `GJCH 팀장 · Claude` | 사용자와 대화, 작업 분해·배정, 결과 검증, 승인이 필요한 외부 작업(commit/push/설치) 요청 | 사용자 승인 대체 |
+| 팀장 | Claude Code | 팀장 잠금 보유자: agent `gjc-herdr-lead`, pane label `GJCH 팀장 · Claude`(herdr 안 pane) 또는 herdr 밖 외부 팀장 | 사용자와 대화, 작업 분해·배정, 결과 검증, 승인이 필요한 외부 작업(commit/push/설치) 요청 | 사용자 승인 대체 |
+| 부팀장(선택, 이관 시범 중) | Claude Code | agent `gjc-herdr-deputy`, pane label `GJCH 부팀장 · Claude` | 관찰, 조회, 팀장 지원(세션 간 메시지) | 팀원 배정과 입력, 팀 구성과 배치 |
 | 구현 팀원 | agy (Antigravity CLI) | agent `gjc-herdr-mate`, pane label `GJCH 팀원 · agy` | 배정된 파일 구현·집중 검증, 결과 파일과 근거 보고 | 같은 회차의 독립 검토 역할 겸임, 승인 없는 commit/push/설치, 범위 밖 탐색 |
 | 검토·조사 팀원(선택) | Codex | agent `gjc-herdr-critic`, pane label `GJCH 검토·조사 · Codex` | 독립 검토·조사·근거 확인, 지시서가 지정한 결과 파일 작성 | 팀장 허락 없는 파일 수정, 커밋·적용, 팀장 검증 대체, 사용자 승인 |
 | 런타임 관측(임시) | GJC | 필요 시 팀장이 임시 탭에 실행 | 플러그인 로드, token 표시, `/herdr-send`·`/herdr-call` 실동작 관측 후 종료 | 상시 팀원 점유 |
 
-작업공간 label은 `GJCH · gjc-herdr`이다. `scripts/team-up.sh`의 환경변수는 다음과 같다.
+작업공간 label은 `GJCH · gjc-herdr`이다. `scripts/team-up.sh`·`scripts/team-lead.sh`·`scripts/critic-send.sh`의 환경변수는 다음과 같다.
 
 | 환경변수 | 기본값·용도 |
 |---|---|
 | `GJCH_LEAD_NAME` | `gjc-herdr-lead` |
+| `GJCH_DEPUTY_NAME` | `gjc-herdr-deputy`; 다른 세션이 팀장 잠금을 보유 중일 때 herdr 안 Claude에 붙이는 부팀장 이름 |
 | `GJCH_MATE_NAME` | `gjc-herdr-mate` |
 | `GJCH_CRITIC_NAME` | `gjc-herdr-critic` |
+| `GJCH_WS_LABEL` | `GJCH · gjc-herdr`; 대상 작업공간 label |
+| `GJCH_EXTERNAL_LEAD` | 미설정; `1`이면 herdr 밖(데스크톱 Code 탭 등) 외부 팀장 모드 |
+| `GJCH_LEAD_LOCK` | `.local/team/lead.json`; 팀장 잠금 파일 경로 |
 | `GJCH_TEAM_CODEX` | `1`; `0`이면 Codex 자동 구성을 끈다 |
 | `GJCH_MATE_MODEL` | `gemini-4-argon-high`. 팀원을 `herdr agent start ... --kind agy ... -- --model <값> --mode accept-edits --sandbox`로 실행한다. 영문자·숫자·`._-`만 허용 |
 | `GJCH_CODEX_MODEL` | `gpt-6.1-sol` |
@@ -25,12 +30,23 @@
 
 **Codex는 사용자 지시로 `--yolo`를 사용하며 샌드박스가 없다.** Codex는 저장소 루트에서 실행되며, **제1원칙은 "파일 수정이 필요하면 먼저 팀장 허락을 받는다"**이다(루트 `AGENTS.md`와 매 지시서에 적는다). 검토·조사 결과 파일은 지시서가 지정한 gitignore 경로(예: `.local/critic/`)에만 쓰며, 이 지정이 팀장의 허락이다. commit·적용은 하지 않는다. Codex가 없으면 WARN과 함께 생략하며, 기존 `gjc-herdr-critic` pane은 다시 시작하거나 변경하지 않는다.
 
+**팀장 잠금 (`scripts/team-lead.sh`):**
+
+- **잠금 파일 위치:** `${GJCH_LEAD_LOCK:-.local/team/lead.json}`(동시 실행은 `<잠금 파일>.mutex`의 `fcntl.flock`으로 직렬화). `session_id`, `socket`, `socket_ino`, `socket_ctime_ns`, `kind`(`herdr`|`external`), `claimed_at`(및 `herdr`일 때 `pane_id`)을 기록한다.
+- **살아 있음과 "내 잠금" 판정:** macOS는 소켓의 대기열(backlog)이 차면 `connect`가 거부되므로 다른 세션 소켓에 접속하여 판정하지 않는다. 판정 순서: (1) 잠금에 기록된 `socket` 경로가 없거나(`FileNotFoundError`/`NotADirectoryError`) 유닉스 소켓이 아니면 만료(`stale`)로 보고, 권한 오류 등 그 밖의 `stat` 조회 `OSError`는 불확실하므로 살아 있는 것(`live`)으로 본다, (2) 현재 `st_ino`나 `st_ctime_ns`가 기록과 다르면 만료(`stale`), (3) `lsof -t <socket>`(타임아웃 5초)을 실행해 rc `0`이고 PID 출력이 하나 이상 있으면 살아 있음(`live`), rc `1`이고 stdout·stderr가 모두 빈 경우(같은 사용자의 정상 조회 전제, 아무 프로세스도 소켓을 열고 있지 않음)만 만료(`stale`)로 확정하며, 그 밖(stderr에 내용이 있음, 다른 rc, `lsof` 없음 `FileNotFoundError`, 실행 실패, timeout)은 불확실하므로 보수적으로 살아 있는 것(`live`)으로 본다(다른 세션의 잠금이면 `claim`·`release`가 rc `3`으로 거절되어 잠금이 유지됨). 내 잠금(`mine`)은 현재 세션의 `CLAUDE_CODE_SESSION_ID`가 `session_id`와 같거나, `CLAUDE_CODE_MESSAGING_SOCKET`의 경로·`st_ino`·`st_ctime_ns`가 잠금 기록과 일치할 때로 판정한다(내 정체 확인용 소켓 `stat`은 어떤 오류든 정체 미확인으로 처리한다).
+- **명령과 종료 코드(rc):**
+  - `scripts/team-lead.sh status`: `none` | `mine <kind> <session_id>` | `other <kind> <session_id> live` | `stale <kind> <session_id>`를 출력하고 rc `0`(잠금 파일 읽기·형식 오류는 rc `1`).
+  - `scripts/team-lead.sh claim`: 잠금이 없거나 만료(`stale`)되었거나 내 잠금(`mine`)이면 확보·갱신하고 `claimed <kind> <session_id>`를 출력한다(rc `0`). 다른 세션의 살아 있는 잠금이 있으면 stderr에 `held <kind> <sid8>…`를 출력하고 rc `3`으로 끝난다. 살아 있는 다른 잠금은 없으나 내 세션 정체(`CLAUDE_CODE_SESSION_ID` 또는 소켓 `stat`)를 확인할 수 없으면 잠금 파일을 쓰지 않고 rc `4`로 끝난다(오류는 rc `1`).
+  - `scripts/team-lead.sh release`: 내 잠금·만료 잠금·잠금 없음이면 잠금 파일을 삭제하고 rc `0`, 다른 세션의 살아 있는 잠금이면 rc `3`, 오류는 rc `1`.
+  - `scripts/team-lead.sh release --force`: 보유자와 무관하게 잠금 파일을 삭제하고 rc `0`. **`--force`는 사용자 승인으로만 쓴다.**
+- **원칙:** 팀원(agy, Codex)에게 배정하거나 입력하는 모든 작업(`herdr agent prompt`, `/new`, `herdr pane send-text`/`send-keys`, `scripts/critic-send.sh`, `scripts/team-up.sh --spawn`/`--layout`)은 **잠금을 가진 팀장 세션만** 수행한다(단, Herdr 안에서 살아 있는 다른 잠금이 없고 정체 환경변수만 없는 경우(rc `4`)는 잠금 파일 없이 기존처럼 팀장으로 동작하는 호환 예외다). 작업 시작 전 `scripts/team-lead.sh status`로 역할을 확인한다.
+
 ## 2. 자동 구성이 일어나는 방식
 
-1. 사용자가 **Herdr pane 안에서 이 프로젝트 폴더에 들어가 `claude`를 실행**한다.
-2. `.claude/settings.json`의 SessionStart(`startup|clear`) hook이 `scripts/team-up.sh --hook`을 호출한다. stdin을 EOF까지 읽는 전체 한도는 2초이며, 최상위 JSON이 객체이고 `source`가 정확히 `clear`일 때만 기본 모드를 백그라운드로 실행해 팀장 이름·pane label과, 비었거나 폴더명 기본값인 작업공간 label만 복구한다. 팀원·검토 pane이 없어도 만들지 않는다. 그 외에는 `--spawn`을 백그라운드로 실행한다. stdin이 터미널이면 읽지 않으며, 읽기 한도 초과·읽기 오류·JSON 파싱 실패·필드 없음일 때도 기존 `--spawn` 동작을 유지한다.
+1. 사용자가 **Herdr pane 안에서 이 프로젝트 폴더에 들어가 `claude`를 실행**한다(herdr 밖 외부 팀장은 아래 §2.1 참조).
+2. `.claude/settings.json`의 SessionStart(`startup|clear`) hook이 `scripts/team-up.sh --hook`을 호출한다. stdin을 EOF까지 읽는 전체 한도는 2초이며, 먼저 동기로 `scripts/team-lead.sh claim`을 실행해 역할 한 줄(`GJCH: ...`)을 stdout(세션 맥락)에 출력한다. 잠금을 확보했거나(rc `0`) 살아 있는 다른 잠금 없이 정체 환경변수만 없는 경우(rc `4`)에는 `GJCH: 이 세션이 팀장입니다(herdr pane <id>, 팀장 잠금 보유).`(rc `4`는 정체를 알 수 없다는 문구가 붙은 팀장 줄)를 출력하고, 최상위 JSON이 객체이고 `source`가 정확히 `clear`일 때만 기본 모드를 백그라운드로 실행해 팀장 이름·pane label과, 비었거나 폴더명 기본값인 작업공간 label만 복구한다(팀원·검토 pane이 없어도 만들지 않음). 그 외에는 `--spawn`을 백그라운드로 실행한다(stdin이 터미널이면 읽지 않으며, 읽기 한도 초과·읽기 오류·JSON 파싱 실패·필드 없음일 때도 기존 `--spawn` 동작을 유지). 잠금이 다른 세션에 있으면(rc `3`) `GJCH: 팀장 잠금이 다른 세션(<kind> <sid8>)에 있어 이 세션은 부팀장(gjc-herdr-deputy)입니다. 팀원에게 배정·입력하지 말고 팀장을 지원만 합니다.`를 출력하고, 백그라운드 실행은 이 pane에 부팀장 이름(`gjc-herdr-deputy`)과 label(`GJCH 부팀장 · Claude`)만 붙이며, 팀원 구성과 배치는 하지 않는다.
 3. `startup`의 `team-up.sh --spawn`이 다음을 순서대로 수행한다. 각 단계는 조건이 맞을 때만 실행되고 아무것도 덮어쓰지 않는다.
-   - 가드: Herdr 안(`HERDR_ENV=1`)·`herdr`/`python3` 존재·이 pane의 실제 cwd가 프로젝트 안·`GJCH_TEAM_ROLE` 미설정일 때만 진행한다. 아니면 조용히 종료한다.
+   - 가드: Herdr 안(`HERDR_ENV=1`)·`herdr`/`python3` 존재·이 pane의 실제 cwd가 프로젝트 안·`GJCH_TEAM_ROLE` 미설정일 때만 진행한다(Herdr 밖에서 `GJCH_EXTERNAL_LEAD=1`이면 §2.1 경로로 진행한다). 아니면 조용히 종료한다. 직접 실행한 `--spawn`·`--layout`에서 잠금이 다른 세션에 있으면(rc `3`) 부팀장 이름·label만 붙이고 팀원 구성·배치는 하지 않으며 rc `3`으로 종료한다(기본 모드 `scripts/team-up.sh`는 rc `3`일 때 부팀장 이름·label만 붙이고 `0`으로 끝난다).
    - 이 pane의 agent 이름을 `gjc-herdr-lead`로 확보(이미 다른 pane이 쓰면 건드리지 않음)하고 pane label과, 폴더명 기본값인 작업공간 label을 바꾼다. Claude 감지 지연 때문에 최대 약 60초 재시도한다.
    - 팀원 pane이 없으면 `pane split --no-focus`로 만들고(재시작 후 남은 새 label(`GJCH 팀원 · agy`)의 빈 셸 pane은 재사용하며, 기동 단계에서는 그 위치를 유지한다. 팀장과 같은 탭의 재사용 pane은 마지막 배치 보정 대상이고, 다른 탭의 재사용 pane은 보정에서 건너뛴다. 옛 `GJCH 팀원 · GJC` label의 빈 셸은 임시 관측 pane 등과 섞이지 않도록 자동 재사용하지 않는다) `herdr agent start gjc-herdr-mate --kind agy --pane <pane> --timeout 60000 -- --model <GJCH_MATE_MODEL> --mode accept-edits --sandbox`로 실행한다. `agy`가 없으면 안내하고 비0으로 끝낸다. 구현(agy, Gemini 4 Argon)과 검토(Codex, GPT)를 다른 모델로 두어 검토 독립성을 높이고 한 제공자 과부하에 함께 멈추지 않게 한다.
    - 새 pane의 위치는 아래 **배치 공식 기준**을 따른다. 포커스가 아니라 팀장 pane(`HERDR_PANE_ID`) 기준이다. 검토가 같은 탭에 있으면 검토를 반으로 나눌 새 pane을 만들고 검토를 임시 탭 경유 `pane move --no-focus`로 그 오른쪽에 되돌린 뒤 팀원 시작 전에 비율을 맞춘다. 없으면 팀장 아래를 나눠 팀장을 60%로 둔다. 검토를 같은 탭에 되돌리지 못하면 팀원은 그대로 시작하되 종료 코드를 비0으로 두고 그 pane·tab ID와 수동 복귀 필요를 알린다(다른 탭의 pane은 마지막 배치 보정·`--layout` 모두 옮기지 않는다).
@@ -41,7 +57,7 @@
 
 **배치 공식 기준**(CF 팀과 같은 기준. 다른 문서는 이 절을 따른다):
 
-- 모양: 팀장 위(높이 60%), 그 아래 왼쪽 agy 팀원 | 오른쪽 Codex 검토(반반). 검토가 없거나 팀장과 다른 탭에 있으면 팀장 60% / 팀원 아래만 맞춘다. 선택 Codex가 꺼져 있으면(`GJCH_TEAM_CODEX=0`, `codex` 없음) 팀 구성 보정은 기존 검토 agent도 빼고 같은 2-pane으로만 맞추되, 그 검토가 팀장과 같은 탭에 남아 있으면 팀원을 흔들지 않도록 아무것도 옮기지 않고 건너뛴다. 수동 `--layout`은 존재하는 검토를 항상 포함한다.
+- 모양: 팀장 위(높이 60%), 그 아래 왼쪽 agy 팀원 | 오른쪽 Codex 검토(반반). 검토가 없거나 팀장과 다른 탭에 있으면 팀장 60% / 팀원 아래만 맞춘다. 선택 Codex가 꺼져 있으면(`GJCH_TEAM_CODEX=0`, `codex` 없음) 팀 구성 보정은 기존 검토 agent도 빼고 같은 2-pane으로만 맞추되, 그 검토가 팀장과 같은 탭에 남아 있으면 팀원을 흔들지 않도록 아무것도 옮기지 않고 건너뛴다. 수동 `--layout`은 존재하는 검토를 항상 포함한다(외부 팀장 모드는 아래 §2.1 참조).
 - Sidebar 등 다른 pane은 건드리지 않는다. 단, 임시 탭 경유 이동 때 그 임시 탭에 자동 생성된 agent 없는 Sidebar는 탭 닫기로 함께 정리한다.
 - 적용 시점: 팀 구성·복구(`--spawn`, 그것을 부르는 시작 훅) 끝 + 수동 `--layout`. `/clear` 훅 경로는 이름·label 복구만 하며 배치를 건드리지 않는다.
 - 방법: 모양(`pane layout`의 rect)이 맞으면 `pane resize`로 비율만 맞추고, 다르면 팀원·검토를 차례로 임시 탭에 뺐다가 `pane move --no-focus`로 되돌린다(같은 탭 안 `pane move`는 `same_tab`으로 무시되고, `pane swap`은 focus를 옮기므로 쓰지 않는다). 임시 탭에서 즉시 되돌리면 원래 탭에 agent 없는 pane이 하나 더 생기는 경쟁이 관측됐다(새 탭에 Sidebar를 비동기로 만드는 사용자 플러그인이 원인으로 추정). 그래서 임시 탭의 pane 수가 늘어 안정될 때까지 기다렸다가 되돌린다. 상한은 목록 조회를 포함해 이동마다 2.5초다(실측 생성 지연 최대 약 1초의 약 2배, Python 시작 등 프로세스 비용 제외). Sidebar가 없는 환경은 이동마다 이 상한만큼 기다린다(팀원·검토를 모두 옮기면 약 5초). 대기 중 목록 조회가 실패해도 pane은 되돌리지만 배치 실패(비0)로 끝난다. 되돌린 뒤 원래 탭에 새로 관측된 agent 없는 pane이 있으면 출처(플러그인·사용자)를 가리지 않고 닫지 않으며, 그 ID를 안내하고 배치 실패(비0)로 끝난다. 그 목록을 읽지 못해도 실패다. 플러그인이 상한보다 늦으면 그 pane이 원래 탭에 남을 수 있고, 이 검사보다 늦게 생기는 pane은 감지하지 못한다. 이미 목표 배치면 아무것도 바꾸지 않는다. 끝에 split 비율을 다시 읽어 0.6/0.5에서 0.01 안인지 확인한다. 사용자 focus는 바뀌지 않는다.
@@ -50,6 +66,42 @@
 - 실패: 배치 실패는 agent 기동을 막지 않는다. 기동이 끝난 뒤 종료 코드만 비0으로 두고(기동 실패 코드가 우선) `--layout` 재실행 안내를 남긴다. 새 팀원을 만들 때 검토를 옮기는 배치 단계에서 실패가 있었으면 마지막 보정이 모양을 고쳐도 비0이다(실패를 숨기지 않는 쪽을 택함). 이동 실패의 사유(이동 불가·새 pane 관측·검사 불능)는 stderr 안내로만 구분한다. Codex 단계가 실패하면 agent 없는 검토 pane을 밀어내지 않도록 보정을 건너뛴다. 임시 탭에 agent pane이 남으면 닫지 않고 tab ID를 안내한다. 이 안내와 비0 종료 코드는 `--spawn`·`--layout`을 직접 실행할 때만 보인다. SessionStart hook은 `--spawn`을 백그라운드로 띄우고 출력을 버리므로, hook 경로의 배치 실패는 `herdr pane layout`으로 확인하거나 `--layout`을 직접 실행해 본다.
 
 수동 실행: `scripts/team-up.sh`(이름·label만), `scripts/team-up.sh --spawn`(구현·선택 검토 팀원 포함, 끝에 배치 보정). `GJCH_TEAM_CODEX=0 scripts/team-up.sh --spawn`이면 agy 팀원만 구성한다. `scripts/team-up.sh --layout`(팀장 pane에서 실행)은 기본 동작 뒤 팀장·팀원·검토 pane을 위 배치 공식 기준으로 재배치한다. `--spawn` 끝의 배치 보정과 같은 로직이며, 조건이 안 맞으면 건너뛰지 않고 아무것도 옮기지 않은 채 오류(비0)로 끝난다. resize 실패·비율 미도달이면 성공 메시지 없이 비0이다. `herdr agent start`는 pane이 빈 셸 프롬프트 상태여야 하며, 성공은 예상 agent가 감지되고 입력 준비가 됐다는 뜻이다.
+
+### 2.1 외부 팀장(herdr 밖, 데스크톱 Code 탭)
+
+Claude 데스크톱 앱의 Code 탭(로컬 세션)이나 Herdr 밖 터미널의 `claude`를 팀장으로 쓰고, Herdr 작업공간에는 구현 팀원(agy)과 검토 팀원(Codex)만 두는 운영 방식이다.
+
+1. **준비:** 데스크톱 앱 Code 탭에서 이 저장소 폴더로 새 세션을 연다. **worktree 옵션은 선택하지 않는다.** worktree 옵션은 새 세션 입력 화면의 브랜치 이름 옆에 있으며 시작할 때만 정할 수 있다. 선택하면 `<프로젝트>/.claude/worktrees/` 아래 별도 사본에서 실행되므로 쓰지 않는다. 시작 후 `pwd; git rev-parse --show-toplevel`이 저장소 루트인지 확인한다. 데스크톱 Code 탭 로컬 세션에서는 Bash에서 `herdr`가 동작하고 `CLAUDE_CODE_SESSION_ID`와 `CLAUDE_CODE_MESSAGING_SOCKET`이 설정되어 있다.
+2. **환경변수:** macOS 데스크톱 앱은 셸 프로필에서 `PATH`만 가져온다. 다른 환경변수는 데스크톱 앱 Settings의 로컬 환경 편집기에 `GJCH_EXTERNAL_LEAD=1`을 넣어야 로컬 세션과 Bash에 전달된다(사용자 설정이므로 사용자가 직접 넣거나 승인 후 진행한다). 데스크톱 앱 밖 일반 터미널에서 Herdr 밖 `claude`로 쓸 때는 `GJCH_EXTERNAL_LEAD=1 claude`로 실행한다.
+3. **자동 구성:** SessionStart hook(`scripts/team-up.sh --hook`)이 `scripts/team-lead.sh claim`으로 잠금을 확보하면 stdout에 `GJCH: 이 세션이 외부 팀장입니다(herdr 밖, 팀장 잠금 보유). 팀원 작업공간 'GJCH · gjc-herdr'을 확인·구성합니다.`를 출력하고, `clear`가 아니면 `--spawn`을 백그라운드로 실행한다. 잠금을 얻지 못하면(다른 세션이 보유 중이거나 정체 환경변수 누락) `GJCH: 팀장 잠금이 다른 세션(<kind> <sid8>)에 있어 이 세션은 팀장이 아닙니다. 팀원에게 배정·입력하지 마세요.`(정체 환경변수가 없으면 `GJCH: 세션 정체(CLAUDE_CODE_SESSION_ID·소켓)를 알 수 없어 이 세션은 외부 팀장이 아닙니다.`)를 출력하고 아무것도 하지 않는다.
+4. **수동 명령:**
+   - 팀원 기동·배치: `GJCH_EXTERNAL_LEAD=1 scripts/team-up.sh --spawn` 또는 `GJCH_EXTERNAL_LEAD=1 scripts/team-up.sh --layout`
+   - 검토 전송: `GJCH_EXTERNAL_LEAD=1 scripts/critic-send.sh [--timeout <ms>] [--no-wait | --result <파일>] <지시서 파일>`(`critic-send.sh`는 외부 모드일 때 잠금이 `mine`인지 먼저 확인하고, label 조회 대신 검토 agent(`gjc-herdr-critic`)의 작업공간을 쓰며 팀원(`gjc-herdr-mate`)이 다른 작업공간에 있으면 전송하지 않고 rc `1`로 끝난다)
+   - agy 배정: Herdr 안과 같이 `herdr agent prompt gjc-herdr-mate "<짧은 지시>"`를 쓴다. 세션 환경에 `GJCH_EXTERNAL_LEAD=1`이 이미 들어 있으면 앞의 환경변수 접두는 필요 없다.
+5. **작업공간과 배치:**
+   - 대상은 label `GJCH · gjc-herdr`(`GJCH_WS_LABEL`)인 작업공간이다. 기존 팀원(`gjc-herdr-mate` 또는 `gjc-herdr-critic`)이 있으면 그 작업공간을 쓴다.
+   - 작업공간을 정할 때 기존 `gjc-herdr-mate`(종류 `agy`, 저장소 안 cwd)와 `gjc-herdr-critic`(종류 `codex`, 정확히 저장소 루트 cwd)의 정체와 같은 작업공간 여부를 먼저 한 번에 확인하며, 하나라도 어긋나거나 조회에 실패하면 어떤 pane도 만들거나 나누거나 옮기지 않고 즉시 중단(rc `1`)한다.
+   - 기존 팀원이 없으면(`--spawn` 시) label로 작업공간을 찾거나 `--no-focus`로 새 작업공간을 만들고 label을 붙인다. 같은 label의 작업공간이 둘 이상이면 오류(`multiple workspaces found with label`)로 중단한다.
+   - 배치는 한 탭 안 **왼쪽 `팀원(agy)` | 오른쪽 `검토(Codex)`(반반, 50:50)** 이다. `--layout`(및 `--spawn` 끝의 배치 보정)은 기존 pane을 임시 탭으로 옮기지 않으며, 두 pane이 같은 탭에 `팀원 | 검토` 좌우로 있을 때만 비율을 맞춘다(팀원만 있거나 Codex가 꺼져 있으면 아무것도 하지 않고 rc `0`). 단, 팀원 pane이 사라진 뒤 외부 `--spawn`이 새 팀원을 다시 만들 때는 예외로 기존 검토 pane을 반으로 나눠 새 팀원을 시작하고 검토를 임시 탭 경유로 오른쪽에 되돌려 `팀원 | 검토` 순서를 복구한다.
+   - 새 작업공간과 탭에는 사용자 플러그인에 의해 Sidebar가 자동으로 생길 수 있다.
+6. **권한과 샌드박스:** 데스크톱 세션에서 `herdr` 명령마다 권한 요청이 뜨면 사용자 승인 후 허용 규칙을 추가할 수 있다. Bash 샌드박스를 쓰면 herdr 소켓(`~/.config/herdr/herdr.sock`)을 `sandbox.network.allowUnixSockets`로 허용해야 한다. 둘 다 사용자 설정이므로 사용자 승인으로만 바꾼다.
+7. **한계와 세션 간 메시지:**
+   - 외부 팀장은 팀원 화면을 텍스트(`herdr agent read`, `herdr pane read`)로만 읽는다.
+   - `agy` 폴더 신뢰 창 같은 `blocked`에는 사용자가 Herdr에서 직접 답한다(명령·편집 확인창 위임은 §5와 동일).
+   - 팀원 감시(백그라운드 루프)는 Herdr 안과 같은 명령을 쓴다.
+   - 데스크톱 세션과 Herdr 안 Claude는 `SendMessage`/`ListAgents`(`/` 명령 `/list-agents`)로 서로 목록에 보이고 메시지를 주고받을 수 있다. 다른 세션의 메시지는 사용자 승인을 대신하지 않는다.
+
+### 2.2 팀장 이관(herdr 팀장 → 외부 팀장 → 부팀장 종료)
+
+1. 현 팀장(herdr 안)이 진행 중인 배정이 없는 것(팀원 `idle`/`done`)을 확인한다.
+2. 현 팀장이 `scripts/team-lead.sh release`를 실행한다.
+3. 새 팀장(외부 데스크톱 Code 탭 등)이 `scripts/team-lead.sh claim`을 실행한다(외부면 `GJCH_EXTERNAL_LEAD=1` 등 환경변수가 있어야 함). 또는 세션을 새로 시작해 SessionStart hook으로 확보한다. `scripts/team-lead.sh status`가 `mine`인지 확인한다.
+4. 옛 팀장(herdr 안)이 `scripts/team-up.sh`(기본 모드)를 실행한다. 잠금이 다른 세션에 있으므로 부팀장 이름(`gjc-herdr-deputy`)과 label(`GJCH 부팀장 · Claude`)로 바뀐다. 이후 부팀장은 팀원에게 입력하지 않는다.
+5. 시범 운영 중 부팀장과 팀장은 세션 간 메시지(`SendMessage`/`ListAgents`)로 소통한다.
+6. 부팀장이 빠질 때는 Claude를 `/exit`로 정상 종료한다. 그 pane을 닫는 것은 사용자 승인으로 한다. 이후 외부 팀장이 `GJCH_EXTERNAL_LEAD=1 scripts/team-up.sh --layout`으로 `팀원 | 검토` 비율을 맞춘다(남은 모양이 좌우 `팀원 | 검토`와 맞지 않으면 옮기지 않고 건너뛴다).
+
+- **되돌리기:** 외부 팀장이 `scripts/team-lead.sh release`를 실행하고, Herdr 안 Claude가 `scripts/team-up.sh`를 실행하면 잠금을 확보하고 팀장 이름(`gjc-herdr-lead`)과 label을 되찾는다.
+- **만료 잠금:** 팀장 세션의 소켓이 사라지면 다음 `claim`이 자동으로 회수한다. 판정이 의심스러울 때만 사용자 승인 후 `scripts/team-lead.sh release --force`를 쓴다.
 
 ## 3. 새 컴퓨터에서 AI가 따를 환경 구축 절차
 
@@ -66,7 +118,7 @@
    |---|---|
    | `agy` 없음 | 상시 구현 팀원(`gjc-herdr-mate`)이다. Antigravity CLI(`agy`) 설치 방법을 사용자에게 안내해 설치를 요청한다 |
    | `gjc` 없음 | GJC 본체는 이 저장소가 설치하지 않는다. 플러그인 설치·관측 대상이므로 README "필요한 프로그램" 표의 링크를 사용자에게 안내해 설치를 요청한다 |
-   | `herdr` 없음 / Herdr pane 밖 | README "필요한 프로그램" 표대로 Herdr를 설치하고 **Herdr 안의 pane에서** Claude Code를 실행하도록 안내한다(팀 구성·token 표시는 Herdr 안에서만 동작) |
+   | `herdr` 없음 / Herdr pane 밖 | README "필요한 프로그램" 표대로 Herdr를 설치하고 **Herdr 안의 pane에서** Claude Code를 실행하도록 안내한다(팀 구성·token 표시는 Herdr가 실행 중이어야 동작). 단, `GJCH_EXTERNAL_LEAD=1`인 외부 팀장 모드(§2.1)에서는 Herdr pane 밖이 정상이며 `check-env.sh`가 `OK`로 보고한다 |
    | `codex` 없음 | 선택 검토 팀원이다. README의 Codex 설치 안내를 따르거나 `GJCH_TEAM_CODEX=0`으로 끈다 |
    | `bun` 없음 또는 버전 불일치 | GJC plugin 설치에 필요. build는 `package.json`의 `engines.bun`(1.4.3) 고정 |
    | `node_modules` 없음 | `npm ci --ignore-scripts --no-audit --no-fund` (개발·테스트 시) |
@@ -149,5 +201,9 @@ GJC는 상시 팀원이 아니며, 플러그인 로드·token 표시·`/herdr-se
 | sidebar에 모델·세션이 안 보임 | 플러그인 설치됨 ≠ 로드됨 ≠ 표시됨. 실행 중이던 GJC를 재시작하고 `herdr pane get <pane-id>`의 token을 확인, 이후 README "Sidebar 설정" |
 | `agent_not_ready` | 대상이 감지되지 않았거나 working/blocked. `team-up.sh --spawn`의 `agy` 기동에서는 `error.code == "agent_not_ready"`이고 해당 pane의 `agent_status`가 `blocked`일 때만 폴더 신뢰 창·질문 확인 안내를 내며, `working`·조회 실패 등은 일반 실패로 끝난다. 임시 GJC 관측 세션 대상은 위 §4 "GJC 관측 절차"의 SDK 경로를 쓴다 |
 | 임시 GJC 관측 세션에 대한 `gjc sdk session send`의 `endpoint_stale` | 재전송하지 않고 `operationRef`·상태를 보존한다. `GJC_SDK_BROKER_AUTOSTART=0 gjc sdk session list --attach-only --scope all`에서 해당 GJC token의 세션 ID 등록을 확인한다(endpoint 파일·포트 존재 ≠ 등록, 조회 실패 ≠ 누락). 성공한 목록에 없으면 정상 종료(`/exit`) 후 다시 띄우고 새 ID 등록·무해한 SDK 왕복 1회로 회복을 확인한다 |
+| `GJCH: 팀장 잠금이 다른 세션(...)에 있어...` | 다른 살아 있는 세션이 팀장 잠금(`.local/team/lead.json`)을 보유 중이다. 이 세션은 부팀장(`gjc-herdr-deputy`)이거나 팀장이 아닌 세션이므로 팀원에게 직접 지시·입력하거나 `--spawn`·`--layout`·`critic-send.sh`를 실행하지 않는다. 팀장을 맡아야 한다면 `scripts/team-lead.sh status`로 보유 세션을 확인하고 §2.2 이관 절차를 따른다 |
+| `팀장 잠금이 다른 세션에 있습니다. 팀장만 검토를 보낼 수 있습니다.` | 잠금을 가지지 않은 세션에서 `scripts/critic-send.sh`를 실행했다(전송하지 않고 rc `1`로 종료). `scripts/team-lead.sh status`가 `mine`인 팀장 세션에서 실행한다 |
+| `multiple workspaces found with label` | 외부 팀장 모드에서 대상 label(`GJCH · gjc-herdr`)을 가진 Herdr 작업공간이 둘 이상이고 기존 팀원 agent로도 작업공간을 하나로 특정할 수 없다. 중복 작업공간 label을 정리하거나 하나만 남긴 뒤 다시 실행한다 |
+| `잠금 파일 읽기 실패` / `잠금 파일 형식 오류` / `잠금 파일 필수 필드 오류` (rc `1`) | 팀장 잠금 파일(`.local/team/lead.json`)이 손상되었거나 필수 필드가 잘못되어 `team-up.sh`와 `critic-send.sh`가 모두 막힌다(fail-closed). 일반 `release`와 세션 재시작으로는 풀리지 않는다. 실제 팀장 세션을 확인한 뒤 **사용자 승인**을 받아 `scripts/team-lead.sh release --force`로 파일을 삭제하고, 팀장 세션에서 `scripts/team-lead.sh claim`과 `scripts/team-lead.sh status`(`mine ...`)를 확인한다 |
 
 더 자세한 사용법은 [README](../README.md)를 참조한다.

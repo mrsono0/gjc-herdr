@@ -39,9 +39,22 @@ case "$timeout" in ''|*[!0-9]*) fail '--timeout은 양의 정수(ms)여야 합�
 [ "$timeout" -gt 0 ] && [ "$timeout" -le 86400000 ] || fail '--timeout은 1–86400000ms(24시간) 범위여야 합니다.'
 # bash 3.2의 SECONDS 해상도에 맞춰 ms 인자를 초 단위로 올림한다.
 timeout=$(( (10#$timeout + 999) / 1000 * 1000 ))
-[ "${HERDR_ENV:-}" = 1 ] && [ -n "${HERDR_WORKSPACE_ID:-}" ] && [ -n "${HERDR_PANE_ID:-}" ] || fail 'Herdr workspace 안에서 실행합니다.'
+if [ "${HERDR_ENV:-}" = 1 ] && [ -n "${HERDR_WORKSPACE_ID:-}" ] && [ -n "${HERDR_PANE_ID:-}" ]; then
+	lead_mode=inside
+elif [ "${GJCH_EXTERNAL_LEAD:-}" = 1 ]; then
+	lead_mode=external
+else
+	fail 'Herdr workspace 안에서 실행하거나, 외부 팀장은 GJCH_EXTERNAL_LEAD=1로 실행합니다.'
+fi
 command -v herdr >/dev/null || fail 'herdr가 필요합니다.'
-
+lead_rc=0
+/bin/bash "$ROOT/scripts/team-lead.sh" claim >/dev/null || lead_rc=$?
+case "$lead_rc" in
+	0) ;;
+	4) [ "$lead_mode" = inside ] || fail '외부 팀장 정체를 확인할 수 없어 검토를 보낼 수 없습니다. 지시서는 보내지 않았습니다.' ;;
+	3) fail '팀장 잠금이 다른 세션에 있습니다. 팀장만 검토를 보낼 수 있습니다. 지시서는 보내지 않았습니다.' ;;
+	*) fail '팀장 잠금 확인에 실패했습니다. 지시서는 보내지 않았습니다.' ;;
+esac
 jget() {
 	python3 -c 'import json,sys
 try: value=json.load(sys.stdin)
@@ -50,6 +63,34 @@ for key in sys.argv[1].split("."):
     value=value.get(key) if isinstance(value,dict) else None
 print("" if value is None else value)' "$1"
 }
+
+if [ "$lead_mode" = inside ]; then
+	team_ws="$HERDR_WORKSPACE_ID"
+	caller="$HERDR_PANE_ID"
+else
+	critic_out="$(herdr agent get "$CRITIC_NAME" 2>&1)" || fail '검토 agent 이름을 확인하지 못했습니다. 지시서는 보내지 않았습니다.'
+	team_ws="$(printf '%s' "$critic_out" | jget result.agent.workspace_id)" || team_ws=""
+	[ -n "$team_ws" ] || fail '검토 agent의 작업공간을 확인하지 못했습니다. 지시서는 보내지 않았습니다.'
+	mate_name="${GJCH_MATE_NAME:-gjc-herdr-mate}"
+	mate_rc=0
+	mate_out="$(herdr agent get "$mate_name" 2>&1)" || mate_rc=$?
+	mate_ws="$(printf '%s' "$mate_out" | python3 -c 'import json,sys
+rc=sys.argv[1]
+try: d=json.load(sys.stdin)
+except Exception: sys.exit(1)
+if rc!="0":
+    if ((d.get("error") or {}).get("code"))=="agent_not_found":
+        sys.exit(0)
+    sys.exit(1)
+a=(d.get("result") or {}).get("agent") or {}
+w=a.get("workspace_id") if isinstance(a,dict) else None
+if not w: sys.exit(1)
+print(w)' "$mate_rc")" || fail "팀원 agent($mate_name)의 작업공간을 확인하지 못했습니다. 지시서는 보내지 않았습니다."
+	if [ -n "$mate_ws" ] && [ "$mate_ws" != "$team_ws" ]; then
+		fail "팀원($mate_name, $mate_ws)과 검토($CRITIC_NAME, $team_ws)의 작업공간이 다릅니다. 지시서는 보내지 않았습니다."
+	fi
+	caller=""
+fi
 # command substitution도 같은 bash 시작 시각을 상속한다(별도 Python clock을 쓰지 않음).
 now_ms() { printf '%s\n' "$((SECONDS * 1000))"; }
 
@@ -191,7 +232,7 @@ if require_name=="1": valid=valid and a.get("name")==name
 if send=="1": valid=valid and a.get("focused") is False and a.get("agent_status") in ("idle","done") and a.get("interactive_ready") is True
 if not valid:
     print("대상 거부: 소유 Codex·workspace·이름·입력 준비·비포커스 조건을 확인하세요. 상태="+str(a.get("agent_status"))+", focused="+str(a.get("focused")),file=sys.stderr)
-    sys.exit(1)' "${HERDR_WORKSPACE_ID:-}" "${HERDR_PANE_ID:-}" "$ROOT" "${pane:-}" "${terminal:-}" "$CRITIC_NAME" "$2" "$3"
+    sys.exit(1)' "$team_ws" "$caller" "$ROOT" "${pane:-}" "${terminal:-}" "$CRITIC_NAME" "$2" "$3"
 }
 agent="$(herdr agent get "$CRITIC_NAME")" || fail '검토 agent 이름을 확인하지 못했습니다.'
 validate_agent "$agent" 1 1 || exit 1

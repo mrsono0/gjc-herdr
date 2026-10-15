@@ -34,7 +34,7 @@ Herdr 안에서 Claude Code(팀장)가 agy(구현 팀원)와 선택 Codex(독립
 | `gjc-herdr` 플러그인 | 모델·세션 표시, `/herdr-send`, `/herdr-call` | 아래 "설치 (한 줄)" | `gjc plugin list --json` |
 | Node.js/npm (개발 시에만) | `npm ci`, 단위 테스트, typecheck | `brew install node` | `npm --version` |
 
-Herdr 밖에서 실행하면 팀 자동 구성과 표시 token이 동작하지 않는다(정상). 설치 상태는 언제든 `scripts/check-env.sh`로 다시 점검할 수 있다. 자세한 구성·대화 방법·문제 해결은 [docs/dev-environment.md](docs/dev-environment.md).
+Herdr 밖에서 실행하면 기본 모드에서는 팀 자동 구성과 표시 token이 동작하지 않는다(정상). Herdr 밖(데스크톱 앱 Code 탭 등)에서 팀장을 맡는 외부 팀장 모드와 팀장 이관 절차는 [docs/dev-environment.md](docs/dev-environment.md) §2.1–§2.2를 참조한다. 설치 상태는 언제든 `scripts/check-env.sh`로 다시 점검할 수 있다. 자세한 구성·대화 방법·문제 해결은 [docs/dev-environment.md](docs/dev-environment.md).
 
 ## 설치 (한 줄)
 
