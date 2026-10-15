@@ -72,7 +72,7 @@
 Claude 데스크톱 앱의 Code 탭(로컬 세션)이나 Herdr 밖 터미널의 `claude`를 팀장으로 쓰고, Herdr 작업공간에는 구현 팀원(agy)과 검토 팀원(Codex)만 두는 운영 방식이다.
 
 1. **준비:** 데스크톱 앱 Code 탭에서 이 저장소 폴더로 새 세션을 연다. **worktree 옵션은 선택하지 않는다.** worktree 옵션은 새 세션 입력 화면의 브랜치 이름 옆에 있으며 시작할 때만 정할 수 있다. 선택하면 `<프로젝트>/.claude/worktrees/` 아래 별도 사본에서 실행되므로 쓰지 않는다. 시작 후 `pwd; git rev-parse --show-toplevel`이 저장소 루트인지 확인한다. 데스크톱 Code 탭 로컬 세션에서는 Bash에서 `herdr`가 동작하고 `CLAUDE_CODE_SESSION_ID`와 `CLAUDE_CODE_MESSAGING_SOCKET`이 설정되어 있다.
-2. **환경변수:** macOS 데스크톱 앱은 셸 프로필에서 `PATH`만 가져온다. 다른 환경변수는 데스크톱 앱 Settings의 로컬 환경 편집기에 `GJCH_EXTERNAL_LEAD=1`을 넣어야 로컬 세션과 Bash에 전달된다(사용자 설정이므로 사용자가 직접 넣거나 승인 후 진행한다). 데스크톱 앱 밖 일반 터미널에서 Herdr 밖 `claude`로 쓸 때는 `GJCH_EXTERNAL_LEAD=1 claude`로 실행한다.
+2. **환경변수:** macOS 데스크톱 앱은 셸 프로필에서 `PATH`만 가져온다. 다른 환경변수는 데스크톱 앱 프롬프트 입력창의 환경 드롭다운 → `로컬 환경 편집` → `환경 변수`에 `GJCH_EXTERNAL_LEAD=1`을 넣어야 로컬 세션과 Bash에 전달된다(사용자 설정이므로 사용자가 직접 넣거나 승인 후 진행한다). 데스크톱 앱 밖 일반 터미널에서 Herdr 밖 `claude`로 쓸 때는 `GJCH_EXTERNAL_LEAD=1 claude`로 실행한다.
 3. **자동 구성:** SessionStart hook(`scripts/team-up.sh --hook`)이 `scripts/team-lead.sh claim`으로 잠금을 확보하면 stdout에 `GJCH: 이 세션이 외부 팀장입니다(herdr 밖, 팀장 잠금 보유). 팀원 작업공간 'GJCH · gjc-herdr'을 확인·구성합니다.`를 출력하고, `clear`가 아니면 `--spawn`을 백그라운드로 실행한다. 잠금을 얻지 못하면(다른 세션이 보유 중이거나 정체 환경변수 누락) `GJCH: 팀장 잠금이 다른 세션(<kind> <sid8>)에 있어 이 세션은 팀장이 아닙니다. 팀원에게 배정·입력하지 마세요.`(정체 환경변수가 없으면 `GJCH: 세션 정체(CLAUDE_CODE_SESSION_ID·소켓)를 알 수 없어 이 세션은 외부 팀장이 아닙니다.`)를 출력하고 아무것도 하지 않는다.
 4. **수동 명령:**
    - 팀원 기동·배치: `GJCH_EXTERNAL_LEAD=1 scripts/team-up.sh --spawn` 또는 `GJCH_EXTERNAL_LEAD=1 scripts/team-up.sh --layout`
