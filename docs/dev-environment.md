@@ -19,7 +19,7 @@
 | `GJCH_MATE_NAME` | `gjc-herdr-mate` |
 | `GJCH_CRITIC_NAME` | `gjc-herdr-critic` |
 | `GJCH_TEAM_CODEX` | `1`; `0`이면 Codex 자동 구성을 끈다 |
-| `GJCH_MATE_MODEL` | `gemini-4-argon-high`. 팀원을 `herdr agent start ... --kind agy ... -- --model <값> --mode auto`로 실행한다. 영문자·숫자·`._-`만 허용 |
+| `GJCH_MATE_MODEL` | `gemini-4-argon-high`. 팀원을 `herdr agent start ... --kind agy ... -- --model <값> --mode accept-edits --sandbox`로 실행한다. 영문자·숫자·`._-`만 허용 |
 | `GJCH_CODEX_MODEL` | `gpt-6.1-sol` |
 | `GJCH_RETRIES` | `30`; 팀장 이름 확보 등을 2초 간격으로 재확인 |
 
@@ -32,7 +32,7 @@
 3. `startup`의 `team-up.sh --spawn`이 다음을 순서대로 수행한다. 각 단계는 조건이 맞을 때만 실행되고 아무것도 덮어쓰지 않는다.
    - 가드: Herdr 안(`HERDR_ENV=1`)·`herdr`/`python3` 존재·이 pane의 실제 cwd가 프로젝트 안·`GJCH_TEAM_ROLE` 미설정일 때만 진행한다. 아니면 조용히 종료한다.
    - 이 pane의 agent 이름을 `gjc-herdr-lead`로 확보(이미 다른 pane이 쓰면 건드리지 않음)하고 pane label과, 폴더명 기본값인 작업공간 label을 바꾼다. Claude 감지 지연 때문에 최대 약 60초 재시도한다.
-   - 팀원 pane이 없으면 `pane split --no-focus`로 만들고(재시작 후 남은 새 label(`GJCH 팀원 · agy`)의 빈 셸 pane은 재사용하며, 기동 단계에서는 그 위치를 유지한다. 팀장과 같은 탭의 재사용 pane은 마지막 배치 보정 대상이고, 다른 탭의 재사용 pane은 보정에서 건너뛴다. 옛 `GJCH 팀원 · GJC` label의 빈 셸은 임시 관측 pane 등과 섞이지 않도록 자동 재사용하지 않는다) `herdr agent start gjc-herdr-mate --kind agy --pane <pane> --timeout 60000 -- --model <GJCH_MATE_MODEL> --mode auto`로 실행한다. `agy`가 없으면 안내하고 비0으로 끝낸다. 구현(agy, Gemini 4 Argon)과 검토(Codex, GPT)를 다른 모델로 두어 검토 독립성을 높이고 한 제공자 과부하에 함께 멈추지 않게 한다.
+   - 팀원 pane이 없으면 `pane split --no-focus`로 만들고(재시작 후 남은 새 label(`GJCH 팀원 · agy`)의 빈 셸 pane은 재사용하며, 기동 단계에서는 그 위치를 유지한다. 팀장과 같은 탭의 재사용 pane은 마지막 배치 보정 대상이고, 다른 탭의 재사용 pane은 보정에서 건너뛴다. 옛 `GJCH 팀원 · GJC` label의 빈 셸은 임시 관측 pane 등과 섞이지 않도록 자동 재사용하지 않는다) `herdr agent start gjc-herdr-mate --kind agy --pane <pane> --timeout 60000 -- --model <GJCH_MATE_MODEL> --mode accept-edits --sandbox`로 실행한다. `agy`가 없으면 안내하고 비0으로 끝낸다. 구현(agy, Gemini 4 Argon)과 검토(Codex, GPT)를 다른 모델로 두어 검토 독립성을 높이고 한 제공자 과부하에 함께 멈추지 않게 한다.
    - 새 pane의 위치는 아래 **배치 공식 기준**을 따른다. 포커스가 아니라 팀장 pane(`HERDR_PANE_ID`) 기준이다. 검토가 같은 탭에 있으면 검토를 반으로 나눌 새 pane을 만들고 검토를 임시 탭 경유 `pane move --no-focus`로 그 오른쪽에 되돌린 뒤 팀원 시작 전에 비율을 맞춘다. 없으면 팀장 아래를 나눠 팀장을 60%로 둔다. 검토를 같은 탭에 되돌리지 못하면 팀원은 그대로 시작하되 종료 코드를 비0으로 두고 그 pane·tab ID와 수동 복귀 필요를 알린다(다른 탭의 pane은 마지막 배치 보정·`--layout` 모두 옮기지 않는다).
    - `herdr agent start`가 JSON `error.code == "agent_not_ready"`로 실패하고 해당 pane의 `agent_status`가 `blocked`이면(처음 저장소를 열 때의 폴더 신뢰 창이나 다른 질문 UI 등), 스크립트는 자동 응답하지 않으며(사용자 결정 사항) 원래 오류(`code`·`message`)와 함께 불확실성을 남긴 안내(`agy가 시작 중 멈췄습니다(..., status=blocked, ...). 폴더 신뢰 창이나 다른 질문일 수 있으니 그 pane에서 사용자가 확인한 뒤 scripts/team-up.sh --spawn을 다시 실행하세요.`)를 출력하고 비0으로 끝낸다. pane 상태가 `working`이거나 상태 조회 실패·다른 기동 오류이면 신뢰 창으로 단정하지 않고 원래 오류와 함께 일반 실패로 끝낸다. 첫 기동이 `blocked`에서 멈춰도 이름 `gjc-herdr-mate`는 이미 붙으므로, 재실행 시 `existing` 분기에서도 `herdr agent get`의 `agent_status`·`interactive_ready`를 확인해 여전히 `blocked`이거나 준비되지 않았으면(조회 실패 포함) 비0으로 끝내고, 사용자가 응답해 `idle`/`done`·`interactive_ready=true`(또는 `working`)가 되면 새 pane을 만들거나 재시작하지 않고 배치 보정으로 넘어간다.
    - 선택 Codex 단계: `GJCH_TEAM_CODEX=0`·`codex` 없음·기존 critic 이름 점유 시 생략한다. 그 외에는 저장소 루트 cwd·검토 label인 같은 workspace 빈 셸 pane을 재사용하거나, 팀장과 같은 탭의 팀원 오른쪽(반반, 팀원이 없거나 다른 탭이면 팀장 아래 팀장 60%)에 no-focus로 만들고(팀원 오른쪽에 만든 경우 Codex 시작 전에 비율을 맞춘다) `herdr agent start ... -- --no-daemon --yolo -m <모델> -C <저장소 루트> --disable worktrees`로 시작한다(`/new` worktree 메뉴 없음, §4). 공유 daemon 환경에서 실행된 훅이 세션 ID를 다른 pane으로 보고할 수 있어 `--no-daemon`으로 해당 pane의 환경을 사용한다. 팀원(agy) 단계 실패 시에도 Codex 단계는 별도로 시도하며, 실패한 단계가 있으면 종료 코드는 비0이다.
@@ -89,11 +89,7 @@
   herdr agent prompt gjc-herdr-mate ".local/agy/<이슈>-brief.md 를 읽고 진행해 줘."
   ```
   완료는 Herdr 상태(`done`)가 아니라 지정한 결과 파일과 `agy` 화면 하단 `task(s)` 표시로 판단한다. 빈 답·결과 파일 없음은 실패로 본다.
-- **구현 팀원 → 팀장 (agy → Claude):** 상세 결과와 검증 출력을 결과 파일(예: `.local/agy/<이슈>-result.md`)에 쓴 뒤, 셸에서 `herdr agent prompt`로 짧은 보고를 보낸다.
-  ```sh
-  herdr agent prompt gjc-herdr-lead "[gjc-herdr-mate→gjc-herdr-lead] #<이슈> <회차> 완료. 상세 <절대경로>"
-  ```
-  **주의:** 셸에서 직접 호출하는 `herdr agent prompt` 경로에는 이 플러그인(`/herdr-call`·`/herdr-send`)의 입력 보호(입력 중 대기·포커스 거부 등)가 없다. 짧은 완료 알림만 1회 보내며, 팀장이 `working`/`blocked`여서 거절되면 같은 pane에 입력을 밀어 넣거나 반복 전송하지 말고 결과 파일만 남겨 둔다.
+- **구현 팀원 → 팀장 (agy → Claude):** 상세 결과와 검증 출력은 결과 파일(예: `.local/agy/<이슈>-result.md`)만 쓴다. sandbox에서 `herdr agent prompt`가 막히므로 `agy`는 셸로 팀장에게 알리지 않는다. 팀장은 백그라운드 감시로 결과 파일·`agent_status`(`blocked` 포함)·화면을 보고 완료와 확인창을 판단한다.
 - **팀장 → 검토 (Claude → Codex):** 자체 완결 지시서 파일을 스크립트로 보낸다. 같은 workspace의 저장소 루트에서 실행 중인 소유 Codex가 idle/done·비포커스일 때만 시작하며, 빈 입력란 확인 → 필요 시 `/new`·새 화면 준비 확인 → pane ID로 전송·working 수락 확인 → 전송 뒤 이름 확인·필요 시 재등록 → 고정 pane의 완료 대기를 수행한다.
   ```sh
   scripts/critic-send.sh <지시서 파일>                    # 기본 30분
@@ -123,7 +119,7 @@ GJC는 상시 팀원이 아니며, 플러그인 로드·token 표시·`/herdr-se
 - 사용자 지시는 팀장이 받는다. 팀원이 직접 받으면 팀장에게 요약해 알리고, 범위 확대는 팀장 확인 후 한다.
 - 배정에는 목적 한 줄, 맡길 결과, 쓰기 허용 파일(최대 3–5개), 범위 밖 읽기 금지, 금지 사항, 회신 방식, 배경(상대에게 대화 이력이 없다고 가정)을 적는다. 같은 파일을 동시에 쓰지 않는다.
 - 팀원은 관측 사실 / source 근거 / 가설 / 미확인을 구분해 보고하고, 팀장은 직접 확인한 사실만 사용자에게 보고한다.
-- **agy 운용 조건**(`AGENTS.md` 참조): 빈 답·결과 파일 없음은 실패로 본다. 완료는 Herdr 상태(`done`)가 아니라 결과 파일과 화면 하단 `task(s)` 표시로 판단한다. 자기 검증은 팀장이나 검토가 다시 실행해 확인한다. 환경 문제가 생기면 탐색하지 말고 멈추고 묻는다. commit·push·설치를 금지한다. `.gjc/RULES.md`는 자동으로 실리지 않으니 필요한 규칙은 지시서에 넣는다. 폴더 신뢰 창 응답과 `--mode auto` 운용 여부는 사용자가 정한다.
+- **agy 운용 조건**(`AGENTS.md` 참조): 빈 답·결과 파일 없음은 실패로 본다. 완료는 Herdr 상태(`done`)가 아니라 결과 파일과 화면 하단 `task(s)` 표시로 판단한다. 자기 검증은 팀장이나 검토가 다시 실행해 확인한다. 환경 문제가 생기면 탐색하지 말고 멈추고 묻는다. commit·push·설치를 금지한다. `.gjc/RULES.md`는 자동으로 실리지 않으니 필요한 규칙은 지시서에 넣는다. 실행 옵션을 `--mode accept-edits --sandbox`로 두는 이유는 공통 설정이 `proceed-in-sandbox`라서, sandbox 안의 셸·편집은 무확인이고 sandbox 밖 실행만 확인하기 때문이다. sandbox 안에서는 홈 설정 파일을 읽는 `git`·`gh`가 실패하므로(`~/.gitconfig`·`~/.config/gh` 접근 거부) diff·이슈 확인은 팀장이 하고, 필요한 배경은 지시서에 싣는다. 폴더 신뢰 창은 사용자가 답한다. 명령·편집 확인창은 팀장이 명령 원문을 확인한 뒤 "이번만"(1번)으로만 답한다. 대화 한정·영구 저장(`settings.json`) 선택지는 사용자 승인으로만 쓴다. 이 위임은 배정 범위 안의 작업에만 적용되며 commit·설치·사용자 설정 변경 등 기존 승인 경계를 넓히지 않고, 폴더 신뢰·그 밖의 질문 UI는 사용자에게 확인한다. `~/.gemini/antigravity-cli/settings.json`은 이 머신의 모든 `agy`가 함께 쓰는 사용자 설정이므로 이 저장소 작업에서 바꾸지 않는다.
 - 검토 요청은 빈 새 대화에서 시작한다. 이미 빈 새 화면이면 그대로 보내고, 기존 대화이면 idle/done·빈 입력란을 확인한 뒤 **`/new`**를 한다. 이전 회차·팀장 설명에 끌려가지 않도록 독립성을 유지하기 위한 규칙이다. 진행 중이거나 승인·질문 UI가 있으면 새 대화를 강제로 시작하지 않는다.
 - 검토 지시서는 대화 이력이 없어도 수행 가능한 자체 완결 문서다. 2회차라면 1회차 지적 목록·근거 파일 경로·sha256을 새 지시서에 싣는다.
 - 구현(agy)과 검토·조사(Codex)를 같은 회차에 섞지 않는다. **Codex의 제1원칙: 파일 수정이 필요하면 먼저 팀장 허락을 받는다.** 지시서가 지정한 결과 파일 외에는 쓰지 않고, commit·적용은 하지 않는다. **`--yolo`는 사용자 지시이고 샌드박스가 없으므로 이 원칙은 규칙(`AGENTS.md`·지시서)으로 지킨다.** 검토 결과가 팀장 검증이나 사용자 승인을 대신하지 않는다.
@@ -139,6 +135,7 @@ GJC는 상시 팀원이 아니며, 플러그인 로드·token 표시·`/herdr-se
 | 팀원 pane이 안 생김 | hook이 가드에서 종료됨(Herdr 밖, cwd가 프로젝트 밖, `GJCH_TEAM_ROLE` 설정, `herdr`/`python3` 없음) 또는 `agy` 없음. `scripts/check-env.sh`와 `scripts/team-up.sh --spawn` 출력 확인 |
 | `agy not found` / `check-env.sh`에서 `agy 없음` FAIL | 상시 구현 팀원(`gjc-herdr-mate`)용 Antigravity CLI(`agy`)가 PATH에 없다. 사용자에게 `agy` 설치를 안내한 뒤 `scripts/team-up.sh --spawn`을 다시 실행한다 |
 | `agy`가 시작 중 멈춤 (`agent start`가 `agent_not_ready`이고 pane 상태가 `blocked`, 또는 기존 `gjc-herdr-mate`가 여전히 `blocked`) | 처음 저장소를 열 때의 폴더 신뢰 창이나 다른 질문 UI에서 멈춘 상태일 수 있다. 스크립트는 자동 응답하지 않으며(사용자 결정) 비0으로 끝난다. 첫 기동(`agent start`) 실패는 불확실성 안내와 원래 오류(`code`·`message`)를 함께 출력하고, 이미 이름이 붙은 기존 팀원이 `blocked`이면 현재 상태와 확인 안내만 출력한다. 그 pane에서 사용자가 직접 확인·응답한 뒤 `scripts/team-up.sh --spawn`을 다시 실행한다. 응답 뒤 `idle`/`done`·`interactive_ready=true`이거나 `working`이면 새 pane을 만들거나 재시작하지 않고 유지·통과한다. 첫 기동에서 pane 상태가 `working`이거나 상태 조회 실패·기타 기동 오류이면 신뢰 창 안내 없이 원래 오류와 함께 일반 실패로 끝난다 |
+| `agy`가 작업 중 `blocked` | sandbox 밖 실행이나 편집 확인창일 수 있다. 화면을 보고 §5 "agy 운용 조건"의 응답 규칙을 따른다 |
 | Codex pane이 안 생김 | `codex` 없음 또는 `GJCH_TEAM_CODEX=0`이면 선택 단계 생략. 기존 critic이 있으면 새 pane을 만들지 않음. `scripts/team-up.sh --spawn`의 stderr를 확인 |
 | 조회 실패(`could not look up agent ...`)로 팀원·검토를 만들지 않음 | `herdr agent get` 조회나 JSON 파싱이 실패하면 부재(`agent_not_found`)로 추정하지 않고 그 단계를 비0으로 끝낸다. `herdr agent list`로 Herdr 상태를 확인한 뒤 `scripts/team-up.sh --spawn`을 다시 실행한다 |
 | Codex가 "Trust and continue" 화면에서 멈춤 | 처음 저장소 폴더에서 실행하면 Codex가 폴더 신뢰를 묻는다(Herdr 상태는 idle로 보일 수 있음). 사용자 설정(`~/.codex/config.toml`)에 기록되므로 사용자 승인 후 선택한다. 그 전에는 `critic-send.sh`가 형식 판정 불가로 거부한다 |

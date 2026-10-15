@@ -53,7 +53,7 @@
 **대화 채널 (방향별):**
 
 1. 팀장 → agy 팀원: `herdr agent prompt gjc-herdr-mate "<짧은 지시>"`로 보내고, 상세 내용은 지시서 파일(예: `.local/agy/<이슈>-brief.md`)로 준다.
-2. agy 팀원 → 팀장: 셸에서 `herdr agent prompt gjc-herdr-lead "<짧은 보고>"`로 보내고, 상세 내용은 결과 파일(예: `.local/agy/<이슈>-result.md`)로 준다. **주의:** 이 셸 경로에는 플러그인(`/herdr-call`·`/herdr-send`)의 입력 보호(입력 중 대기·포커스 거부 등)가 없으므로 짧은 완료 알림만 1회 보내며, 팀장이 working/blocked여서 거절되면 같은 pane에 입력을 밀어 넣거나 반복 전송하지 말고 결과 파일만 남겨 둔다.
+2. agy 팀원 → 팀장: 상세 결과와 검증 출력은 결과 파일(예: `.local/agy/<이슈>-result.md`)만 쓴다. sandbox에서 `herdr agent prompt`가 막히므로 agy는 셸로 팀장에게 알리지 않는다. 팀장은 백그라운드 감시로 결과 파일·`agent_status`(`blocked` 포함)·화면을 보고 완료와 확인창을 판단한다.
 3. 팀장 → Codex: `scripts/critic-send.sh <지시서 파일>`로 보낸다. 요청마다 빈 새 대화(`/new`)에서 시작하고, 지시서는 대화 이력 없이 수행 가능한 자체 완결 문서로 쓰며 첫머리에 제1원칙과 허락하는 결과 파일 경로를 적는다. 결과는 완료 확인 뒤 그 파일을 읽어 받는다.
 4. 임시 GJC 관측 세션과의 대화: 플러그인 실사용 관측을 위해 임시 탭에 띄운 GJC는 Herdr가 *감지*한 agent가 아니라 상태 *보고*만 있어 `herdr agent prompt`가 `agent_not_ready`로 거절된다. 팀장 → 임시 GJC는 공개 SDK 경로 `gjc sdk session send <gjc_herdr_session_id> --text "<요청>" --wait --timeout-ms <ms>`를 쓰고(`herdr pane get <pane-id>`의 token 확인, `endpoint_stale` 처리는 [docs/dev-environment.md](docs/dev-environment.md) §4), 임시 GJC → 팀장 등 감지 에이전트는 플러그인의 `/herdr-call`·`herdr_agent_call`(대상 `gjc-herdr-lead`)을 쓴다. 슬래시 명령(`/rename ...`)은 SDK 텍스트로 실행되지 않으므로 필요 시 사용자 승인 후 대상 pane의 idle·비포커스·빈 입력란을 확인하고 `herdr pane send-text <pane-id> "/명령"` + `herdr pane send-keys <pane-id> enter`를 쓴다.
 5. 읽기 전용 관찰은 `herdr agent read <이름>`(임시 GJC 관측 세션은 `gjc sdk session tail <session_id> --json`). `pane send-text/send-keys/rename`은 **pane ID만** 받으므로 `herdr agent get <이름>`으로 pane_id를 얻는다.
@@ -88,7 +88,10 @@ LFAI 합본 보고서와 GJCH 시범(#21·#23)에서 확인된 조건이다.
 - 지시서에 쓰기 허용 파일과 범위 밖 읽기 금지를 적는다. 환경 문제가 생기면 탐색하지 말고 멈추고 묻는다.
 - commit·push·설치를 금지한다.
 - `.gjc/RULES.md`는 자동으로 실리지 않으니, 필요한 규칙은 지시서에 넣는다.
-- 폴더 신뢰 창 응답과 `--mode auto` 운용 여부는 사용자가 정한다.
+- 실행 옵션을 `--mode accept-edits --sandbox`로 두는 이유는 공통 설정이 `proceed-in-sandbox`라서, sandbox 안의 셸·편집은 무확인이고 sandbox 밖 실행만 확인하기 때문이다.
+- sandbox 안에서는 홈 설정 파일을 읽는 `git`·`gh`가 실패하므로(`~/.gitconfig`·`~/.config/gh` 접근 거부) diff·이슈 확인은 팀장이 하고, 필요한 배경은 지시서에 싣는다.
+- 확인창 응답 규칙: 폴더 신뢰 창은 사용자가 답한다. 명령·편집 확인창은 팀장이 명령 원문을 확인한 뒤 "이번만"(1번)으로만 답한다. 대화 한정·영구 저장(`settings.json`) 선택지는 사용자 승인으로만 쓴다.
+- `~/.gemini/antigravity-cli/settings.json`은 이 머신의 모든 agy가 함께 쓰는 사용자 설정이므로 이 저장소 작업에서 바꾸지 않는다.
 
 **협업 중에도 절대 하지 않는 일:**
 
@@ -113,7 +116,7 @@ LFAI 합본 보고서와 GJCH 시범(#21·#23)에서 확인된 조건이다.
 **Herdr (항상 `HERDR_ENV=1` 환경, 제어 전 확인):**
 - 계층 workspace(`w1`) › tab(`w1:t1`) › pane(`w1:p1`). ID는 불투명 핸들이며 응답 JSON에서 읽고 추측하지 않는다. 내 위치는 `herdr pane current --current`, 환경변수 `HERDR_WORKSPACE_ID/TAB_ID/PANE_ID`.
 - pane 명령은 raw 터미널(셸·테스트·서버), agent 명령은 *감지된* 코딩 agent용이다. agent 대상은 살아 있는 고유 이름(`[a-z][a-z0-9_-]{0,31}`) 또는 pane ID. 이름은 그 pane의 점유자를 따라가며 종료·교체 시 사라진다.
-- 상태: `idle`/`done`=입력 가능, `working`, `blocked`=승인·질문 UI(임의 응답 금지, 사용자에게 확인), `unknown`=분류 불가(완료 증거 아님).
+- 상태: `idle`/`done`=입력 가능, `working`, `blocked`=승인·질문 UI(임의 응답 금지, 사용자에게 확인. 예외: agy의 명령·편집 확인창은 위 "agy 운용 조건"에 따라 팀장이 "이번만" 1회 응답한다. 이 위임은 배정 범위 안의 작업에만 적용되며 commit·설치·사용자 설정 변경 등 기존 승인 경계를 넓히지 않는다), `unknown`=분류 불가(완료 증거 아님).
 - 호출: `herdr agent prompt <대상> "<질문>" --wait --timeout <ms>` → 응답은 `agent read <대상> --source recent-unwrapped --lines N`. `agent_prompt_stalled`/`timeout`은 미전달 증거가 아니므로 맹목 재전송 금지.
 - 일반 명령: `pane split --current --direction right|down --cwd "$PWD" --no-focus` → `pane run <id> "<cmd>"` → `pane wait-output --match|--regex` → `pane read`. 사용자 포커스는 항상 `--no-focus`로 보존.
 - 금지: 만들지 않은 workspace/tab/pane 닫기, `herdr server stop`, 메인 Herdr 프로세스 종료, 인자 없이 변경성 하위 명령 탐색, 맨 `herdr`(TUI 실행). 실험은 이름 있는 격리 session에서.

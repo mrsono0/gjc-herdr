@@ -467,7 +467,7 @@ if [ -z "$pane" ]; then
 fi
 mate_pane="$pane"
 herdr pane rename "$pane" "$MATE_LABEL" >/dev/null 2>&1
-if ! start_out="$(herdr agent start "$MATE_NAME" --kind agy --pane "$pane" --timeout 60000 -- --model "$MATE_MODEL" --mode auto 2>&1)"; then
+if ! start_out="$(herdr agent start "$MATE_NAME" --kind agy --pane "$pane" --timeout 60000 -- --model "$MATE_MODEL" --mode accept-edits --sandbox 2>&1)"; then
 	start_info="$(printf '%s' "$start_out" | python3 -c 'import sys,json
 raw=sys.stdin.read().strip()
 try: d=json.loads(raw)

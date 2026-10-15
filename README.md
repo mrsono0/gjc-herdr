@@ -26,7 +26,7 @@ Herdr 안에서 Claude Code(팀장)가 agy(구현 팀원)와 선택 Codex(독립
 |---|---|---|---|
 | [Herdr](https://herdr.dev) | agent pane 관리자. 팀 구성과 sidebar 표시의 바탕 (0.9.3에서 검증) | `brew install herdr` 또는 `curl -fsSL https://herdr.dev/install.sh \| sh` | `herdr --version` |
 | [Claude Code CLI](https://docs.claude.com/en/docs/claude-code) | 팀장 (2.1.295에서 사용) | `brew install --cask claude-code@latest` 또는 공식 문서의 설치 방법 | `claude --version` |
-| Antigravity CLI (`agy`) | 구현 팀원 (`gjc-herdr-mate`, `--mode auto`) | Antigravity CLI 설치 안내 참조 | `agy --version` |
+| Antigravity CLI (`agy`) | 구현 팀원 (`gjc-herdr-mate`, `--mode accept-edits --sandbox`) | Antigravity CLI 설치 안내 참조 | `agy --version` |
 | [GJC (Gajae Code)](https://github.com/Yeachan-Heo/gajae-code) | 이 플러그인의 설치·관측 대상 (0.18.8에서 사용, 설치 검증은 0.18.7) | 해당 저장소의 [설치 문서](https://github.com/Yeachan-Heo/gajae-code/blob/main/docs/install.md)에서 태그된 설치 스크립트를 내려받아 실행 | `gjc --version` |
 | [Codex CLI](https://github.com/openai/codex) (선택) | 독립 검토·조사 팀원. `GJCH_TEAM_CODEX=0`으로 끌 수 있음 | 공식 설치 안내 또는 `npm install -g @openai/codex` | `codex --version` |
 | [Bun](https://bun.sh) 1.4.3 | GJC가 Git 플러그인을 설치할 때 필요, build는 1.4.3 고정 | `curl -fsSL https://bun.sh/install \| bash` (특정 버전은 Bun 문서 참조) | `bun --version` |
