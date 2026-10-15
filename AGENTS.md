@@ -37,12 +37,12 @@
 
 **팀 목적:** 서로 대화하며 역할을 나눠 `gjc-herdr`의 다음 확인된 요구를 최소 구현으로 끝까지 달성하고, 같은 일을 두 번 하거나 서로 다른 사실을 기록하지 않는다.
 
-**구성 (같은 Herdr workspace, cwd 이 저장소 루트):**
+**구성 (같은 Herdr workspace, cwd 이 저장소 루트. 외부 팀장은 Herdr 밖):**
 
 | 역할 | 에이전트 | 이름·label | 책임 |
 |---|---|---|---|
 | 팀장 | Claude Code | 팀장 잠금 보유자(herdr 안 `gjc-herdr-lead`, pane label `GJCH 팀장 · Claude` 또는 herdr 밖 외부 팀장) | 사용자와 직접 대화, 목표·승인 경계 유지, 작업 분해·배정, 결과 검증과 통합, 문서·이 파일, 승인이 필요한 commit/push/설치의 요청 |
-| 부팀장(선택, 이관 시범 중) | Claude Code | agent `gjc-herdr-deputy`, pane label `GJCH 부팀장 · Claude` | 관찰, 조회, 팀장 지원(세션 간 메시지). 팀원 배정과 입력, 팀 구성과 배치는 하지 않는다 |
+| 부팀장(선택, 이관 때만) | Claude Code | agent `gjc-herdr-deputy`, pane label `GJCH 부팀장 · Claude` | 관찰, 조회, 팀장 지원(세션 간 메시지). 팀원 배정과 입력, 팀 구성과 배치는 하지 않는다 |
 | 구현 팀원 | agy (Antigravity CLI) | agent `gjc-herdr-mate`, pane label `GJCH 팀원 · agy` | 배정된 파일의 조사·구현·집중 검증, 결과 파일과 근거 보고 |
 | 검토·조사 팀원(선택) | Codex | agent `gjc-herdr-critic`, pane label `GJCH 검토·조사 · Codex` | 독립 검토·조사·근거 확인, 지시서가 지정한 결과 파일 작성(위 제1원칙) |
 | 런타임 관측(임시) | GJC | 필요할 때만 팀장이 임시 탭에 실행 | 플러그인 로드, token 표시, `/herdr-send`·`/herdr-call` 실동작 관측 후 종료(상시 팀원 아님) |
@@ -57,7 +57,7 @@
 1. 팀장 → agy 팀원: `herdr agent prompt gjc-herdr-mate "<짧은 지시>"`로 보내고, 상세 내용은 지시서 파일(예: `.local/agy/<이슈>-brief.md`)로 준다.
 2. agy 팀원 → 팀장: 상세 결과와 검증 출력은 결과 파일(예: `.local/agy/<이슈>-result.md`)만 쓴다. sandbox에서 `herdr agent prompt`가 막히므로 agy는 셸로 팀장에게 알리지 않는다. 팀장은 백그라운드 감시로 결과 파일·`agent_status`(`blocked` 포함)·화면을 보고 완료와 확인창을 판단한다.
 3. 팀장 → Codex: `scripts/critic-send.sh <지시서 파일>`로 보낸다. 요청마다 빈 새 대화(`/new`)에서 시작하고, 지시서는 대화 이력 없이 수행 가능한 자체 완결 문서로 쓰며 첫머리에 제1원칙과 허락하는 결과 파일 경로를 적는다. 결과는 완료 확인 뒤 그 파일을 읽어 받는다.
-4. 임시 GJC 관측 세션과의 대화: 플러그인 실사용 관측을 위해 임시 탭에 띄운 GJC는 Herdr가 *감지*한 agent가 아니라 상태 *보고*만 있어 `herdr agent prompt`가 `agent_not_ready`로 거절된다. 팀장 → 임시 GJC는 공개 SDK 경로 `gjc sdk session send <gjc_herdr_session_id> --text "<요청>" --wait --timeout-ms <ms>`를 쓰고(`herdr pane get <pane-id>`의 token 확인, `endpoint_stale` 처리는 [docs/dev-environment.md](docs/dev-environment.md) §4), 임시 GJC → 팀장 등 감지 에이전트는 플러그인의 `/herdr-call`·`herdr_agent_call`(대상 `gjc-herdr-lead`)을 쓴다. 슬래시 명령(`/rename ...`)은 SDK 텍스트로 실행되지 않으므로 필요 시 사용자 승인 후 대상 pane의 idle·비포커스·빈 입력란을 확인하고 `herdr pane send-text <pane-id> "/명령"` + `herdr pane send-keys <pane-id> enter`를 쓴다.
+4. 임시 GJC 관측 세션과의 대화: 플러그인 실사용 관측을 위해 임시 탭에 띄운 GJC는 Herdr가 *감지*한 agent가 아니라 상태 *보고*만 있어 `herdr agent prompt`가 `agent_not_ready`로 거절된다. 팀장 → 임시 GJC는 공개 SDK 경로 `gjc sdk session send <gjc_herdr_session_id> --text "<요청>" --wait --timeout-ms <ms>`를 쓰고(`herdr pane get <pane-id>`의 token 확인, `endpoint_stale` 처리는 [docs/dev-environment.md](docs/dev-environment.md) §4), 임시 GJC → 팀장 등 감지 에이전트는 플러그인의 `/herdr-call`·`herdr_agent_call`(대상 `gjc-herdr-lead`)을 쓴다(외부 팀장 모드에서는 팀장이 Herdr agent가 아니므로 이 호출 경로가 없으며, 팀장이 `gjc sdk session tail <session_id> --json` 또는 `send --wait`의 응답으로 GJC의 답을 읽는다 — 런타임 미확인 추론). 슬래시 명령(`/rename ...`)은 SDK 텍스트로 실행되지 않으므로 필요 시 사용자 승인 후 대상 pane의 idle·비포커스·빈 입력란을 확인하고 `herdr pane send-text <pane-id> "/명령"` + `herdr pane send-keys <pane-id> enter`를 쓴다.
 5. 읽기 전용 관찰은 `herdr agent read <이름>`(임시 GJC 관측 세션은 `gjc sdk session tail <session_id> --json`). `pane send-text/send-keys/rename`은 **pane ID만** 받으므로 `herdr agent get <이름>`으로 pane_id를 얻는다.
 6. 대량 근거·로그는 채팅 본문에 붙이지 않고 파일 경로와 sha256으로 공유한다.
 7. 채널 자체가 막히면(차단, 미응답) 그 사실을 기록하고 독립 작업을 계속한다. 연결 실패를 동의로 간주하지 않는다. 다른 세션의 transcript·credentials를 열람해 상태를 알아내지 않는다.
@@ -116,7 +116,7 @@ LFAI 합본 보고서와 GJCH 시범(#21·#23)에서 확인된 조건에, 같은
 
 명령 문법은 설치된 binary가 기준이므로 쓰기 전에 `--help`(`herdr --skill`, `gjc --help`)로 다시 확인한다.
 
-**Herdr (항상 `HERDR_ENV=1` 환경, 제어 전 확인):**
+**Herdr (항상 `HERDR_ENV=1` 환경, 제어 전 확인. 단, Herdr 밖 외부 팀장 `GJCH_EXTERNAL_LEAD=1`은 `HERDR_ENV`가 없으며 `scripts/team-lead.sh status`가 `mine`인지와 `herdr agent list`로 대상 작업공간·pane을 확인한다 — [docs/dev-environment.md](docs/dev-environment.md) §2.1):**
 - 계층 workspace(`w1`) › tab(`w1:t1`) › pane(`w1:p1`). ID는 불투명 핸들이며 응답 JSON에서 읽고 추측하지 않는다. 내 위치는 `herdr pane current --current`, 환경변수 `HERDR_WORKSPACE_ID/TAB_ID/PANE_ID`.
 - pane 명령은 raw 터미널(셸·테스트·서버), agent 명령은 *감지된* 코딩 agent용이다. agent 대상은 살아 있는 고유 이름(`[a-z][a-z0-9_-]{0,31}`) 또는 pane ID. 이름은 그 pane의 점유자를 따라가며 종료·교체 시 사라진다.
 - 상태: `idle`/`done`=입력 가능, `working`, `blocked`=승인·질문 UI(임의 응답 금지, 사용자에게 확인. 예외: agy의 명령·편집 확인창은 위 "agy 운용 조건"에 따라 팀장이 "이번만" 1회 응답한다. 이 위임은 배정 범위 안의 작업에만 적용되며 commit·설치·사용자 설정 변경 등 기존 승인 경계를 넓히지 않는다), `unknown`=분류 불가(완료 증거 아님).
@@ -133,7 +133,7 @@ LFAI 합본 보고서와 GJCH 시범(#21·#23)에서 확인된 조건에, 같은
 
 1. 작업을 시작할 때 공동 작업 상대의 실제 session ID·pane ID·현재 상태를 공개 세션/Herdr API로 확인한다. 옆에 있다는 이유만으로 동일 프로세스의 하위 에이전트라고 가정하지 않는다.
 2. 같은 프로세스의 상대는 실제 `irc list` 결과의 ID로 `irc` 대화한다. 외부 GJC 세션은 공개 session-control API를 우선한다. 해당 채널이 없을 때만 확인된 Herdr pane/agent 입력을 사용한다.
-3. Herdr 제어 전 caller의 `HERDR_ENV=1`과 현재 workspace/tab/pane를 확인한다. 다른 workspace나 사용자의 포커스를 임의로 제어하지 않는다.
+3. Herdr 제어 전 caller의 `HERDR_ENV=1`과 현재 workspace/tab/pane를 확인한다(외부 팀장 `GJCH_EXTERNAL_LEAD=1`은 `HERDR_ENV`가 없으므로 `scripts/team-lead.sh status`가 `mine`인지 확인하고, 대상 작업공간·pane은 `herdr agent list`로 확인한다. [docs/dev-environment.md](docs/dev-environment.md) §2.1 참조). 다른 workspace나 사용자의 포커스를 임의로 제어하지 않는다.
 4. 다른 세션의 transcript·JSONL·캐시·credentials를 뒤져 상대 상태를 알아내지 않는다.
 5. 사용자 편집 중인 입력·진행 중인 작업·차단 UI를 덮어쓰지 않는다. 실행 중이면 안전한 queue/steer 채널을 쓰고, 없으면 대화 가능한 시점까지 기다린다.
 6. 상대에게 보낸 사실과 상대의 응답을 받은 사실을 구분한다.

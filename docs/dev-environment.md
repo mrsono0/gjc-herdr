@@ -1,13 +1,13 @@
 # 개발 환경: Herdr + 팀장(Claude Code) + 구현(agy) + 선택 검토(Codex)
 
-이 저장소는 한 Herdr workspace에서 **팀장(Claude Code)** 이 **구현 팀원(agy)** 과 **선택 검토·조사 팀원(Codex)** 에게 역할을 나눠 `gjc-herdr`을 개발하도록 구성되어 있다. GJC는 상시 팀원이 아니며, 플러그인 실사용 관측이 필요할 때만 팀장이 임시 탭에 띄운다. 구현과 독립 검토를 같은 에이전트의 같은 회차에 맡기지 않는다. 새 컴퓨터에서 `git clone`한 뒤 AI(Claude Code 등)가 이 문서를 읽고 스스로 점검·구축할 수 있게 쓴 문서다. 각 단계의 **실제 출력으로 판정**하고, 확인하지 못한 항목을 성공으로 적지 않는다.
+이 저장소는 한 Herdr workspace에서 **팀장(Claude Code)** 이 **구현 팀원(agy)** 과 **선택 검토·조사 팀원(Codex)** 에게 역할을 나눠 `gjc-herdr`을 개발하도록 구성되어 있다(팀장은 그 workspace의 pane이거나 Herdr 밖 외부 팀장이다. §2.1 참조). GJC는 상시 팀원이 아니며, 플러그인 실사용 관측이 필요할 때만 팀장이 임시 탭에 띄운다. 구현과 독립 검토를 같은 에이전트의 같은 회차에 맡기지 않는다. 새 컴퓨터에서 `git clone`한 뒤 AI(Claude Code 등)가 이 문서를 읽고 스스로 점검·구축할 수 있게 쓴 문서다. 각 단계의 **실제 출력으로 판정**하고, 확인하지 못한 항목을 성공으로 적지 않는다.
 
 ## 1. 구성 요약
 
 | 역할 | 에이전트 | 이름·label | 하는 일 | 하지 않는 일 |
 |---|---|---|---|---|
 | 팀장 | Claude Code | 팀장 잠금 보유자: agent `gjc-herdr-lead`, pane label `GJCH 팀장 · Claude`(herdr 안 pane) 또는 herdr 밖 외부 팀장 | 사용자와 대화, 작업 분해·배정, 결과 검증, 승인이 필요한 외부 작업(commit/push/설치) 요청 | 사용자 승인 대체 |
-| 부팀장(선택, 이관 시범 중) | Claude Code | agent `gjc-herdr-deputy`, pane label `GJCH 부팀장 · Claude` | 관찰, 조회, 팀장 지원(세션 간 메시지) | 팀원 배정과 입력, 팀 구성과 배치 |
+| 부팀장(선택, 이관 때만) | Claude Code | agent `gjc-herdr-deputy`, pane label `GJCH 부팀장 · Claude` | 관찰, 조회, 팀장 지원(세션 간 메시지) | 팀원 배정과 입력, 팀 구성과 배치 |
 | 구현 팀원 | agy (Antigravity CLI) | agent `gjc-herdr-mate`, pane label `GJCH 팀원 · agy` | 배정된 파일 구현·집중 검증, 결과 파일과 근거 보고 | 같은 회차의 독립 검토 역할 겸임, 승인 없는 commit/push/설치, 범위 밖 탐색 |
 | 검토·조사 팀원(선택) | Codex | agent `gjc-herdr-critic`, pane label `GJCH 검토·조사 · Codex` | 독립 검토·조사·근거 확인, 지시서가 지정한 결과 파일 작성 | 팀장 허락 없는 파일 수정, 커밋·적용, 팀장 검증 대체, 사용자 승인 |
 | 런타임 관측(임시) | GJC | 필요 시 팀장이 임시 탭에 실행 | 플러그인 로드, token 표시, `/herdr-send`·`/herdr-call` 실동작 관측 후 종료 | 상시 팀원 점유 |
@@ -83,11 +83,12 @@ Claude 데스크톱 앱의 Code 탭(로컬 세션)이나 Herdr 밖 터미널의 
    - 작업공간을 정할 때 기존 `gjc-herdr-mate`(종류 `agy`, 저장소 안 cwd)와 `gjc-herdr-critic`(종류 `codex`, 정확히 저장소 루트 cwd)의 정체와 같은 작업공간 여부를 먼저 한 번에 확인하며, 하나라도 어긋나거나 조회에 실패하면 어떤 pane도 만들거나 나누거나 옮기지 않고 즉시 중단(rc `1`)한다.
    - 기존 팀원이 없으면(`--spawn` 시) label로 작업공간을 찾거나 `--no-focus`로 새 작업공간을 만들고 label을 붙인다. 같은 label의 작업공간이 둘 이상이면 오류(`multiple workspaces found with label`)로 중단한다.
    - 배치는 한 탭 안 **왼쪽 `팀원(agy)` | 오른쪽 `검토(Codex)`(반반, 50:50)** 이다. `--layout`(및 `--spawn` 끝의 배치 보정)은 기존 pane을 임시 탭으로 옮기지 않으며, 두 pane이 같은 탭에 `팀원 | 검토` 좌우로 있을 때만 비율을 맞춘다(팀원만 있거나 Codex가 꺼져 있으면 아무것도 하지 않고 rc `0`). 단, 팀원 pane이 사라진 뒤 외부 `--spawn`이 새 팀원을 다시 만들 때는 예외로 기존 검토 pane을 반으로 나눠 새 팀원을 시작하고 검토를 임시 탭 경유로 오른쪽에 되돌려 `팀원 | 검토` 순서를 복구한다.
-   - 새 작업공간과 탭에는 사용자 플러그인에 의해 Sidebar가 자동으로 생길 수 있다.
+   - 새 작업공간과 탭에는 사용자 플러그인에 의해 Sidebar가 자동으로 생길 수 있다. Sidebar는 팀 스크립트가 쓰지 않는다. 닫을지는 사용자가 정한다(소유하지 않은 pane). 닫으면 `GJCH_EXTERNAL_LEAD=1 scripts/team-up.sh --layout`으로 비율을 다시 맞춘다.
 6. **권한과 샌드박스:** 데스크톱 세션에서 `herdr` 명령마다 권한 요청이 뜨면 사용자 승인 후 허용 규칙을 추가할 수 있다. Bash 샌드박스를 쓰면 herdr 소켓(`~/.config/herdr/herdr.sock`)을 `sandbox.network.allowUnixSockets`로 허용해야 한다. 둘 다 사용자 설정이므로 사용자 승인으로만 바꾼다.
 7. **한계와 세션 간 메시지:**
    - 외부 팀장은 팀원 화면을 텍스트(`herdr agent read`, `herdr pane read`)로만 읽는다.
    - `agy` 폴더 신뢰 창 같은 `blocked`에는 사용자가 Herdr에서 직접 답한다(명령·편집 확인창 위임은 §5와 동일).
+   - 사용자가 Herdr에서 팀 작업공간을 볼 때 검토 pane에 포커스가 가 있으면 `critic-send.sh`가 사용자 입력과 섞이지 않게 하려고 `대상 거부: … 상태=idle, focused=True`(rc `1`)를 출력하고 보내지 않는다. 사용자가 Herdr 포커스를 agy pane이나 다른 작업공간으로 옮긴 뒤 다시 실행한다(팀장은 사용자 포커스를 바꾸지 않는다).
    - 팀원 감시(백그라운드 루프)는 Herdr 안과 같은 명령을 쓴다.
    - 데스크톱 세션과 Herdr 안 Claude는 `SendMessage`/`ListAgents`(`/` 명령 `/list-agents`)로 서로 목록에 보이고 메시지를 주고받을 수 있다. 다른 세션의 메시지는 사용자 승인을 대신하지 않는다.
 
@@ -97,7 +98,7 @@ Claude 데스크톱 앱의 Code 탭(로컬 세션)이나 Herdr 밖 터미널의 
 2. 현 팀장이 `scripts/team-lead.sh release`를 실행한다.
 3. 새 팀장(외부 데스크톱 Code 탭 등)이 `scripts/team-lead.sh claim`을 실행한다(외부면 `GJCH_EXTERNAL_LEAD=1` 등 환경변수가 있어야 함). 또는 세션을 새로 시작해 SessionStart hook으로 확보한다. `scripts/team-lead.sh status`가 `mine`인지 확인한다.
 4. 옛 팀장(herdr 안)이 `scripts/team-up.sh`(기본 모드)를 실행한다. 잠금이 다른 세션에 있으므로 부팀장 이름(`gjc-herdr-deputy`)과 label(`GJCH 부팀장 · Claude`)로 바뀐다. 이후 부팀장은 팀원에게 입력하지 않는다.
-5. 시범 운영 중 부팀장과 팀장은 세션 간 메시지(`SendMessage`/`ListAgents`)로 소통한다.
+5. 부팀장이 있는 동안 부팀장과 팀장은 세션 간 메시지(`SendMessage`/`ListAgents`)로 소통한다.
 6. 부팀장이 빠질 때는 Claude를 `/exit`로 정상 종료한다. 그 pane을 닫는 것은 사용자 승인으로 한다. 이후 외부 팀장이 `GJCH_EXTERNAL_LEAD=1 scripts/team-up.sh --layout`으로 `팀원 | 검토` 비율을 맞춘다(남은 모양이 좌우 `팀원 | 검토`와 맞지 않으면 옮기지 않고 건너뛴다).
 
 - **되돌리기:** 외부 팀장이 `scripts/team-lead.sh release`를 실행하고, Herdr 안 Claude가 `scripts/team-up.sh`를 실행하면 잠금을 확보하고 팀장 이름(`gjc-herdr-lead`)과 label을 되찾는다.
@@ -162,7 +163,7 @@ GJC는 상시 팀원이 아니며, 플러그인 로드·token 표시·`/herdr-se
 1. **기동:** 팀장이 임시 탭(또는 임시 pane)을 `--no-focus`로 만들고 `gjc --mpreset opus5-codex56-pro`를 실행한다.
 2. **메시지 채널 (GJC 관측을 띄웠을 때 한정):**
    - **팀장 → GJC 관측 세션:** GJC는 Herdr 감지 agent가 아니라 상태 보고만 있어 `herdr agent prompt`가 `agent_not_ready`로 거절된다. `herdr pane get <pane-id>`에서 `tokens.gjc_herdr_session_id`를 확인해 `gjc sdk session send <session_id> --text "<요청>" --wait --timeout-ms 120000`으로 보낸다(읽기 전용 관찰은 `gjc sdk session tail <session_id> --json`). `endpoint_stale` 등으로 실패하면 재전송하지 않고 `GJC_SDK_BROKER_AUTOSTART=0 gjc sdk session list --attach-only --scope all`로 기존 broker에 해당 세션 ID가 등록돼 있는지 확인하며, 목록에 없으면 정상 종료(`/exit`) 후 다시 띄운다.
-   - **GJC 관측 세션 → 팀장 등 감지 에이전트:** 이 플러그인의 `/herdr-call` 또는 `herdr_agent_call`(대상 `gjc-herdr-lead` 등)을 써서 호출·회수한다. 입력 보호를 거치지 않는 bash의 `herdr agent prompt`·`herdr pane send-text`/`send-keys` 직접 호출은 하지 않는다.
+   - **GJC 관측 세션 → 팀장 등 감지 에이전트:** 이 플러그인의 `/herdr-call` 또는 `herdr_agent_call`(대상 `gjc-herdr-lead` 등)을 써서 호출·회수한다(외부 팀장 모드에서는 팀장이 Herdr agent가 아니므로 이 호출 경로가 없으며, 팀장이 `gjc sdk session tail <session_id> --json` 또는 `send --wait`의 응답으로 GJC의 답을 읽는다 — 런타임 미확인 추론). 입력 보호를 거치지 않는 bash의 `herdr agent prompt`·`herdr pane send-text`/`send-keys` 직접 호출은 하지 않는다.
    - **슬래시 명령:** `/rename` 등은 SDK 텍스트로 실행되지 않는다. 필요하면 사용자 승인 후 대상 pane의 idle·비포커스·빈 입력란을 먼저 확인하고 `herdr pane send-text <pane-id> "/명령"` + `herdr pane send-keys <pane-id> enter`를 쓴다(`pane` 명령은 pane ID만 받는다).
 3. **종료·정리:** 관측과 근거 수집이 끝나면 임시 GJC를 `/exit`로 정상 종료하고 팀장이 만든 임시 탭을 닫는다.
 
@@ -194,9 +195,9 @@ GJC는 상시 팀원이 아니며, 플러그인 로드·token 표시·`/herdr-se
 | `critic-send.sh`가 `/new` 직후 "대상 거부: … 상태=working" | `/new` 뒤 Codex의 일시적인 working을 준비 전에 본 옛 버전(#22 이전) 증상이다. 화면이 이미 새 빈 대화(`Context 100% left · 0 in · 0 out`)이고 idle/done이면 같은 명령을 다시 실행해도 `/new` 없이 보낸다(지시서는 아직 보내지 않은 상태). 현재 버전은 준비 한도 안에서 기다린다 |
 | `critic-send.sh`가 `/new` 뒤 "새 입력란 준비 확인 timeout" | `/new` 뒤 Codex가 30초 넘게 working이었다. 실측 1회는 Codex 경고 `MCP client for codex_apps failed to start: … timed out awaiting tools/list after 30s`와 함께였다(보통 1–4초). 지시서는 보내지 않았으므로, done/idle과 새 빈 대화를 확인한 뒤 다시 실행하면 `/new` 없이 보낸다 |
 | Codex `/new`가 "Where should the new conversation run?" 메뉴를 띄움 | `--disable worktrees` 없이 떠 있는 Codex다. `critic-send.sh`가 1번(현재 worktree) 선택에만 Enter를 보낸다. 없애려면 사용자 승인 후 그 Codex를 정상 종료하고 `scripts/team-up.sh --spawn`으로 다시 띄운다. `codex features disable`은 전역 영구 설정이라 쓰지 않는다 |
-| `critic-send.sh`가 "대상 거부" | critic의 cwd가 저장소 루트가 아니면 거부한다(예: 이전 버전이 만든 `../gjc-herdr-codex-work`의 critic). 사용자 승인 후 그 Codex를 정상 종료하고 `scripts/team-up.sh --spawn`으로 다시 띄운다 |
+| `critic-send.sh`가 "대상 거부" | critic의 cwd가 저장소 루트가 아니면 거부한다(예: 이전 버전이 만든 `../gjc-herdr-codex-work`의 critic). 사용자 승인 후 그 Codex를 정상 종료하고 `scripts/team-up.sh --spawn`으로 다시 띄운다. 출력이 `대상 거부: … 상태=idle, focused=True`이면 검토 pane에 포커스가 있어 사용자 입력과 섞이지 않게 거부한 것이다. 사용자가 Herdr 포커스를 agy pane이나 다른 작업공간으로 옮긴 뒤 다시 실행한다(팀장은 사용자 포커스를 바꾸지 않는다) |
 | `/clear` 뒤 팀장 이름(`gjc-herdr-lead`)이 사라짐 | 셸에서 실행한 Claude에 붙인 이름은 `/clear`로 세션 ID가 바뀌면 Herdr가 지운다. 이제 `clear` SessionStart hook이 팀장 이름·label만 다시 붙이며, 팀원·검토 pane은 새로 만들지 않는다. 복구되지 않으면 `scripts/team-up.sh`를 수동 실행해 이름·label을 되찾는다 |
-| 팀장·팀원·검토가 세로로 쌓이는 등 배치가 어긋남 | 팀 구성(`--spawn`·시작 훅)은 끝에 §2 배치 공식 기준으로 보정하지만, 팀원이 다른 탭인 등 조건이 안 맞으면 `team layout skipped: ...`만 남기고 옮기지 않는다. 팀장 pane에서 `scripts/team-up.sh --layout`을 실행한다. "nothing moved"면 이유(다른 탭·cwd·이름 없음)를 고친 뒤 다시 실행한다. "could not move ... back from temporary tab"이면 안내된 임시 탭의 pane을 수동으로 되돌린다 |
+| 팀장·팀원·검토가 세로로 쌓이는 등 배치가 어긋남 | 팀 구성(`--spawn`·시작 훅)은 끝에 §2 배치 공식 기준으로 보정하지만, 팀원이 다른 탭인 등 조건이 안 맞으면 `team layout skipped: ...`만 남기고 옮기지 않는다. 팀장 pane에서 `scripts/team-up.sh --layout`을 실행한다. "nothing moved"면 이유(다른 탭·cwd·이름 없음)를 고친 뒤 다시 실행한다. "could not move ... back from temporary tab"이면 안내된 임시 탭의 pane을 수동으로 되돌린다. 외부 팀장은 `GJCH_EXTERNAL_LEAD=1 scripts/team-up.sh --layout`으로 왼쪽 팀원·오른쪽 검토의 비율을 50:50으로 맞춘다(두 pane이 이 순서로 나란히 있지 않으면 옮기지 않는다. §2.1 5번 참조). |
 | agent 이름이 이미 사용 중 | 다른 pane이 점유 중이라 label을 건드리지 않음(의도된 동작). 이름은 pane 종료·교체 시 사라짐 |
 | sidebar에 모델·세션이 안 보임 | 플러그인 설치됨 ≠ 로드됨 ≠ 표시됨. 실행 중이던 GJC를 재시작하고 `herdr pane get <pane-id>`의 token을 확인, 이후 README "Sidebar 설정" |
 | `agent_not_ready` | 대상이 감지되지 않았거나 working/blocked. `team-up.sh --spawn`의 `agy` 기동에서는 `error.code == "agent_not_ready"`이고 해당 pane의 `agent_status`가 `blocked`일 때만 폴더 신뢰 창·질문 확인 안내를 내며, `working`·조회 실패 등은 일반 실패로 끝난다. 임시 GJC 관측 세션 대상은 위 §4 "GJC 관측 절차"의 SDK 경로를 쓴다 |
