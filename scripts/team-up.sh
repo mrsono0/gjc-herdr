@@ -11,6 +11,7 @@
 #   GJCH_MATE_MODEL은 팀원 agy 모델(기본 gemini-4-argon-high)이며, 영문자·숫자·점·밑줄·하이픈만 허용한다.
 #   GJCH_TEAM_CODEX=0은 Codex 생성을 끈다. Codex는 사용자 지시로 --yolo(샌드박스 없음)를 사용한다.
 #   --no-daemon은 공유 daemon 환경의 훅이 세션 ID를 다른 pane으로 보고하는 것을 막는다.
+#   -c 'tui.status_line=[...]'은 56칸 검토 pane에서 상태 줄이 잘리지 않게 사용자 설정을 바꾸지 않고 이 프로세스만 덮어쓴다.
 #   Codex는 저장소 루트에서 실행하며, 파일 수정은 먼저 팀장 허락을 받는다는 규칙(AGENTS.md·지시서)으로 지킨다.
 # 아무것도 덮어쓰지 않는다: 이미 다른 pane이 쓰는 이름은 건드리지 않고, 작업공간 label은 비었거나 폴더명(Herdr 기본값)일 때만 설정한다.
 set -u
@@ -548,7 +549,7 @@ for p in panes:
 		fi
 	fi
 	herdr pane rename "$pane" "$CRITIC_LABEL" >/dev/null || return 1
-	if ! herdr agent start "$CRITIC_NAME" --kind codex --pane "$pane" --timeout 60000 -- --no-daemon --yolo -m "$CODEX_MODEL" -C "$workdir" --disable worktrees; then
+	if ! herdr agent start "$CRITIC_NAME" --kind codex --pane "$pane" --timeout 60000 -- --no-daemon --yolo -m "$CODEX_MODEL" -C "$workdir" --disable worktrees -c 'tui.status_line=["context-remaining","total-input-tokens","total-output-tokens"]'; then
 		echo "Codex start failed for $pane" >&2
 		return 1
 	fi

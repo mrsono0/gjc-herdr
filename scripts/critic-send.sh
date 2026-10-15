@@ -115,7 +115,7 @@ if warning:
 hint_prefix=hint_line[:-1].rstrip() if hint_line.endswith("…") else hint_line
 guide_ok=bool(hint_prefix) and any(hint.startswith(hint_prefix) for hint in hints)
 hint_ok=len(footer)==1 or (len(footer)==2 and (guide_ok or (bool(warning) and not hint_prefix)) and (not warning or warning_ok))
-status=re.fullmatch(r".* · Context (\d+)% left(?: · (\d+(?:\.\d+)?[KM]?) (?:in( ·.*| …|…)?|i?…)| ·(?: ?…| \d+(?:\.\d*)?[KM]?…)| …|…)",footer[0]) if footer else None
+status=re.fullmatch(r"(?:.* · )?Context (\d+)% left(?: · (\d+(?:\.\d+)?[KM]?) (?:in( ·.*| …|…)?|i?…)| ·(?: ?…| \d+(?:\.\d*)?[KM]?…)| …|…)",footer[0]) if footer else None
 tail=(status.group(3) or "") if status else ""
 output=re.fullmatch(r" · (\d+(?:\.\d+)?[KM]?) out",tail)
 clipped=re.fullmatch(r"(?: ·(?: ?…| \d+(?:\.\d*)?[KM]?(?: (?:o|ou|out)?)?…)| …|…)",tail)
