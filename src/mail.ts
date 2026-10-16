@@ -7,6 +7,7 @@ import {
 	open as nodeOpen,
 	readdir as nodeReaddir,
 	realpath as nodeRealpath,
+	rename as nodeRename,
 	unlink as nodeUnlink,
 } from "node:fs/promises";
 import { posix } from "node:path";
@@ -97,6 +98,7 @@ export interface MailFs {
 	link(existingPath: string, newPath: string): Promise<void>;
 	unlink(path: string): Promise<void>;
 	readdir?(path: string): Promise<string[]>;
+	rename?(oldPath: string, newPath: string): Promise<void>;
 }
 
 export interface MailDeps {
@@ -182,6 +184,7 @@ export const defaultMailFs: MailFs = {
 	link: (existingPath, newPath) => nodeLink(existingPath, newPath),
 	unlink: (path) => nodeUnlink(path),
 	readdir: (path) => nodeReaddir(path),
+	rename: (oldPath, newPath) => nodeRename(oldPath, newPath),
 };
 
 const defaultFs: MailFs = defaultMailFs;
@@ -1246,19 +1249,27 @@ export interface MailboxBoundary {
 	warnings: MailWarning[];
 }
 
-/**
- * §2 Resolves the Git top-level, verifies `.gjc-herdr/mailbox` is ignored and has
- * zero tracked files, checks every path element for symlinks and `realpath`
- * containment, and creates missing directories with mode 0700 (warning if an
- * existing directory has a mode other than 0700).
- */
-export async function prepareMailboxWriteBoundary(
+export type ReadBoundaryOutcome =
+	| { ok: true; exists: boolean; boundary: MailboxBoundary }
+	| { ok: false; error: MailError; warnings: MailWarning[] };
+
+async function resolveMailboxGitAndRealTop(
 	deps: MailDeps,
 	recipient: string,
-	pathsToWrite: readonly string[],
+	pathsToIgnore: readonly string[],
+	warnings: MailWarning[],
 	signal?: AbortSignal,
-): Promise<{ ok: true; boundary: MailboxBoundary } | { ok: false; error: MailError; warnings: MailWarning[] }> {
-	const warnings: MailWarning[] = [];
+): Promise<
+	| {
+			ok: true;
+			topLevel: string;
+			realTopLevel: string;
+			dotDir: string;
+			mailboxRoot: string;
+			recipientDir: string;
+	  }
+	| { ok: false; error: MailError; warnings: MailWarning[] }
+> {
 	const fsOps = deps.fs ?? defaultFs;
 
 	if (signal?.aborted) {
@@ -1336,7 +1347,7 @@ export async function prepareMailboxWriteBoundary(
 
 	const ignoreTargets = [
 		mailboxRoot,
-		...pathsToWrite.map((relOrAbs) =>
+		...pathsToIgnore.map((relOrAbs) =>
 			relOrAbs.startsWith("/") ? relOrAbs : posix.join(recipientDir, relOrAbs),
 		),
 	];
@@ -1397,6 +1408,44 @@ export async function prepareMailboxWriteBoundary(
 	if (signal?.aborted) {
 		return { ok: false, warnings, error: abortedError() };
 	}
+
+	return {
+		ok: true,
+		topLevel,
+		realTopLevel,
+		dotDir,
+		mailboxRoot,
+		recipientDir,
+	};
+}
+
+/**
+ * §2 Resolves the Git top-level, verifies `.gjc-herdr/mailbox` is ignored and has
+ * zero tracked files, checks every path element for symlinks and `realpath`
+ * containment, and creates missing directories with mode 0700 (warning if an
+ * existing directory has a mode other than 0700).
+ */
+export async function prepareMailboxWriteBoundary(
+	deps: MailDeps,
+	recipient: string,
+	pathsToWrite: readonly string[],
+	signal?: AbortSignal,
+): Promise<
+	| { ok: true; boundary: MailboxBoundary }
+	| { ok: false; error: MailError; warnings: MailWarning[] }
+> {
+	const warnings: MailWarning[] = [];
+	const fsOps = deps.fs ?? defaultFs;
+	const resolved = await resolveMailboxGitAndRealTop(
+		deps,
+		recipient,
+		pathsToWrite,
+		warnings,
+		signal,
+	);
+	if (!resolved.ok) return resolved;
+	const { topLevel, realTopLevel, dotDir, mailboxRoot, recipientDir } =
+		resolved;
 
 	for (const dir of [dotDir, mailboxRoot, recipientDir]) {
 		if (signal?.aborted) {
@@ -1526,6 +1575,145 @@ export async function prepareMailboxWriteBoundary(
 
 	return {
 		ok: true,
+		boundary: {
+			topLevel,
+			realTopLevel,
+			mailboxRoot,
+			recipientDir,
+			warnings,
+		},
+	};
+}
+
+/**
+ * §2 + §6 Read-only mailbox boundary inspection for `mail-watch.sh`.
+ * Performs the same Git top-level, `-C`, tracked-file, ignore, symlink, and
+ * `realpath` containment checks as `prepareMailboxWriteBoundary`, but never
+ * creates directories. Missing `.gjc-herdr`, `.gjc-herdr/mailbox`, or
+ * `<recipient>` (`ENOENT`) yields `{ ok: true, exists: false, boundary }`.
+ */
+export async function inspectMailboxReadBoundary(
+	deps: MailDeps,
+	recipient: string,
+	signal?: AbortSignal,
+): Promise<ReadBoundaryOutcome> {
+	const warnings: MailWarning[] = [];
+	const fsOps = deps.fs ?? defaultFs;
+	const resolved = await resolveMailboxGitAndRealTop(
+		deps,
+		recipient,
+		[""],
+		warnings,
+		signal,
+	);
+	if (!resolved.ok) return resolved;
+	const { topLevel, realTopLevel, dotDir, mailboxRoot, recipientDir } =
+		resolved;
+
+	for (const dir of [dotDir, mailboxRoot, recipientDir]) {
+		if (signal?.aborted) {
+			return { ok: false, warnings, error: abortedError() };
+		}
+		let stat: MailStat;
+		try {
+			stat = await fsOps.lstat(dir);
+		} catch (error) {
+			if (signal?.aborted) {
+				return { ok: false, warnings, error: abortedError() };
+			}
+			if (isMissingPath(error)) {
+				return {
+					ok: true,
+					exists: false,
+					boundary: {
+						topLevel,
+						realTopLevel,
+						mailboxRoot,
+						recipientDir,
+						warnings,
+					},
+				};
+			}
+			return {
+				ok: false,
+				warnings,
+				error: {
+					code: "path_boundary_failed",
+					message: `Cannot inspect path element ${dir}: ${errorMessage(error)}`,
+					...(errorCode(error) ? { causeCode: errorCode(error) } : {}),
+				},
+			};
+		}
+		if (signal?.aborted) {
+			return { ok: false, warnings, error: abortedError() };
+		}
+
+		if (stat.isSymbolicLink()) {
+			return {
+				ok: false,
+				warnings,
+				error: {
+					code: "symlink_rejected",
+					message: `Symlink is not permitted in mailbox path: ${dir}`,
+				},
+			};
+		}
+		if (!stat.isDirectory()) {
+			return {
+				ok: false,
+				warnings,
+				error: {
+					code: "not_a_directory",
+					message: `Mailbox path element is not a directory: ${dir}`,
+				},
+			};
+		}
+		if (
+			typeof stat.mode === "number" &&
+			(stat.mode & 0o777) !== MAIL_DIR_MODE
+		) {
+			warnings.push({
+				code: "dir_mode_not_0700",
+				path: dir,
+				message: `Directory ${dir} has mode 0${(stat.mode & 0o777).toString(8)} instead of 0700.`,
+			});
+		}
+
+		let realDir: string;
+		try {
+			realDir = await fsOps.realpath(dir);
+		} catch (error) {
+			if (signal?.aborted) {
+				return { ok: false, warnings, error: abortedError() };
+			}
+			return {
+				ok: false,
+				warnings,
+				error: {
+					code: "path_boundary_failed",
+					message: `Cannot resolve realpath of ${dir}: ${errorMessage(error)}`,
+					...(errorCode(error) ? { causeCode: errorCode(error) } : {}),
+				},
+			};
+		}
+		if (signal?.aborted) {
+			return { ok: false, warnings, error: abortedError() };
+		}
+		if (!isInsideRepo(realDir, realTopLevel)) {
+			return {
+				ok: false,
+				warnings,
+				error: {
+					code: "outside_repo",
+					message: `Resolved path ${realDir} escapes repository root ${realTopLevel}.`,
+				},
+			};
+		}
+	}
+
+	return {
+		ok: true,
+		exists: true,
 		boundary: {
 			topLevel,
 			realTopLevel,
@@ -1713,19 +1901,13 @@ export type PublishOutcome =
 	| { ok: true; path: string; warnings: MailWarning[] }
 	| { ok: false; error: MailError; warnings: MailWarning[] };
 
-/**
- * §3.2 Exclusive publication via temp file (`O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW|O_NONBLOCK`, 0600) +
- * `fstat` + `write` + `fsync` + `close` + `link(tmp, final)` + `unlink(tmp)`. Never uses `rename` or a fallback.
- */
-export async function publishExclusiveFile(
+async function writeAndSyncExclusiveTmpFile(
 	fsOps: MailFs,
 	tmpPath: string,
-	finalPath: string,
 	bytes: Uint8Array,
-	initialWarnings: readonly MailWarning[] = [],
+	warnings: MailWarning[],
 	signal?: AbortSignal,
-): Promise<PublishOutcome> {
-	const warnings = [...initialWarnings];
+): Promise<{ ok: true } | { ok: false; error: MailError; warnings: MailWarning[] }> {
 	const openFlags = resolveCreateTmpFlags(fsOps.constants);
 	if (openFlags === undefined) {
 		return {
@@ -1770,24 +1952,24 @@ export async function publishExclusiveFile(
 	}
 
 	let closed = false;
-	const cleanupBeforeLink = async (): Promise<void> => {
+	const cleanupTmp = async (): Promise<void> => {
 		if (!closed) {
 			closed = true;
 			try {
 				await handle.close();
 			} catch {
-				// Ignore close error during pre-link cleanup.
+				// Ignore close error during pre-publication cleanup.
 			}
 		}
 		try {
 			await fsOps.unlink(tmpPath);
 		} catch {
-			// Best-effort cleanup of own temporary file before link.
+			// Best-effort cleanup of own temporary file before publication.
 		}
 	};
 
 	if (signal?.aborted) {
-		await cleanupBeforeLink();
+		await cleanupTmp();
 		return {
 			ok: false,
 			warnings,
@@ -1798,7 +1980,7 @@ export async function publishExclusiveFile(
 	try {
 		const stat = await handle.stat();
 		if (signal?.aborted) {
-			await cleanupBeforeLink();
+			await cleanupTmp();
 			return {
 				ok: false,
 				warnings,
@@ -1809,7 +1991,7 @@ export async function publishExclusiveFile(
 			(typeof stat.isSymbolicLink === "function" && stat.isSymbolicLink()) ||
 			!stat.isFile()
 		) {
-			await cleanupBeforeLink();
+			await cleanupTmp();
 			return {
 				ok: false,
 				warnings,
@@ -1823,7 +2005,7 @@ export async function publishExclusiveFile(
 		let offset = 0;
 		while (offset < bytes.byteLength) {
 			if (signal?.aborted) {
-				await cleanupBeforeLink();
+				await cleanupTmp();
 				return {
 					ok: false,
 					warnings,
@@ -1837,7 +2019,7 @@ export async function publishExclusiveFile(
 				offset,
 			);
 			if (signal?.aborted) {
-				await cleanupBeforeLink();
+				await cleanupTmp();
 				return {
 					ok: false,
 					warnings,
@@ -1852,7 +2034,7 @@ export async function publishExclusiveFile(
 			offset += written;
 		}
 		if (signal?.aborted) {
-			await cleanupBeforeLink();
+			await cleanupTmp();
 			return {
 				ok: false,
 				warnings,
@@ -1861,7 +2043,7 @@ export async function publishExclusiveFile(
 		}
 		await handle.sync();
 		if (signal?.aborted) {
-			await cleanupBeforeLink();
+			await cleanupTmp();
 			return {
 				ok: false,
 				warnings,
@@ -1871,7 +2053,7 @@ export async function publishExclusiveFile(
 		await handle.close();
 		closed = true;
 		if (signal?.aborted) {
-			await cleanupBeforeLink();
+			await cleanupTmp();
 			return {
 				ok: false,
 				warnings,
@@ -1879,7 +2061,7 @@ export async function publishExclusiveFile(
 			};
 		}
 	} catch (error) {
-		await cleanupBeforeLink();
+		await cleanupTmp();
 		if (signal?.aborted) {
 			return {
 				ok: false,
@@ -1898,6 +2080,31 @@ export async function publishExclusiveFile(
 			},
 		};
 	}
+
+	return { ok: true };
+}
+
+/**
+ * §3.2 Exclusive publication via temp file (`O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW|O_NONBLOCK`, 0600) +
+ * `fstat` + `write` + `fsync` + `close` + `link(tmp, final)` + `unlink(tmp)`. Never uses `rename` or a fallback.
+ */
+export async function publishExclusiveFile(
+	fsOps: MailFs,
+	tmpPath: string,
+	finalPath: string,
+	bytes: Uint8Array,
+	initialWarnings: readonly MailWarning[] = [],
+	signal?: AbortSignal,
+): Promise<PublishOutcome> {
+	const warnings = [...initialWarnings];
+	const tmpRes = await writeAndSyncExclusiveTmpFile(
+		fsOps,
+		tmpPath,
+		bytes,
+		warnings,
+		signal,
+	);
+	if (!tmpRes.ok) return tmpRes;
 
 	try {
 		await fsOps.link(tmpPath, finalPath);
@@ -1938,6 +2145,105 @@ export async function publishExclusiveFile(
 			path: tmpPath,
 			message: `Published ${finalPath}, but failed to remove temporary file ${tmpPath}: ${errorMessage(error)}`,
 		});
+	}
+
+	return {
+		ok: true,
+		path: finalPath,
+		warnings,
+	};
+}
+
+/**
+ * §3.3 / §6 Replaces an `uncertain` ack with a terminal (`received` or `rejected`) ack.
+ * Writes and fsyncs an exclusive temporary file in the same directory, re-opens and
+ * re-validates `finalPath` right before replacement to confirm it is still a valid
+ * `uncertain` ack, and then atomically replaces it with `rename(tmpPath, finalPath)`.
+ */
+export async function replaceUncertainAckFile(
+	fsOps: MailFs,
+	tmpPath: string,
+	finalPath: string,
+	bytes: Uint8Array,
+	verifyOptions?: ValidateAckOptions,
+	initialWarnings: readonly MailWarning[] = [],
+	signal?: AbortSignal,
+): Promise<PublishOutcome> {
+	const warnings = [...initialWarnings];
+	if (typeof fsOps.rename !== "function") {
+		return {
+			ok: false,
+			warnings,
+			error: {
+				code: "unsupported_platform",
+				message: "fs.rename is unavailable on this MailFs implementation.",
+			},
+		};
+	}
+
+	const tmpRes = await writeAndSyncExclusiveTmpFile(
+		fsOps,
+		tmpPath,
+		bytes,
+		warnings,
+		signal,
+	);
+	if (!tmpRes.ok) return tmpRes;
+
+	const cleanupTmp = async (): Promise<void> => {
+		try {
+			await fsOps.unlink(tmpPath);
+		} catch {
+			// Best-effort cleanup of own temporary file before rename.
+		}
+	};
+
+	const currentAck = await readMailAckFile(fsOps, finalPath, verifyOptions);
+	if (!currentAck.ok) {
+		await cleanupTmp();
+		return {
+			ok: false,
+			warnings,
+			error: {
+				code: currentAck.code,
+				message: `Pre-rename recheck of ${finalPath} failed: ${currentAck.reason}`,
+			},
+		};
+	}
+	if (currentAck.value.state !== "uncertain") {
+		await cleanupTmp();
+		return {
+			ok: false,
+			warnings,
+			error: {
+				code: "ack_not_uncertain",
+				message: `Cannot overwrite ack ${finalPath} with state '${currentAck.value.state}' (expected 'uncertain').`,
+			},
+		};
+	}
+	if (signal?.aborted) {
+		await cleanupTmp();
+		return {
+			ok: false,
+			warnings,
+			error: abortedError(),
+		};
+	}
+
+	try {
+		await fsOps.rename(tmpPath, finalPath);
+	} catch (error) {
+		await cleanupTmp();
+		const causeCode = errorCode(error);
+		return {
+			ok: false,
+			warnings,
+			error: {
+				code: "publish_failed",
+				message: `Failed to replace uncertain ack ${finalPath}${causeCode ? ` (${causeCode})` : ""}: ${errorMessage(error)}`,
+				...(causeCode ? { causeCode } : {}),
+			},
+		};
 	}
 
 	return {

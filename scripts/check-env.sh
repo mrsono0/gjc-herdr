@@ -49,6 +49,28 @@ grep -q 'team-up.sh --hook' "$ROOT/.claude/settings.json" 2>/dev/null \
 	&& ok ".claude/settings.json SessionStart hook 있음" || bad ".claude/settings.json에 team-up hook 없음"
 [ -f "$ROOT/dist/extension.js" ] && ok "dist/extension.js 있음" || bad "dist/extension.js 없음"
 [ -d "$ROOT/node_modules" ] && ok "node_modules 있음" || warn "node_modules 없음 → npm ci --ignore-scripts --no-audit --no-fund (개발·테스트 시)"
+if command -v git >/dev/null; then
+	ls_out=""
+	ls_rc=0
+	ls_out="$(git -C "$ROOT" ls-files -- .gjc-herdr 2>/dev/null)" || ls_rc=$?
+	if [ "$ls_rc" -ne 0 ]; then
+		warn ".gjc-herdr git ls-files 확인 실패 (exit $ls_rc)"
+	elif [ -n "$ls_out" ]; then
+		bad ".gjc-herdr 아래에 git 추적 파일이 있음"
+	else
+		ci_rc=0
+		git -C "$ROOT" check-ignore -q .gjc-herdr/mailbox 2>/dev/null || ci_rc=$?
+		if [ "$ci_rc" -eq 0 ]; then
+			ok ".gjc-herdr/mailbox gitignore 설정됨"
+		elif [ "$ci_rc" -eq 1 ]; then
+			warn "우편함을 쓰려면 .gitignore에 /.gjc-herdr/를 더한다"
+		else
+			warn ".gjc-herdr/mailbox git check-ignore 확인 실패 (exit $ci_rc)"
+		fi
+	fi
+else
+	warn "git 없음 (.gjc-herdr 우편함 경계 확인 생략)"
+fi
 
 # --- GJC 플러그인 설치 상태 ---
 if command -v gjc >/dev/null; then

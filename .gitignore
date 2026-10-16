@@ -5,6 +5,7 @@
 
 # Private workflow, verification, backups and legacy experiments
 /.gjc/
+/.gjc-herdr/
 /.local/
 /backups/
 /e2e-results/
