@@ -1,4 +1,10 @@
 import { randomUUID } from "node:crypto";
+import {
+	constants as fsConstants,
+	lstat as nodeLstat,
+	open as nodeOpen,
+} from "node:fs/promises";
+import { isAbsolute } from "node:path";
 import type { ExtensionAPI, ExecResult } from "@gajae-code/coding-agent";
 import { classifyInput, inputWaitMs, waitForEmptyInput } from "./input.ts";
 
@@ -15,12 +21,47 @@ const READ_RESERVE_MS = 3_000;
 const READ_LINES = "200";
 const POLL_INTERVAL_MS = 2_000;
 const MIN_RECHECK_MS = 1_000;
+const MAX_RESULT_FILE_BYTES = 1_024 * 1_024;
+const RESULT_FILE_OPEN_FLAGS =
+	fsConstants.O_RDONLY |
+	(fsConstants.O_NOFOLLOW ?? 0) |
+	(fsConstants.O_NONBLOCK ?? 0);
 
-export const USAGE = "Usage: /herdr-call <pane-id-or-unique-agent-name> <text>";
+export const USAGE =
+	"Usage: /herdr-call [--result-file <abs-path>] <pane-id-or-unique-agent-name> <text>";
 
 export interface AgentCallRequest {
 	target: string;
 	text: string;
+	resultFile?: string;
+	result_file?: string;
+}
+
+export interface ResultFileStat {
+	isFile(): boolean;
+	nlink: number;
+	size: number;
+}
+
+export interface ResultFileReadResult {
+	bytesRead: number;
+	buffer: Uint8Array;
+}
+
+export interface ResultFileHandle {
+	stat(): Promise<ResultFileStat>;
+	read(
+		buffer: Uint8Array,
+		offset: number,
+		length: number,
+		position: number | null,
+	): Promise<ResultFileReadResult>;
+	close(): Promise<void>;
+}
+
+export interface ResultFileFs {
+	lstat(path: string): Promise<unknown>;
+	open(path: string, flags: number): Promise<ResultFileHandle>;
 }
 
 export interface AgentCallDeps {
@@ -33,6 +74,8 @@ export interface AgentCallDeps {
 	now?: () => number;
 	/** Max wait for a typed-in input box; defaults to GJC_HERDR_INPUT_WAIT_SEC (60 s). */
 	inputWaitMs?: number;
+	/** Test seam for `--result-file` / `result_file` inspection and recovery; defaults to `node:fs/promises`. */
+	fs?: ResultFileFs;
 }
 
 export interface PreflightAgent {
@@ -66,6 +109,8 @@ export interface AgentCallResult {
 	state?: string;
 	answer?: string;
 	capture?: string;
+	resultFile?: string;
+	markerVerified?: boolean;
 	error?: {
 		code: string;
 		message: string;
@@ -77,6 +122,11 @@ export interface AgentCallResult {
 	waitedMs?: number;
 }
 
+const defaultFs: ResultFileFs = {
+	lstat: (path) => nodeLstat(path),
+	open: (path, flags) => nodeOpen(path, flags),
+};
+
 class CallFailure extends Error {
 	constructor(
 		readonly partial: {
@@ -85,7 +135,7 @@ class CallFailure extends Error {
 			pane?: string;
 			state?: string;
 			capture?: string;
-		error: NonNullable<AgentCallResult["error"]>;
+			error: NonNullable<AgentCallResult["error"]>;
 		},
 	) {
 		super(partial.error.message);
@@ -409,6 +459,172 @@ function markerInstruction(requestId: string): string {
 	);
 }
 
+function resultFileInstruction(requestId: string, resultFile: string): string {
+	return (
+		`\n\nWrite your complete final answer as a new file at ${resultFile}, ` +
+		`and reply on screen with only three lines: the exact token GJC_HERDR_BEGIN_${requestId} ` +
+		`on the first line, ${resultFile} on the second line, and GJC_HERDR_END_${requestId} on the last line.`
+	);
+}
+
+function isMissingPath(error: unknown): boolean {
+	if (isMissingExecutable(error)) return true;
+	return error instanceof Error && /\bENOENT\b/.test(error.message);
+}
+
+async function checkResultFileAbsent(
+	fsOps: ResultFileFs,
+	resultFile: string,
+): Promise<string | undefined> {
+	try {
+		await fsOps.lstat(resultFile);
+		return `result_file already exists at ${resultFile}; use a new path for each call.`;
+	} catch (error) {
+		if (isMissingPath(error)) return undefined;
+		return `Cannot inspect result_file ${resultFile}: ${errorMessage(error)}`;
+	}
+}
+
+type RecoveredResultFile =
+	| { ok: true; answer: string }
+	| {
+			ok: false;
+			code: "aborted" | "result_file_missing" | "result_file_invalid";
+			message: string;
+	  };
+
+function abortedResultFile(): RecoveredResultFile {
+	return {
+		ok: false,
+		code: "aborted",
+		message: "Answer read aborted; the prompt was already delivered.",
+	};
+}
+
+async function recoverResultFile(
+	fsOps: ResultFileFs,
+	resultFile: string,
+	signal?: AbortSignal,
+): Promise<RecoveredResultFile> {
+	if (signal?.aborted) return abortedResultFile();
+	let handle: ResultFileHandle;
+	try {
+		handle = await fsOps.open(resultFile, RESULT_FILE_OPEN_FLAGS);
+	} catch (error) {
+		if (signal?.aborted) return abortedResultFile();
+		if (isMissingPath(error)) {
+			return {
+				ok: false,
+				code: "result_file_missing",
+				message: `Result file was not created at ${resultFile}.`,
+			};
+		}
+		return {
+			ok: false,
+			code: "result_file_invalid",
+			message: `Result file at ${resultFile} could not be opened: ${errorMessage(error)}`,
+		};
+	}
+	try {
+		if (signal?.aborted) return abortedResultFile();
+		let stat: ResultFileStat;
+		try {
+			stat = await handle.stat();
+		} catch (error) {
+			if (signal?.aborted) return abortedResultFile();
+			return {
+				ok: false,
+				code: "result_file_invalid",
+				message: `Result file at ${resultFile} could not be inspected: ${errorMessage(error)}`,
+			};
+		}
+		if (signal?.aborted) return abortedResultFile();
+		if (!stat.isFile()) {
+			return {
+				ok: false,
+				code: "result_file_invalid",
+				message: `Result file at ${resultFile} is not a regular file.`,
+			};
+		}
+		if (stat.nlink !== 1) {
+			return {
+				ok: false,
+				code: "result_file_invalid",
+				message: `Result file at ${resultFile} must have link count 1 (got ${stat.nlink}).`,
+			};
+		}
+		if (stat.size <= 0 || stat.size > MAX_RESULT_FILE_BYTES) {
+			return {
+				ok: false,
+				code: "result_file_invalid",
+				message:
+					stat.size <= 0
+						? `Result file at ${resultFile} is empty.`
+						: `Result file at ${resultFile} exceeds the 1 MiB limit (${stat.size} bytes).`,
+			};
+		}
+		const maxReadBytes = MAX_RESULT_FILE_BYTES + 1;
+		const buffer = new Uint8Array(maxReadBytes);
+		let totalBytes = 0;
+		try {
+			while (totalBytes < maxReadBytes) {
+				const { bytesRead, buffer: chunkBuffer } = await handle.read(
+					buffer,
+					totalBytes,
+					maxReadBytes - totalBytes,
+					totalBytes,
+				);
+				if (signal?.aborted) return abortedResultFile();
+				if (bytesRead <= 0) break;
+				if (chunkBuffer && chunkBuffer !== buffer) {
+					const copyLen = Math.min(bytesRead, maxReadBytes - totalBytes);
+					buffer.set(chunkBuffer.subarray(0, copyLen), totalBytes);
+				}
+				totalBytes += bytesRead;
+			}
+		} catch (error) {
+			if (signal?.aborted) return abortedResultFile();
+			return {
+				ok: false,
+				code: "result_file_invalid",
+				message: `Result file at ${resultFile} could not be read: ${errorMessage(error)}`,
+			};
+		}
+		if (signal?.aborted) return abortedResultFile();
+		if (totalBytes <= 0 || totalBytes > MAX_RESULT_FILE_BYTES) {
+			return {
+				ok: false,
+				code: "result_file_invalid",
+				message:
+					totalBytes <= 0
+						? `Result file at ${resultFile} is empty.`
+						: `Result file at ${resultFile} exceeds the 1 MiB limit (${totalBytes} bytes).`,
+			};
+		}
+		let answer: string;
+		try {
+			answer = new TextDecoder("utf-8", { fatal: true }).decode(
+				buffer.subarray(0, totalBytes),
+			);
+		} catch (error) {
+			if (signal?.aborted) return abortedResultFile();
+			return {
+				ok: false,
+				code: "result_file_invalid",
+				message: `Result file at ${resultFile} is not valid UTF-8: ${errorMessage(error)}`,
+			};
+		}
+		if (signal?.aborted) return abortedResultFile();
+		return { ok: true, answer };
+	} finally {
+		try {
+			await handle.close();
+		} catch {
+			// Ignore close errors so the primary recovery verdict is preserved.
+		}
+	}
+}
+
 /**
  * Extracts the answer between the anchored marker lines for this request.
  * Exactly one ordered pair with non-empty body qualifies; anything else is
@@ -558,6 +774,7 @@ export async function callRegisteredAgent(
 	let deadline = startedAt + CALL_BUDGET_MS;
 	let waitedMs = 0;
 	const requestId = randomUUID();
+	const rawResultFile = request.resultFile ?? request.result_file;
 	const finish = (
 		partial: Partial<AgentCallResult> & { status: AgentCallStatus; delivery: DeliveryCertainty },
 	): AgentCallResult => ({
@@ -565,6 +782,7 @@ export async function callRegisteredAgent(
 		requestId,
 		elapsedMs: now() - startedAt,
 		...(waitedMs > 0 ? { waitedMs } : {}),
+		...(rawResultFile !== undefined ? { resultFile: rawResultFile } : {}),
 		...partial,
 	});
 
@@ -593,12 +811,52 @@ export async function callRegisteredAgent(
 			error: { code: "invalid_request", message: "Prompt text must not be empty." },
 		});
 	}
+	if (
+		rawResultFile !== undefined &&
+		(!rawResultFile ||
+			!rawResultFile.trim() ||
+			rawResultFile !== rawResultFile.trim() ||
+			/[\0\r\n]/.test(rawResultFile) ||
+			!isAbsolute(rawResultFile))
+	) {
+		return finish({
+			status: "not_sent",
+			delivery: "not_sent",
+			error: {
+				code: "invalid_request",
+				message:
+					"result_file must be a non-empty absolute path without NUL or newline characters.",
+			},
+		});
+	}
 	if (signal?.aborted) {
 		return finish({
 			status: "not_sent",
 			delivery: "not_sent",
 			error: { code: "aborted", message: "Call aborted before delivery." },
 		});
+	}
+
+	const fsOps = deps.fs ?? defaultFs;
+	if (rawResultFile !== undefined) {
+		const fileConflict = await checkResultFileAbsent(fsOps, rawResultFile);
+		if (signal?.aborted) {
+			return finish({
+				status: "not_sent",
+				delivery: "not_sent",
+				error: { code: "aborted", message: "Call aborted before delivery." },
+			});
+		}
+		if (fileConflict !== undefined) {
+			return finish({
+				status: "not_sent",
+				delivery: "not_sent",
+				error: {
+					code: "invalid_request",
+					message: fileConflict,
+				},
+			});
+		}
 	}
 
 	try {
@@ -858,6 +1116,31 @@ export async function callRegisteredAgent(
 				return finishUnready(preflight.state, focusedUnknown);
 			}
 
+			if (rawResultFile !== undefined) {
+				const fileConflict = await checkResultFileAbsent(fsOps, rawResultFile);
+				if (signal?.aborted) {
+					return finish({
+						status: "not_sent",
+						delivery: "not_sent",
+						pane: paneId,
+						state: preflight.state,
+						error: { code: "aborted", message: "Call aborted before delivery." },
+					});
+				}
+				if (fileConflict !== undefined) {
+					return finish({
+						status: "not_sent",
+						delivery: "not_sent",
+						pane: paneId,
+						state: preflight.state,
+						error: {
+							code: "invalid_request",
+							message: fileConflict,
+						},
+					});
+				}
+			}
+
 			const promptBudget = Math.floor(deadline - now() - READ_RESERVE_MS);
 			if (promptBudget <= 0) {
 				return finish({
@@ -872,7 +1155,10 @@ export async function callRegisteredAgent(
 				});
 			}
 			const patchedText =
-				request.text + markerInstruction(requestId);
+				request.text +
+				(rawResultFile !== undefined
+					? resultFileInstruction(requestId, rawResultFile)
+					: markerInstruction(requestId));
 			const promptArgs = [
 				"agent",
 				"prompt",
@@ -953,6 +1239,92 @@ export async function callRegisteredAgent(
 						message: "Prompt settled but no read budget remained.",
 					},
 				});
+			}
+			if (rawResultFile !== undefined) {
+				let capture: string | undefined;
+				let screenError: string | undefined;
+				let screenErrorMeta: { herdrCode?: string; exitCode?: number } | undefined;
+				try {
+					const read = await runHerdr(
+						deps,
+						["agent", "read", paneId, "--source", "recent-unwrapped", "--lines", READ_LINES],
+						Math.min(READ_TIMEOUT_MS, readRemaining),
+						signal,
+						"read",
+					);
+					if (read.code === 0) {
+						capture = read.stdout;
+					} else {
+						const error = stderrEnvelope(read);
+						const detail =
+							typeof error?.message === "string"
+								? error.message
+								: read.stderr.trim() || `exit ${read.code}`;
+						screenError = `screen read failed: ${detail}`;
+						screenErrorMeta = {
+							herdrCode: typeof error?.code === "string" ? error.code : undefined,
+							exitCode: read.code,
+						};
+					}
+				} catch (error) {
+					if (
+						signal?.aborted ||
+						(error instanceof CallFailure && error.partial.error.code === "aborted")
+					) {
+						throw error;
+					}
+					const detail =
+						error instanceof CallFailure
+							? error.partial.error.message
+							: errorMessage(error);
+					screenError = `screen read failed: ${detail}`;
+				}
+				const marked =
+					capture !== undefined ? extractMarkedAnswer(capture, requestId) : undefined;
+				const markerVerified =
+					marked !== undefined && marked.trim() === rawResultFile;
+				const recovered = await recoverResultFile(fsOps, rawResultFile, signal);
+				if (signal?.aborted || (!recovered.ok && recovered.code === "aborted")) {
+					return finish({
+						status: "read_failed",
+						delivery: "submitted",
+						pane: paneId,
+						state: settled,
+						error: {
+							code: "aborted",
+							message: "Answer read aborted; the prompt was already delivered.",
+						},
+					});
+				}
+				if (!recovered.ok) {
+					return finish({
+						status: "response_unverified",
+						delivery: "submitted",
+						pane: paneId,
+						state: settled,
+						...(capture !== undefined ? { capture } : {}),
+						error: {
+							code: recovered.code,
+							message: screenError
+								? `${recovered.message} (${screenError})`
+								: recovered.message,
+							...screenErrorMeta,
+						},
+					});
+				}
+				return {
+					ok: true,
+					status: "answered",
+					delivery: "submitted",
+					requestId,
+					pane: paneId,
+					state: settled,
+					answer: recovered.answer,
+					resultFile: rawResultFile,
+					markerVerified,
+					elapsedMs: now() - startedAt,
+					...(waitedMs > 0 ? { waitedMs } : {}),
+				};
 			}
 			const read = await runHerdr(
 				deps,
@@ -1037,17 +1409,31 @@ export async function callRegisteredAgent(
 	}
 }
 
-/** Parses `<target> <text>`; everything after the target's single separator is kept verbatim. */
+/** Parses `[--result-file <abs-path>] <target> <text>`; everything after the target's single separator is kept verbatim. */
 export function parseCallCommandArgs(args: string): AgentCallRequest | string {
-	const rest = args.replace(/^\s+/, "");
-	if (rest.startsWith("-")) return USAGE;
+	let rest = args.replace(/^\s+/, "");
+	let resultFile: string | undefined;
+	while (rest.startsWith("-")) {
+		const [flag] = rest.split(/\s/, 1);
+		if (flag !== "--result-file" || resultFile !== undefined) return USAGE;
+		rest = rest.slice(flag.length).replace(/^\s+/, "");
+		if (!rest) return USAGE;
+		const [fileToken] = rest.split(/\s/, 1);
+		if (!fileToken) return USAGE;
+		resultFile = fileToken;
+		rest = rest.slice(fileToken.length).replace(/^\s+/, "");
+	}
 	const match = /^(\S+)(?:\s([\s\S]*))?$/.exec(rest);
 	if (!match) return USAGE;
-	return { target: match[1]!, text: match[2] ?? "" };
+	return {
+		target: match[1]!,
+		text: match[2] ?? "",
+		...(resultFile !== undefined ? { resultFile } : {}),
+	};
 }
 
 export function describeCallResult(result: AgentCallResult): string {
-	const header = `herdr-call ${result.status} (delivery ${result.delivery}, request ${result.requestId}${result.pane ? `, pane ${result.pane}` : ""})`;
+	const header = `herdr-call ${result.status} (delivery ${result.delivery}, request ${result.requestId}${result.pane ? `, pane ${result.pane}` : ""}${result.resultFile ? `, resultFile ${result.resultFile}` : ""})`;
 	if (result.ok && result.status === "answered") {
 		return `${header}\n\n${result.answer}`;
 	}
@@ -1082,12 +1468,14 @@ export function registerCallFeatures(
 			delivery: result.delivery,
 			elapsedMs: result.elapsedMs,
 			code: result.error?.code,
+			resultFile: result.resultFile,
+			markerVerified: result.markerVerified,
 		});
 	}
 
 	api.registerCommand("herdr-call", {
 		description:
-			"Call a Herdr-registered agent in another pane and get its answer back: <pane-id-or-unique-agent-name> <text>",
+			"Call a Herdr-registered agent in another pane and get its answer back: [--result-file <abs-path>] <pane-id-or-unique-agent-name> <text>",
 		handler: async (args: string) => {
 			const request = parseCallCommandArgs(args);
 			const result: AgentCallResult =
@@ -1124,18 +1512,31 @@ export function registerCallFeatures(
 			"`target` must be an explicit Herdr pane ID or a name that resolves to exactly one agent; the target must be observed idle/done, " +
 			"and Herdr's own known-agent/foreground gate decides finally whether the prompt is sent (zero input on rejection). " +
 			"One prompt with a bounded wait (60s total budget) and one bounded screen read (200 lines); the answer is recovered from " +
-			"per-request marker lines, and anything less is returned as an unverified capture instead of a success. " +
+			"per-request marker lines, or from `result_file` when a new absolute file path is provided (must not already exist before sending; resilient to long answers and folded/truncated terminal output; the target agent must be able to write to that path, e.g. inside the repository for sandboxed agy). " +
+			"Anything less is returned as an unverified capture instead of a success. " +
 			"No remote approvals, key presses, or retries are ever sent. For GJC targets use the existing herdr_send tool instead.",
 		parameters: z.object({
 			target: z
 				.string()
 				.describe("Target Herdr pane ID (e.g. wC:p2) or unique agent name"),
 			text: z.string().describe("Prompt text to deliver verbatim"),
+			result_file: z
+				.string()
+				.optional()
+				.describe(
+					"Optional new absolute path (must not exist before sending) where the target agent writes its full answer (resilient to long output or screen folding; target agent must have write access, e.g. inside the workspace for sandboxed agy)",
+				),
 		}),
 		async execute(_toolCallId: string, params, signal) {
 			const result = await callRegisteredAgent(
 				deps,
-				{ target: params.target, text: params.text },
+				{
+					target: params.target,
+					text: params.text,
+					...(params.result_file !== undefined
+						? { resultFile: params.result_file }
+						: {}),
+				},
 				senderPane,
 				signal,
 			);

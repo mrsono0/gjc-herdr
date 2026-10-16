@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { constants as fsConstants } from "node:fs/promises";
 import test, { afterEach } from "node:test";
 import type { ExecResult, ExtensionAPI } from "@gajae-code/coding-agent";
 import {
@@ -10,6 +11,9 @@ import {
 	USAGE,
 	type AgentCallDeps,
 	type AgentCallResult,
+	type ResultFileHandle,
+	type ResultFileReadResult,
+	type ResultFileStat,
 } from "../src/call.ts";
 
 const SENDER_PANE = "wE:p1";
@@ -521,7 +525,15 @@ test("registration wires command, tool, sendMessage, and logger summary", async 
 		sendMessage: async (message: unknown, options: unknown) => {
 			messages.push({ message, options });
 		},
-		zod: { z: { object: (shape: unknown) => shape, string: () => ({ describe: () => undefined }) } },
+		zod: {
+			z: {
+				object: (shape: unknown) => shape,
+				string: () => {
+					const field = { optional: () => field, describe: () => field };
+					return field;
+				},
+			},
+		},
 	} as unknown as ExtensionAPI;
 	registerCallFeatures(api, "herdr", SENDER_PANE);
 	assert.deepEqual(commands, ["herdr-call"]);
@@ -1172,4 +1184,532 @@ test("readiness sleep abort, final lookup elapsed time, bounded retry timeouts, 
 	assert.equal(agyResult.status, "not_sent");
 	assert.equal(agyResult.error?.code, "target_busy");
 	assert.equal(agyResult.waitedMs, 3_200);
+});
+
+test("--result-file command parsing accepts a leading path, rejects missing values, and keeps trailing flags in text", () => {
+	assert.deepEqual(parseCallCommandArgs("  --result-file /tmp/out.md wE:p2 hello world"), {
+		target: "wE:p2",
+		text: "hello world",
+		resultFile: "/tmp/out.md",
+	});
+	assert.deepEqual(
+		parseCallCommandArgs("wE:p2 --result-file /tmp/out.md keep as prompt"),
+		{
+			target: "wE:p2",
+			text: "--result-file /tmp/out.md keep as prompt",
+		},
+	);
+	assert.deepEqual(
+		parseCallCommandArgs("--result-file /tmp/a.md reviewer --result-file /tmp/b.md"),
+		{
+			target: "reviewer",
+			text: "--result-file /tmp/b.md",
+			resultFile: "/tmp/a.md",
+		},
+	);
+	assert.equal(parseCallCommandArgs("--result-file"), USAGE);
+	assert.equal(parseCallCommandArgs("--result-file   "), USAGE);
+	assert.equal(parseCallCommandArgs("--result-file /tmp/only-path"), USAGE);
+	assert.equal(
+		parseCallCommandArgs("--result-file /tmp/a.md --result-file /tmp/b.md wE:p2 hi"),
+		USAGE,
+	);
+});
+
+function enoentError(): Error {
+	return Object.assign(new Error("ENOENT: no such file or directory"), {
+		code: "ENOENT",
+	});
+}
+
+function fakeFileHandle(
+	content: string | Uint8Array,
+	overrides?: Partial<ResultFileStat> & {
+		onStat?: () => Promise<ResultFileStat> | ResultFileStat;
+		onRead?: (
+			buffer: Uint8Array,
+			offset: number,
+			length: number,
+			position: number | null,
+		) => Promise<ResultFileReadResult> | ResultFileReadResult;
+		onClose?: () => Promise<void> | void;
+	},
+): {
+	handle: ResultFileHandle;
+	counts: { stat: number; read: number; close: number };
+} {
+	const bytes =
+		typeof content === "string" ? new TextEncoder().encode(content) : content;
+	const counts = { stat: 0, read: 0, close: 0 };
+	let cursor = 0;
+	const handle: ResultFileHandle = {
+		stat: async () => {
+			counts.stat++;
+			if (overrides?.onStat) return await overrides.onStat();
+			return {
+				isFile: overrides?.isFile ?? (() => true),
+				nlink: overrides?.nlink ?? 1,
+				size: overrides?.size ?? bytes.byteLength,
+			};
+		},
+		read: async (buffer, offset, length, position) => {
+			counts.read++;
+			if (overrides?.onRead) {
+				return await overrides.onRead(buffer, offset, length, position);
+			}
+			const start = position ?? cursor;
+			const slice = bytes.subarray(start, start + length);
+			buffer.set(slice, offset);
+			if (position === null) cursor += slice.byteLength;
+			return { bytesRead: slice.byteLength, buffer };
+		},
+		close: async () => {
+			counts.close++;
+			await overrides?.onClose?.();
+		},
+	};
+	return { handle, counts };
+}
+
+test("result_file rejects invalid paths, CR/LF, and any pre-existing file, symlink, or directory before any prompt", async () => {
+	for (const badPath of [
+		"relative/out.md",
+		"./out.md",
+		"",
+		"   ",
+		" /tmp/out.md",
+		"/tmp/out.md ",
+		"/tmp/bad\0path.md",
+		"/tmp/bad\rpath.md",
+		"/tmp/bad\npath.md",
+	]) {
+		const { deps, calls } = fakeExec({});
+		const result = await callRegisteredAgent(
+			deps,
+			{ target: TARGET_PANE, text: "hi", resultFile: badPath },
+			SENDER_PANE,
+		);
+		assert.equal(result.ok, false);
+		assert.equal(result.status, "not_sent");
+		assert.equal(result.delivery, "not_sent");
+		assert.equal(result.error?.code, "invalid_request");
+		assert.equal(calls.length, 0);
+	}
+
+	for (const kind of ["regular", "symlink", "directory"] as const) {
+		let openCalls = 0;
+		const { deps, calls } = fakeExec({});
+		deps.fs = {
+			lstat: async () => ({
+				isFile: () => kind === "regular",
+				isSymbolicLink: () => kind === "symlink",
+				size: 10,
+			}),
+			open: async () => {
+				openCalls++;
+				throw new Error("should not open");
+			},
+		};
+		const result = await callRegisteredAgent(
+			deps,
+			{ target: TARGET_PANE, text: "hi", resultFile: `/tmp/preexisting-${kind}` },
+			SENDER_PANE,
+		);
+		assert.equal(result.ok, false);
+		assert.equal(result.status, "not_sent");
+		assert.equal(result.delivery, "not_sent");
+		assert.equal(result.error?.code, "invalid_request");
+		assert.match(result.error?.message ?? "", /already exists/);
+		assert.equal(calls.length, 0);
+		assert.equal(openCalls, 0);
+	}
+});
+
+test("result_file rechecks absence after the #34 readiness wait and refuses if created while working", async () => {
+	const resultPath = "/tmp/gjc-herdr-created-during-wait.md";
+	const states = ["working", "idle"];
+	let createdDuringWait = false;
+	let lstatCalls = 0;
+	let openCalls = 0;
+	const { deps, count, advance } = fakeExec({
+		"herdr agent get": () => agentGet(states.shift() ?? "idle"),
+		"herdr agent prompt": () => agentPrompted("done"),
+	});
+	deps.sleep = async (ms) => {
+		advance(ms);
+		createdDuringWait = true;
+	};
+	deps.fs = {
+		lstat: async (path) => {
+			assert.equal(path, resultPath);
+			lstatCalls++;
+			if (!createdDuringWait) throw enoentError();
+			return { isFile: () => true, size: 12 };
+		},
+		open: async () => {
+			openCalls++;
+			throw new Error("should not open");
+		},
+	};
+	const result = await callRegisteredAgent(
+		deps,
+		{ target: TARGET_PANE, text: "hi", resultFile: resultPath },
+		SENDER_PANE,
+	);
+	assert.equal(result.ok, false);
+	assert.equal(result.status, "not_sent");
+	assert.equal(result.delivery, "not_sent");
+	assert.equal(result.error?.code, "invalid_request");
+	assert.match(result.error?.message ?? "", /already exists/);
+	assert.equal(result.waitedMs, 2_000);
+	assert.equal(lstatCalls, 2);
+	assert.equal(openCalls, 0);
+	assert.equal(count("herdr agent prompt"), 0);
+});
+
+test("result_file recovers a new regular file from a single handle with markerVerified true or false", async () => {
+	const resultPath = "/tmp/gjc-herdr-answer.md";
+	const expectedFlags =
+		fsConstants.O_RDONLY |
+		(fsConstants.O_NOFOLLOW ?? 0) |
+		(fsConstants.O_NONBLOCK ?? 0);
+
+	for (const screenMode of ["matching", "missing", "different-path"] as const) {
+		let requestId = "";
+		let lstatCalls = 0;
+		let openCalls = 0;
+		const { handle, counts } = fakeFileHandle("full file answer\nline 2");
+		const { deps, count } = fakeExec({
+			"herdr agent get": () => agentGet("idle"),
+			"herdr agent prompt": (args) => {
+				requestId = /GJC_HERDR_BEGIN_([0-9a-f-]{36})/.exec(args[3]!)![1]!;
+				assert.match(args[3]!, new RegExp(`new file at ${resultPath}`));
+				assert.doesNotMatch(args[3]!, /overwrite/i);
+				return agentPrompted("done");
+			},
+			"herdr agent read": () => {
+				if (screenMode === "matching") return answerScreen(requestId, resultPath);
+				if (screenMode === "different-path") {
+					return answerScreen(requestId, "/tmp/other-path.md");
+				}
+				return { stdout: "screen folded or markers missing" };
+			},
+		});
+		deps.fs = {
+			lstat: async (path) => {
+				assert.equal(path, resultPath);
+				lstatCalls++;
+				throw enoentError();
+			},
+			open: async (path, flags) => {
+				assert.equal(path, resultPath);
+				assert.equal(flags, expectedFlags);
+				openCalls++;
+				return handle;
+			},
+		};
+		const result = await callRegisteredAgent(
+			deps,
+			{ target: TARGET_PANE, text: "summarize", resultFile: resultPath },
+			SENDER_PANE,
+		);
+		assert.equal(result.ok, true);
+		assert.equal(result.status, "answered");
+		assert.equal(result.delivery, "submitted");
+		assert.equal(result.answer, "full file answer\nline 2");
+		assert.equal(result.resultFile, resultPath);
+		assert.equal(result.markerVerified, screenMode === "matching");
+		assert.equal(lstatCalls, 2);
+		assert.equal(openCalls, 1);
+		assert.equal(counts.stat, 1);
+		assert.ok(counts.read >= 1);
+		assert.equal(counts.close, 1);
+		assert.equal(count("herdr agent prompt"), 1);
+		assert.match(describeCallResult(result), new RegExp(`resultFile ${resultPath}`));
+	}
+});
+
+test("result_file enforces handle stat, link count, byte bounds (0, 1 MiB, 1 MiB + 1), and fatal UTF-8", async () => {
+	const resultPath = "/tmp/gjc-herdr-bounds.md";
+	const exactOneMiB = "a".repeat(1_024 * 1_024);
+
+	{
+		let requestId = "";
+		const { handle, counts } = fakeFileHandle(exactOneMiB);
+		const { deps } = fakeExec({
+			"herdr agent get": () => agentGet("idle"),
+			"herdr agent prompt": (args) => {
+				requestId = /GJC_HERDR_BEGIN_([0-9a-f-]{36})/.exec(args[3]!)![1]!;
+				return agentPrompted("done");
+			},
+			"herdr agent read": () => answerScreen(requestId, resultPath),
+		});
+		deps.fs = {
+			lstat: async () => {
+				throw enoentError();
+			},
+			open: async () => handle,
+		};
+		const okOneMiB = await callRegisteredAgent(
+			deps,
+			{ target: TARGET_PANE, text: "1mib", resultFile: resultPath },
+			SENDER_PANE,
+		);
+		assert.equal(okOneMiB.ok, true);
+		assert.equal(okOneMiB.status, "answered");
+		assert.equal(okOneMiB.answer?.length, 1_024 * 1_024);
+		assert.equal(okOneMiB.markerVerified, true);
+		assert.equal(counts.stat, 1);
+		assert.ok(counts.read >= 1);
+		assert.equal(counts.close, 1);
+	}
+
+	for (const scenario of [
+		"missing",
+		"eloop",
+		"fifo",
+		"hardlink",
+		"empty-stat",
+		"empty-read",
+		"oversize-stat",
+		"oversize-read",
+		"bad-utf8",
+	] as const) {
+		let requestId = "";
+		const { handle, counts } =
+			scenario === "fifo"
+				? fakeFileHandle("ignored", { isFile: () => false, size: 10 })
+				: scenario === "hardlink"
+					? fakeFileHandle("ignored", { nlink: 2, size: 10 })
+					: scenario === "empty-stat"
+						? fakeFileHandle("", { size: 0 })
+						: scenario === "empty-read"
+							? fakeFileHandle("", { size: 10 })
+							: scenario === "oversize-stat"
+								? fakeFileHandle("x", { size: 1_024 * 1_024 + 1 })
+								: scenario === "oversize-read"
+									? fakeFileHandle("a".repeat(1_024 * 1_024 + 1), { size: 64 })
+									: fakeFileHandle(new Uint8Array([0x61, 0xff, 0x62]));
+		const { deps } = fakeExec({
+			"herdr agent get": () => agentGet("idle"),
+			"herdr agent prompt": (args) => {
+				requestId = /GJC_HERDR_BEGIN_([0-9a-f-]{36})/.exec(args[3]!)![1]!;
+				return agentPrompted("done");
+			},
+			"herdr agent read": () => answerScreen(requestId, resultPath),
+		});
+		deps.fs = {
+			lstat: async () => {
+				throw enoentError();
+			},
+			open: async () => {
+				if (scenario === "missing") throw enoentError();
+				if (scenario === "eloop") {
+					throw Object.assign(new Error("ELOOP: too many symbolic links encountered"), {
+						code: "ELOOP",
+					});
+				}
+				return handle;
+			},
+		};
+		const result = await callRegisteredAgent(
+			deps,
+			{ target: TARGET_PANE, text: "check", resultFile: resultPath },
+			SENDER_PANE,
+		);
+		assert.equal(result.ok, false, `scenario=${scenario}`);
+		assert.equal(result.status, "response_unverified", `scenario=${scenario}`);
+		assert.equal(result.delivery, "submitted", `scenario=${scenario}`);
+		assert.equal(result.resultFile, resultPath, `scenario=${scenario}`);
+		assert.equal(
+			result.error?.code,
+			scenario === "missing" ? "result_file_missing" : "result_file_invalid",
+			`scenario=${scenario}`,
+		);
+		assert.match(result.capture ?? "", new RegExp(resultPath), `scenario=${scenario}`);
+		if (scenario !== "missing" && scenario !== "eloop") {
+			assert.equal(counts.stat, 1, `scenario=${scenario}`);
+			assert.equal(counts.close, 1, `scenario=${scenario}`);
+		}
+		if (
+			scenario === "fifo" ||
+			scenario === "hardlink" ||
+			scenario === "empty-stat" ||
+			scenario === "oversize-stat"
+		) {
+			assert.equal(counts.read, 0, `scenario=${scenario}`);
+		}
+	}
+});
+
+test("result_file recovers when screen read fails or throws, and preserves screen error when file also fails", async () => {
+	const resultPath = "/tmp/gjc-herdr-screen-fallback.md";
+
+	for (const readMode of ["nonzero", "throw"] as const) {
+		const { handle, counts } = fakeFileHandle("recovered despite screen read failure");
+		const { deps } = fakeExec({
+			"herdr agent get": () => agentGet("idle"),
+			"herdr agent prompt": () => agentPrompted("done"),
+			"herdr agent read": () => {
+				if (readMode === "throw") throw new Error("read process crashed");
+				return {
+					code: 1,
+					stderr: JSON.stringify({
+						error: { code: "read_error", message: "tmux capture failed" },
+					}),
+				};
+			},
+		});
+		deps.fs = {
+			lstat: async () => {
+				throw enoentError();
+			},
+			open: async () => handle,
+		};
+		const okResult = await callRegisteredAgent(
+			deps,
+			{ target: TARGET_PANE, text: "check", resultFile: resultPath },
+			SENDER_PANE,
+		);
+		assert.equal(okResult.ok, true);
+		assert.equal(okResult.status, "answered");
+		assert.equal(okResult.delivery, "submitted");
+		assert.equal(okResult.answer, "recovered despite screen read failure");
+		assert.equal(okResult.resultFile, resultPath);
+		assert.equal(okResult.markerVerified, false);
+		assert.equal(counts.close, 1);
+
+		const { deps: failDeps } = fakeExec({
+			"herdr agent get": () => agentGet("idle"),
+			"herdr agent prompt": () => agentPrompted("done"),
+			"herdr agent read": () => {
+				if (readMode === "throw") throw new Error("read process crashed");
+				return {
+					code: 1,
+					stderr: JSON.stringify({
+						error: { code: "read_error", message: "tmux capture failed" },
+					}),
+				};
+			},
+		});
+		failDeps.fs = {
+			lstat: async () => {
+				throw enoentError();
+			},
+			open: async () => {
+				throw enoentError();
+			},
+		};
+		const failResult = await callRegisteredAgent(
+			failDeps,
+			{ target: TARGET_PANE, text: "check", resultFile: resultPath },
+			SENDER_PANE,
+		);
+		assert.equal(failResult.ok, false);
+		assert.equal(failResult.status, "response_unverified");
+		assert.equal(failResult.delivery, "submitted");
+		assert.equal(failResult.error?.code, "result_file_missing");
+		assert.match(failResult.error?.message ?? "", /Result file was not created/);
+		assert.match(
+			failResult.error?.message ?? "",
+			readMode === "throw" ? /read process crashed/ : /tmux capture failed/,
+		);
+	}
+});
+
+test("result_file honors abort during pre-prompt lstat and during file recovery (open, stat, and first read)", async () => {
+	const resultPath = "/tmp/gjc-herdr-abort.md";
+
+	{
+		const controller = new AbortController();
+		let lstatCalls = 0;
+		let openCalls = 0;
+		const { deps, count } = fakeExec({
+			"herdr agent get": () => agentGet("idle"),
+			"herdr agent prompt": () => agentPrompted("done"),
+		});
+		deps.fs = {
+			lstat: async () => {
+				if (++lstatCalls === 2) controller.abort();
+				throw enoentError();
+			},
+			open: async () => {
+				openCalls++;
+				throw new Error("should not open");
+			},
+		};
+		const result = await callRegisteredAgent(
+			deps,
+			{ target: TARGET_PANE, text: "hi", resultFile: resultPath },
+			SENDER_PANE,
+			controller.signal,
+		);
+		assert.equal(result.ok, false);
+		assert.equal(result.status, "not_sent");
+		assert.equal(result.delivery, "not_sent");
+		assert.equal(result.error?.code, "aborted");
+		assert.equal(result.answer, undefined);
+		assert.equal(lstatCalls, 2);
+		assert.equal(openCalls, 0);
+		assert.equal(count("herdr agent prompt"), 0);
+	}
+
+	for (const abortAt of ["open", "stat", "first-read"] as const) {
+		const controller = new AbortController();
+		let requestId = "";
+		const bytes = new TextEncoder().encode("SAFE");
+		const { handle, counts } = fakeFileHandle(bytes, {
+			onStat: () => {
+				if (abortAt === "stat") controller.abort();
+				return { isFile: () => true, nlink: 1, size: bytes.byteLength };
+			},
+			onRead: (buffer, offset, _length, position) => {
+				const start = position ?? 0;
+				const slice = bytes.subarray(start, start + 2);
+				buffer.set(slice, offset);
+				if (abortAt === "first-read") controller.abort();
+				return { bytesRead: slice.byteLength, buffer };
+			},
+		});
+		const { deps, count } = fakeExec({
+			"herdr agent get": () => agentGet("idle"),
+			"herdr agent prompt": (args) => {
+				requestId = /GJC_HERDR_BEGIN_([0-9a-f-]{36})/.exec(args[3]!)![1]!;
+				return agentPrompted("done");
+			},
+			"herdr agent read": () => answerScreen(requestId, resultPath),
+		});
+		deps.fs = {
+			lstat: async () => {
+				throw enoentError();
+			},
+			open: async () => {
+				if (abortAt === "open") controller.abort();
+				return handle;
+			},
+		};
+		const result = await callRegisteredAgent(
+			deps,
+			{ target: TARGET_PANE, text: "hi", resultFile: resultPath },
+			SENDER_PANE,
+			controller.signal,
+		);
+		assert.equal(result.ok, false, `abortAt=${abortAt}`);
+		assert.equal(result.status, "read_failed", `abortAt=${abortAt}`);
+		assert.equal(result.delivery, "submitted", `abortAt=${abortAt}`);
+		assert.equal(result.error?.code, "aborted", `abortAt=${abortAt}`);
+		assert.equal(result.answer, undefined, `abortAt=${abortAt}`);
+		assert.equal(count("herdr agent prompt"), 1, `abortAt=${abortAt}`);
+		assert.equal(counts.close, 1, `abortAt=${abortAt}`);
+		if (abortAt === "open") {
+			assert.equal(counts.stat, 0);
+			assert.equal(counts.read, 0);
+		} else if (abortAt === "stat") {
+			assert.equal(counts.stat, 1);
+			assert.equal(counts.read, 0);
+		} else {
+			assert.equal(counts.stat, 1);
+			assert.equal(counts.read, 1);
+		}
+	}
 });
