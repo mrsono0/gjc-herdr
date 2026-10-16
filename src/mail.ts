@@ -5,6 +5,7 @@ import {
 	lstat as nodeLstat,
 	mkdir as nodeMkdir,
 	open as nodeOpen,
+	readdir as nodeReaddir,
 	realpath as nodeRealpath,
 	unlink as nodeUnlink,
 } from "node:fs/promises";
@@ -57,6 +58,7 @@ export interface MailStat {
 	isSymbolicLink(): boolean;
 	mode?: number;
 	size: number;
+	ino?: number | bigint;
 }
 
 export interface MailReadResult {
@@ -94,6 +96,7 @@ export interface MailFs {
 	open(path: string, flags: number, mode?: number): Promise<MailFileHandle>;
 	link(existingPath: string, newPath: string): Promise<void>;
 	unlink(path: string): Promise<void>;
+	readdir?(path: string): Promise<string[]>;
 }
 
 export interface MailDeps {
@@ -170,7 +173,7 @@ export interface MailLockRecord {
 	at: string;
 }
 
-const defaultFs: MailFs = {
+export const defaultMailFs: MailFs = {
 	lstat: (path) => nodeLstat(path),
 	realpath: (path) => nodeRealpath(path),
 	mkdir: (path, options) => nodeMkdir(path, options),
@@ -178,7 +181,10 @@ const defaultFs: MailFs = {
 		(await nodeOpen(path, flags, mode)) as unknown as MailFileHandle,
 	link: (existingPath, newPath) => nodeLink(existingPath, newPath),
 	unlink: (path) => nodeUnlink(path),
+	readdir: (path) => nodeReaddir(path),
 };
+
+const defaultFs: MailFs = defaultMailFs;
 
 function resolveReadOpenFlags(
 	constants: Record<string, number | undefined> = fsConstants,
@@ -355,11 +361,19 @@ export function createUlid(
 	return timeChars.join("") + randChars.join("");
 }
 
-function randomHex8(
+export function randomHex8(
 	fillRandom: (target: Uint8Array) => Uint8Array = (buf) =>
 		crypto.getRandomValues(buf),
 ): string {
 	const bytes = fillRandom(new Uint8Array(4));
+	return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+export function randomHex16(
+	fillRandom: (target: Uint8Array) => Uint8Array = (buf) =>
+		crypto.getRandomValues(buf),
+): string {
+	const bytes = fillRandom(new Uint8Array(16));
 	return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
 }
 
@@ -1680,6 +1694,19 @@ export async function readMailAttemptFile(
 	return parseMailAttempt(raw.value, {
 		expectedId: options?.expectedId ?? stem,
 	});
+}
+
+/**
+ * §2 + §5.1 Reads a consumer lock file safely (`O_RDONLY|O_NOFOLLOW|O_NONBLOCK` + `fstat`)
+ * and validates its format (`pid`, `token`, `at`).
+ */
+export async function readMailLockFile(
+	fsOps: MailFs,
+	filePath: string,
+): Promise<ParseResult<MailLockRecord>> {
+	const raw = await readMailboxFileBytes(fsOps, filePath, MAX_RECORD_BYTES);
+	if (!raw.ok) return raw;
+	return parseMailLockRecord(raw.value);
 }
 
 export type PublishOutcome =

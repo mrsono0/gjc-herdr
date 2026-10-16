@@ -215,13 +215,15 @@ Herdr가 **감지한** 다른 pane의 에이전트(Claude Code, Codex 등 Herdr 
 
 GJC 0.18.7은 플러그인이 skill을 등록할 수 없다(파일시스템 기반 skill 발견만 지원). Herdr 공식 agent skill을 쓰고 싶으면 [herdr.dev agent skill 문서](https://herdr.dev/docs/agent-skill)를 따라 사용자가 직접 설치한다. 이 플러그인은 skill 등록 API가 없어 그 경로를 사용하지 않으며(`resources_discover`/`skillPaths` 공개 설정이 존재하기는 하나 이 범위에서는 미사용), `/herdr-call`이 그 역할을 대신한다.
 
-## 파일 우편함 보내기
+## 파일 우편함 보내기·받기
 
 `herdr_mail_send` 도구(`{ to, subject, body, reply_to? }`)는 `<git 최상위>/.gjc-herdr/mailbox/<to>/<id>.md`에 우편 파일을 배타적 하드 링크(`link`)로 공개하고 `{ ok, id, path, warnings? }`를 반환한다(다른 pane 입력이나 토스트는 없음).
 
-- 발신자 이름(`from`)은 환경변수 `GJC_HERDR_MAILBOX`(`^[a-z][a-z0-9-]{0,31}$`)에서 읽으며, 없거나 형식이 맞지 않으면 전송을 거절한다.
-- 플러그인은 `.gitignore`를 수정하지 않는다. 사용하는 저장소의 `.gitignore`에 `/.gjc-herdr/`를 직접 추가해야 하며, 우편함 경로가 Git에서 무시되지 않거나 추적 파일이 있으면 전송을 거절한다.
-- 우편 받기(수신 감시·주입)는 아직 포함되어 있지 않다.
+- 발신자 이름(`from`)과 수신 우편함 이름은 환경변수 `GJC_HERDR_MAILBOX`(`^[a-z][a-z0-9-]{0,31}$`)에서 읽는다. `GJC_HERDR_MAILBOX`가 설정되지 않으면 우편 받기는 비활성 상태(리스너·감시자·타이머 미등록)로 남고, 형식에 어긋나면 에러 안내를 1회 남긴 뒤 우편 받기를 비활성화한다.
+- 플러그인은 `.gitignore`를 수정하지 않는다. 사용하는 저장소의 `.gitignore`에 `/.gjc-herdr/`를 직접 추가해야 하며, 우편함 경로가 Git에서 무시되지 않거나 추적 파일이 있으면 보내기·받기를 거절한다.
+- **GJC 우편 받기**: `GJC_HERDR_MAILBOX`가 유효한 주 세션(`kind === "main" && taskDepth === 0`)이 시작되면 `<우편함>/.consumer.lock`을 배타 생성해 단독 소비자로 동작하고(`session_shutdown` 때 정리, 이미 잠금이 있으면 자동 삭제하지 않고 `pid`·프로세스 상태와 수동 조치 안내를 표시), 이전 비정상 종료로 `<id>.attempt`만 남은 항목은 시작 시 `uncertain`(`crash_recovery`) ack로 정리한다. 남은 잠금은 이전 GJC가 끝났는지 확인한 뒤 `.consumer.lock`만 지우고 다시 시작한다. 메시지·ack·attempt는 지우지 않는다.
+- 새 우편(`<id>.md`)은 세션이 유휴(`ctx.isIdle()`)일 때만 `<id>.attempt` 원장을 먼저 기록한 뒤 `api.sendMessage`(`customType: "herdr-mail"`, `deliverAs: "followUp"`, `triggerTurn: true`)로 주입한다. 주입 본문은 고정 헤더·비권한 데이터 경고·최대 8 KiB(UTF-8 코드포인트 경계) 미리보기와 원본 상대 경로(`전문: .gjc-herdr/mailbox/<to>/<id>.md`)로 구성된다.
+- 주입된 커스텀 메시지 반영(1단계)과 그 뒤 정상 어시스턴트 응답 완료(2단계)가 같은 세션 세대에서 관측되면 `<id>.ack`(`state: received`, `via: observed`)를 배타 생성하고, 문법·크기 위반 우편은 `rejected`, 미관측 종료 2회·세션 전환 등은 `uncertain` ack로 기록한다. `received`는 읽음·이해·업무 완료의 증거가 아니다.
 
 ## 제거
 
