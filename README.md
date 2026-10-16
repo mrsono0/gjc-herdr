@@ -215,6 +215,14 @@ Herdr가 **감지한** 다른 pane의 에이전트(Claude Code, Codex 등 Herdr 
 
 GJC 0.18.7은 플러그인이 skill을 등록할 수 없다(파일시스템 기반 skill 발견만 지원). Herdr 공식 agent skill을 쓰고 싶으면 [herdr.dev agent skill 문서](https://herdr.dev/docs/agent-skill)를 따라 사용자가 직접 설치한다. 이 플러그인은 skill 등록 API가 없어 그 경로를 사용하지 않으며(`resources_discover`/`skillPaths` 공개 설정이 존재하기는 하나 이 범위에서는 미사용), `/herdr-call`이 그 역할을 대신한다.
 
+## 파일 우편함 보내기
+
+`herdr_mail_send` 도구(`{ to, subject, body, reply_to? }`)는 `<git 최상위>/.gjc-herdr/mailbox/<to>/<id>.md`에 우편 파일을 배타적 하드 링크(`link`)로 공개하고 `{ ok, id, path, warnings? }`를 반환한다(다른 pane 입력이나 토스트는 없음).
+
+- 발신자 이름(`from`)은 환경변수 `GJC_HERDR_MAILBOX`(`^[a-z][a-z0-9-]{0,31}$`)에서 읽으며, 없거나 형식이 맞지 않으면 전송을 거절한다.
+- 플러그인은 `.gitignore`를 수정하지 않는다. 사용하는 저장소의 `.gitignore`에 `/.gjc-herdr/`를 직접 추가해야 하며, 우편함 경로가 Git에서 무시되지 않거나 추적 파일이 있으면 전송을 거절한다.
+- 우편 받기(수신 감시·주입)는 아직 포함되어 있지 않다.
+
 ## 제거
 
 플러그인이 로드된 GJC를 정상 종료한 뒤 제거하고 새 GJC로 확인한다.

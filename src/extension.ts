@@ -3,6 +3,7 @@ import { resolveHerdrPaneEnvironment } from "@gajae-code/coding-agent/utils/herd
 import { createReporter, isMainSession, REFRESH_MS } from "./metadata.ts";
 import { registerSendFeatures } from "./send.ts";
 import { registerCallFeatures } from "./call.ts";
+import { registerMailFeatures } from "./mail.ts";
 
 export default function herdrMetadata(api: ExtensionAPI): void {
 	api.logger.info("gjc-herdr extension loaded");
@@ -18,6 +19,7 @@ export default function herdrMetadata(api: ExtensionAPI): void {
 		pane?.binPath ?? "herdr",
 		pane?.paneId ?? process.env.HERDR_PANE_ID,
 	);
+	registerMailFeatures(api);
 	if (!pane) return;
 
 	const report = createReporter(api.exec.bind(api), pane.paneId, pane.binPath);

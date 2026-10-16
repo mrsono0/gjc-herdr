@@ -83,7 +83,7 @@ test("a denied public pane resolver registers no publisher but still registers d
 		} as unknown as ExtensionAPI);
 		assert.equal(registrations, 0);
 		assert.deepEqual(commands, ["herdr-send", "herdr-call"]);
-		assert.deepEqual(tools, ["herdr_send", "herdr_agent_call"]);
+		assert.deepEqual(tools, ["herdr_send", "herdr_agent_call", "herdr_mail_send"]);
 		assert.equal(execs, 0);
 		assert.equal(process.env.HERDR_ENV, originalHerdrFlag);
 	} finally {
