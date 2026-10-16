@@ -236,6 +236,7 @@ test("preflight states gate the call before any prompt", async () => {
 		const { deps, calls, count } = fakeExec({
 			"herdr agent get": () => agentGet(state, extra),
 		});
+		deps.inputWaitMs = 0;
 		const result = await callRegisteredAgent(
 			deps,
 			{ target: TARGET_PANE, text: "x" },
@@ -880,4 +881,295 @@ test("lazy agy kind lookup is bounded by remaining input-wait budget and exclude
 	assert.equal(longResult.waitedMs, 70_000);
 	assert.equal(longResult.answer, "after 70s wait");
 	assert.equal(longWait.count("herdr agent get"), 2);
+});
+
+test("a focused pane with an unreadable input box waits until unfocused and then prompts once", async () => {
+	let gets = 0;
+	let requestId = "";
+	const sleeps: number[] = [];
+	const { deps, count, advance } = fakeExec({
+		"herdr pane read": () => ({ stdout: "$ plain shell\n" }),
+		"herdr agent get": () => agentGet("idle", { focused: ++gets < 3 }),
+		"herdr agent prompt": (args) => {
+			requestId = /GJC_HERDR_BEGIN_([0-9a-f-]{36})/.exec(args[3])![1]!;
+			return agentPrompted("done");
+		},
+		"herdr agent read": () => answerScreen(requestId, "unfocused ok"),
+	});
+	deps.sleep = async (ms) => {
+		sleeps.push(ms);
+		advance(ms);
+	};
+	const result = await callRegisteredAgent(deps, { target: TARGET_PANE, text: "hi" }, SENDER_PANE);
+	assert.equal(result.ok, true);
+	assert.equal(result.status, "answered");
+	assert.equal(result.answer, "unfocused ok");
+	assert.equal(result.waitedMs, 4_000);
+	assert.deepEqual(sleeps, [2_000, 2_000]);
+	assert.equal(count("herdr pane read"), 3);
+	assert.equal(count("herdr agent get"), 3);
+	assert.equal(count("herdr agent prompt"), 1);
+
+	const stuck = fakeExec({
+		"herdr pane read": () => ({ stdout: "$ plain shell\n" }),
+		"herdr agent get": () => agentGet("idle", { focused: true }),
+	});
+	stuck.deps.inputWaitMs = 6_000;
+	const refused = await callRegisteredAgent(stuck.deps, { target: TARGET_PANE, text: "hi" }, SENDER_PANE);
+	assert.equal(refused.ok, false);
+	assert.equal(refused.status, "not_sent");
+	assert.equal(refused.delivery, "not_sent");
+	assert.equal(refused.error?.code, "target_focused");
+	assert.match(refused.error?.message ?? "", /after 6s; not sent\. Retry later\./);
+	assert.equal(refused.waitedMs, 6_000);
+	assert.equal(stuck.count("herdr agent prompt"), 0);
+	assert.equal(stuck.deps.inFlight.size, 0);
+});
+
+test("a working target waits until idle and gives up as target_busy when the wait cap expires", async () => {
+	const states = ["working", "working", "idle"];
+	let requestId = "";
+	const sleeps: number[] = [];
+	const { deps, count, advance } = fakeExec({
+		"herdr agent get": () => agentGet(states.shift() ?? "idle"),
+		"herdr agent prompt": (args) => {
+			requestId = /GJC_HERDR_BEGIN_([0-9a-f-]{36})/.exec(args[3])![1]!;
+			return agentPrompted("done");
+		},
+		"herdr agent read": () => answerScreen(requestId, "now idle"),
+	});
+	deps.sleep = async (ms) => {
+		sleeps.push(ms);
+		advance(ms);
+	};
+	const result = await callRegisteredAgent(deps, { target: TARGET_PANE, text: "hi" }, SENDER_PANE);
+	assert.equal(result.ok, true);
+	assert.equal(result.status, "answered");
+	assert.equal(result.answer, "now idle");
+	assert.equal(result.waitedMs, 4_000);
+	assert.deepEqual(sleeps, [2_000, 2_000]);
+	assert.equal(count("herdr agent get"), 3);
+	assert.equal(count("herdr agent prompt"), 1);
+
+	const stuck = fakeExec({
+		"herdr agent get": () => agentGet("working"),
+	});
+	stuck.deps.inputWaitMs = 6_000;
+	const busy = await callRegisteredAgent(stuck.deps, { target: TARGET_PANE, text: "hi" }, SENDER_PANE);
+	assert.equal(busy.ok, false);
+	assert.equal(busy.status, "not_sent");
+	assert.equal(busy.delivery, "not_sent");
+	assert.equal(busy.error?.code, "target_busy");
+	assert.match(busy.error?.message ?? "", /after 6s; not sent\. Retry later\./);
+	assert.equal(busy.waitedMs, 6_000);
+	assert.equal(stuck.count("herdr agent prompt"), 0);
+	assert.equal(stuck.deps.inFlight.size, 0);
+});
+
+test("inputWaitMs = 0 refuses focused-unknown and working targets immediately without sleeping", async () => {
+	for (const [screen, state, focused, expectedStatus, code] of [
+		["$ plain shell\n", "idle", true, "not_sent", "target_focused"],
+		[EMPTY_CLAUDE, "working", false, "not_sent", "target_busy"],
+		["$ plain shell\n", "blocked", true, "blocked", "agent_blocked"],
+		["$ plain shell\n", "unknown", true, "not_sent", "target_state_unknown"],
+	] as const) {
+		for (const waitBudget of [0, 6_000]) {
+			if (waitBudget > 0 && (code === "target_focused" || code === "target_busy")) continue;
+			const sleeps: number[] = [];
+			const { deps, count, advance } = fakeExec({
+				"herdr pane read": () => ({ stdout: screen }),
+				"herdr agent get": () => agentGet(state, { focused }),
+			});
+			deps.inputWaitMs = waitBudget;
+			deps.sleep = async (ms) => {
+				sleeps.push(ms);
+				advance(ms);
+			};
+			const result = await callRegisteredAgent(deps, { target: TARGET_PANE, text: "hi" }, SENDER_PANE);
+			assert.equal(result.ok, false);
+			assert.equal(result.status, expectedStatus);
+			assert.equal(result.delivery, "not_sent");
+			assert.equal(result.error?.code, code);
+			assert.equal(result.waitedMs, undefined);
+			assert.equal(sleeps.length, 0);
+			assert.equal(count("herdr pane read"), 1);
+			assert.equal(count("herdr agent get"), 1);
+			assert.equal(count("herdr agent prompt"), 0);
+		}
+	}
+});
+
+test("typing wait and preflight readiness wait share one inputWaitMs cap and do not eat the call budget", async () => {
+	const screens = [TYPING_CLAUDE, "$ plain shell\n", EMPTY_CLAUDE, EMPTY_CLAUDE];
+	const preflightStates: [string, boolean][] = [
+		["idle", true],
+		["working", false],
+		["idle", false],
+	];
+	let requestId = "";
+	const sleeps: number[] = [];
+	const { deps, calls, count, advance } = fakeExec({
+		"herdr pane read": () => ({ stdout: screens.shift() ?? EMPTY_CLAUDE }),
+		"herdr agent get": () => {
+			const [state, focused] = preflightStates.shift() ?? ["idle", false];
+			return agentGet(state, { focused });
+		},
+		"herdr agent prompt": (args) => {
+			requestId = /GJC_HERDR_BEGIN_([0-9a-f-]{36})/.exec(args[3])![1]!;
+			return agentPrompted("done");
+		},
+		"herdr agent read": () => answerScreen(requestId, "shared budget ok"),
+	});
+	deps.inputWaitMs = 8_000;
+	deps.sleep = async (ms) => {
+		sleeps.push(ms);
+		advance(ms);
+	};
+	const okResult = await callRegisteredAgent(deps, { target: TARGET_PANE, text: "hi" }, SENDER_PANE);
+	assert.equal(okResult.ok, true);
+	assert.equal(okResult.waitedMs, 6_000);
+	assert.deepEqual(sleeps, [2_000, 2_000, 2_000]);
+	assert.equal(count("herdr agent prompt"), 1);
+	const promptCall = calls.find(({ args }) => args[1] === "prompt")!;
+	assert.equal(Number(promptCall.args[6]), 57_000);
+	assert.equal(promptCall.options?.timeout, 60_000);
+
+	const cappedScreens = [TYPING_CLAUDE, TYPING_CLAUDE, EMPTY_CLAUDE, EMPTY_CLAUDE];
+	const cappedSleeps: number[] = [];
+	const capped = fakeExec({
+		"herdr pane read": () => ({ stdout: cappedScreens.shift() ?? EMPTY_CLAUDE }),
+		"herdr agent get": () => agentGet("working"),
+	});
+	capped.deps.inputWaitMs = 5_000;
+	capped.deps.sleep = async (ms) => {
+		cappedSleeps.push(ms);
+		capped.advance(ms);
+	};
+	const cappedResult = await callRegisteredAgent(capped.deps, { target: TARGET_PANE, text: "hi" }, SENDER_PANE);
+	assert.equal(cappedResult.ok, false);
+	assert.equal(cappedResult.error?.code, "target_busy");
+	assert.equal(cappedResult.waitedMs, 5_000);
+	assert.deepEqual(cappedSleeps, [2_000, 2_000, 1_000]);
+	assert.equal(capped.count("herdr agent prompt"), 0);
+});
+
+test("readiness sleep abort, final lookup elapsed time, bounded retry timeouts, and small remaining budgets", async () => {
+	const abortController = new AbortController();
+	const aborted = fakeExec({
+		"herdr pane read": () => ({ stdout: "$ plain shell\n" }),
+		"herdr agent get": () => agentGet("idle", { focused: true }),
+	});
+	aborted.deps.sleep = async (ms) => {
+		aborted.advance(ms);
+		abortController.abort();
+	};
+	const abortResult = await callRegisteredAgent(
+		aborted.deps,
+		{ target: TARGET_PANE, text: "hi" },
+		SENDER_PANE,
+		abortController.signal,
+	);
+	assert.equal(abortResult.status, "not_sent");
+	assert.equal(abortResult.delivery, "not_sent");
+	assert.equal(abortResult.error?.code, "aborted");
+	assert.equal(abortResult.waitedMs, 2_000);
+	assert.equal(aborted.count("herdr agent prompt"), 0);
+	assert.equal(aborted.deps.inFlight.size, 0);
+
+	let gets = 0;
+	let requestId = "";
+	const timed = fakeExec({
+		"herdr pane read": () => {
+			timed.advance(gets === 0 ? 100 : 200);
+			return { stdout: EMPTY_CLAUDE };
+		},
+		"herdr agent get": () => {
+			if (++gets === 1) return agentGet("working");
+			timed.advance(500);
+			return agentGet("idle");
+		},
+		"herdr agent prompt": (args) => {
+			requestId = /GJC_HERDR_BEGIN_([0-9a-f-]{36})/.exec(args[3])![1]!;
+			return agentPrompted("done");
+		},
+		"herdr agent read": () => answerScreen(requestId, "timed ok"),
+	});
+	const timedResult = await callRegisteredAgent(timed.deps, { target: TARGET_PANE, text: "hi" }, SENDER_PANE);
+	assert.equal(timedResult.ok, true);
+	assert.equal(timedResult.status, "answered");
+	assert.equal(timedResult.waitedMs, 2_800);
+	const promptCall = timed.calls.find(({ args }) => args[1] === "prompt")!;
+	assert.equal(Number(promptCall.args[6]), 57_000);
+	assert.equal(promptCall.options?.timeout, 60_000);
+
+	for (const overMode of ["killed", "late-idle"] as const) {
+		let overGets = 0;
+		const over = fakeExec({
+			"herdr pane read": () => {
+				if (overGets > 0) over.advance(300);
+				return { stdout: EMPTY_CLAUDE };
+			},
+			"herdr agent get": (_args, options) => {
+				if (++overGets === 1) return agentGet("working");
+				assert.equal(options?.timeout, 1_200);
+				if (overMode === "killed") {
+					over.advance(options?.timeout ?? 0);
+					return { killed: true, code: 0, stdout: "", stderr: "" };
+				}
+				over.advance(2_000);
+				return agentGet("idle");
+			},
+		});
+		over.deps.inputWaitMs = 3_500;
+		const overResult = await callRegisteredAgent(over.deps, { target: TARGET_PANE, text: "hi" }, SENDER_PANE);
+		assert.equal(overResult.ok, false);
+		assert.equal(overResult.status, "not_sent");
+		assert.equal(overResult.error?.code, "target_busy");
+		assert.equal(over.count("herdr agent prompt"), 0);
+		if (overMode === "killed") assert.equal(overResult.waitedMs, 3_500);
+	}
+
+	const subRecheck = fakeExec({
+		"herdr pane read": () => {
+			subRecheck.advance(0.4);
+			return { stdout: "$ plain shell\n" };
+		},
+		"herdr agent get": () => agentGet("idle", { focused: true }),
+	});
+	subRecheck.deps.inputWaitMs = 2_001.5;
+	const subResult = await callRegisteredAgent(subRecheck.deps, { target: TARGET_PANE, text: "hi" }, SENDER_PANE);
+	assert.equal(subResult.status, "not_sent");
+	assert.equal(subResult.error?.code, "target_focused");
+	assert.equal(subResult.waitedMs, 2_000.4);
+	assert.equal(subRecheck.count("herdr pane read"), 1);
+
+	const emptyAgy = `${RULE_LINE}\n>\n${RULE_LINE}\n? for shortcuts                                                 Gemini 4 Argon · hig`;
+	let agyGets = 0;
+	const agyExhausted = fakeExec({
+		"herdr pane read": () => {
+			if (agyGets > 0) {
+				agyExhausted.advance(1_200);
+				return { stdout: emptyAgy };
+			}
+			return { stdout: "$ plain shell\n" };
+		},
+		"herdr agent get": () => {
+			agyGets++;
+			return ok({
+				result: {
+					type: "agent_info",
+					agent: {
+						agent_status: "working",
+						pane_id: TARGET_PANE,
+						terminal_id: TERMINAL,
+					},
+				},
+			});
+		},
+	});
+	agyExhausted.deps.inputWaitMs = 3_200;
+	const agyResult = await callRegisteredAgent(agyExhausted.deps, { target: TARGET_PANE, text: "hi" }, SENDER_PANE);
+	assert.equal(agyResult.status, "not_sent");
+	assert.equal(agyResult.error?.code, "target_busy");
+	assert.equal(agyResult.waitedMs, 3_200);
 });

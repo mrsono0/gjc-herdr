@@ -633,53 +633,170 @@ test("raw delivery falls back to the focus rule when the input box is unreadable
 });
 
 test("raw rechecks blocked and focused state after waiting", async () => {
-	for (const latest of ["blocked", "focused", "blocked-still-typing"]) {
+	for (const latest of [
+		"blocked",
+		"blocked-unknown-ui",
+		"typing-cap-exhausted",
+		"focused",
+		"focused-then-typing",
+	] as const) {
+		let agentGets = 0;
 		let gets = 0;
-		const screens = [TYPING_CLAUDE, latest.startsWith("blocked") ? EMPTY_CLAUDE : "$ approval / unknown UI"];
-		const { deps, calls, count } = fakeExec({
-			"herdr pane get": () => paneGet("wE:p2", {}, ++gets === 1
-				? { focused: false, agent_status: "idle" }
-				: { focused: true, agent_status: latest.startsWith("blocked") ? "blocked" : "idle" }),
-			"herdr pane read": () => ({ stdout: screens.shift()! }),
+		const screens =
+			latest === "blocked"
+				? [TYPING_CLAUDE, EMPTY_CLAUDE]
+				: latest === "blocked-unknown-ui"
+					? [TYPING_CLAUDE, "$ approval / unknown UI"]
+					: latest === "typing-cap-exhausted"
+						? [TYPING_CLAUDE]
+						: latest === "focused"
+							? [TYPING_CLAUDE, "$ approval / unknown UI", "$ approval / unknown UI"]
+							: [TYPING_CLAUDE, "$ approval / unknown UI", TYPING_CLAUDE];
+		const { deps, calls, count, advance } = fakeExec({
+			"herdr agent get": (_args, options) => {
+				if (++agentGets > 1) advance(1_000);
+				assert.equal(options?.timeout, 3_000);
+				return ok({ result: { agent: { pane_id: "wE:p2" } } });
+			},
+			"herdr pane get": (_args, options) => {
+				if (++gets === 1) {
+					return paneGet("wE:p2", {}, { focused: false, agent_status: "idle" });
+				}
+				if (latest === "blocked-unknown-ui") assert.equal(options?.timeout, 1_500);
+				if (latest === "typing-cap-exhausted") advance(1_000);
+				return paneGet(
+					"wE:p2",
+					{},
+					{
+						focused: latest === "focused-then-typing" ? gets === 2 : true,
+						agent_status: latest.startsWith("blocked") ? "blocked" : "idle",
+					},
+				);
+			},
+			"herdr pane read": () => ({ stdout: screens.shift() ?? "$ approval / unknown UI" }),
 		});
-		if (latest === "blocked-still-typing") deps.inputWaitMs = 2_000;
-		const result = await deliverPrompt(deps, { pane: "wE:p2", text: "x", raw: true }, SENDER);
+		deps.inputWaitMs =
+			latest === "typing-cap-exhausted"
+				? 2_000
+				: latest === "blocked-unknown-ui"
+					? 3_500
+					: 6_000;
+		const target = latest === "typing-cap-exhausted" ? "receiver" : "wE:p2";
+		const result = await deliverPrompt(deps, { pane: target, text: "x", raw: true }, SENDER);
 		assert.equal(result.status, "not_sent");
-		assert.equal(result.waitedMs, 2_000);
-		assert.match(result.error ?? "", latest.startsWith("blocked") ? /Target is blocked/ : /could not be read and the pane is focused/);
-		assert.equal(count("herdr pane get"), 2);
+		assert.equal(
+			result.waitedMs,
+			latest.startsWith("blocked") || latest === "typing-cap-exhausted" ? 2_000 : 6_000,
+		);
+		assert.match(
+			result.error ?? "",
+			latest.startsWith("blocked")
+				? /Target is blocked/
+				: latest === "typing-cap-exhausted"
+					? /input box still has text after 2s; raw input not sent/
+					: latest === "focused"
+						? /could not be read and the pane is focused.*after 6s/
+						: /input box still has text after 6s; raw input not sent/,
+		);
+		if (latest === "typing-cap-exhausted") {
+			assert.equal(count("herdr agent get"), 1);
+			assert.equal(count("herdr pane get"), 1);
+			assert.equal(count("herdr pane read"), 1);
+		} else {
+			assert.equal(count("herdr pane get"), latest === "focused" ? 3 : 2);
+			assert.equal(count("herdr pane read"), latest.startsWith("blocked") ? 2 : 3);
+		}
 		assert.equal(SENDS(calls).length, 0);
 	}
 });
 
 test("raw re-resolves names and refuses a refreshed self target", async () => {
-	let gets = 0;
-	const screens = [TYPING_CLAUDE, EMPTY_CLAUDE];
-	const { deps, calls, count } = fakeExec({
-		"herdr agent get": () => ok({ result: { agent: { pane_id: ++gets === 1 ? "wE:p2" : SENDER.pane } } }),
+	let selfGets = 0;
+	const selfScreens = [TYPING_CLAUDE, EMPTY_CLAUDE];
+	const selfTarget = fakeExec({
+		"herdr agent get": () =>
+			ok({ result: { agent: { pane_id: ++selfGets === 1 ? "wE:p2" : SENDER.pane } } }),
 		"herdr pane get": (args) => paneGet(args[2]),
-		"herdr pane read": () => ({ stdout: screens.shift()! }),
+		"herdr pane read": () => ({ stdout: selfScreens.shift()! }),
 	});
-	const result = await deliverPrompt(deps, { pane: "receiver", text: "x", raw: true }, SENDER);
-	assert.equal(result.status, "not_sent");
-	assert.equal(result.pane, SENDER.pane);
-	assert.match(result.error ?? "", /current Herdr pane/);
-	assert.equal(count("herdr agent get"), 2);
-	assert.equal(SENDS(calls).length, 0);
+	const selfResult = await deliverPrompt(
+		selfTarget.deps,
+		{ pane: "receiver", text: "x", raw: true },
+		SENDER,
+	);
+	assert.equal(selfResult.status, "not_sent");
+	assert.equal(selfResult.pane, SENDER.pane);
+	assert.equal(selfResult.waitedMs, 2_000);
+	assert.match(selfResult.error ?? "", /current Herdr pane/);
+	assert.equal(selfTarget.count("herdr agent get"), 2);
+	assert.equal(SENDS(selfTarget.calls).length, 0);
+
+	for (const waitReason of ["typing", "focused-unknown"] as const) {
+		let movedGets = 0;
+		const movedScreens =
+			waitReason === "typing"
+				? [TYPING_CLAUDE, EMPTY_CLAUDE]
+				: ["$ plain shell", EMPTY_CLAUDE];
+		const moved = fakeExec({
+			"herdr agent get": () =>
+				ok({ result: { agent: { pane_id: ++movedGets === 1 ? "wE:p2" : "wE:p3" } } }),
+			"herdr pane get": (args) =>
+				paneGet(args[2], {}, { focused: waitReason === "focused-unknown" && args[2] === "wE:p2" }),
+			"herdr pane read": (args) => {
+				assert.equal(args[2], "wE:p2");
+				return { stdout: movedScreens.shift() ?? TYPING_CLAUDE };
+			},
+		});
+		const movedResult = await deliverPrompt(
+			moved.deps,
+			{ pane: "receiver", text: "x", raw: true },
+			SENDER,
+		);
+		assert.equal(movedResult.status, "not_sent");
+		assert.equal(movedResult.pane, "wE:p3");
+		assert.equal(movedResult.waitedMs, 2_000);
+		assert.match(
+			movedResult.error ?? "",
+			/Target receiver moved from pane wE:p2 to wE:p3 while waiting; raw input not sent/,
+		);
+		assert.equal(moved.count("herdr agent get"), 2);
+		assert.equal(SENDS(moved.calls).length, 0);
+	}
+
+	let goneGets = 0;
+	const goneScreens = [TYPING_CLAUDE, EMPTY_CLAUDE];
+	const gone = fakeExec({
+		"herdr agent get": () =>
+			++goneGets === 1
+				? ok({ result: { agent: { pane_id: "wE:p2" } } })
+				: herdrError("agent_not_found", "no such agent"),
+		"herdr pane get": (args) => paneGet(args[2]),
+		"herdr pane read": () => ({ stdout: goneScreens.shift()! }),
+	});
+	const goneResult = await deliverPrompt(
+		gone.deps,
+		{ pane: "receiver", text: "x", raw: true },
+		SENDER,
+	);
+	assert.equal(goneResult.status, "not_sent");
+	assert.equal(goneResult.waitedMs, 2_000);
+	assert.match(goneResult.error ?? "", /Herdr target not found: receiver\./);
+	assert.equal(gone.count("herdr agent get"), 2);
+	assert.equal(SENDS(gone.calls).length, 0);
 });
 
 test("raw abort before lookup or during input reads and sleeps sends no input", async () => {
-	for (const when of ["before", "read", "sleep"]) {
+	for (const when of ["before", "read", "sleep", "readiness-sleep"] as const) {
 		const controller = new AbortController();
 		if (when === "before") controller.abort();
 		const { deps, calls, advance } = fakeExec({
-			"herdr pane get": () => paneGet("wE:p2", {}, { focused: false }),
+			"herdr pane get": () => paneGet("wE:p2", {}, { focused: when === "readiness-sleep" }),
 			"herdr pane read": () => {
 				if (when === "read") {
 					controller.abort();
 					return new Error("read aborted");
 				}
-				return { stdout: TYPING_CLAUDE };
+				return { stdout: when === "readiness-sleep" ? "$ plain shell" : TYPING_CLAUDE };
 			},
 		});
 		deps.sleep = async (ms) => { advance(ms); controller.abort(); };
@@ -688,6 +805,7 @@ test("raw abort before lookup or during input reads and sleeps sends no input", 
 		assert.match(result.error ?? "", /aborted/);
 		assert.equal(SENDS(calls).length, 0);
 		if (when === "before") assert.equal(calls.length, 0);
+		if (when === "readiness-sleep") assert.equal(result.waitedMs, 2_000);
 	}
 });
 
@@ -746,4 +864,128 @@ test("fractional clock and wait budgets never turn a typing draft into unfocused
 		assert.equal(count("herdr pane read"), waitBudget < 3_000 ? 1 : 3);
 		assert.equal(SENDS(calls).length, 0);
 	}
+});
+
+test("raw delivery waits on a focused pane with an unreadable input box, gives up at the cap, and refuses immediately when inputWaitMs = 0", async () => {
+	let gets = 0;
+	const sleeps: number[] = [];
+	const { deps, calls, count, advance } = fakeExec({
+		"herdr pane get": () => paneGet("wE:p2", {}, { focused: ++gets < 3 }),
+		"herdr pane read": () => ({ stdout: "$ plain shell" }),
+		"herdr pane send-text": () => ({}),
+		"herdr pane send-keys": () => ({}),
+	});
+	deps.sleep = async (ms) => {
+		sleeps.push(ms);
+		advance(ms);
+	};
+	const written = await deliverPrompt(deps, { pane: "wE:p2", text: "ls", raw: true }, SENDER);
+	assert.equal(written.ok, true);
+	assert.equal(written.status, "raw_written");
+	assert.equal(written.waitedMs, 4_000);
+	assert.deepEqual(sleeps, [2_000, 2_000]);
+	assert.equal(count("herdr pane get"), 3);
+	assert.equal(count("herdr pane read"), 3);
+	assert.equal(SENDS(calls).length, 2);
+
+	const stuck = fakeExec({
+		"herdr pane get": () => paneGet("wE:p2", {}, { focused: true }),
+		"herdr pane read": () => ({ stdout: "$ plain shell" }),
+	});
+	stuck.deps.inputWaitMs = 6_000;
+	const refused = await deliverPrompt(stuck.deps, { pane: "wE:p2", text: "ls", raw: true }, SENDER);
+	assert.equal(refused.ok, false);
+	assert.equal(refused.status, "not_sent");
+	assert.equal(refused.waitedMs, 6_000);
+	assert.match(refused.error ?? "", /could not be read and the pane is focused.*after 6s; raw input not sent\. Retry later\./);
+	assert.equal(SENDS(stuck.calls).length, 0);
+
+	const zeroSleeps: number[] = [];
+	const zero = fakeExec({
+		"herdr pane get": () => paneGet("wE:p2", {}, { focused: true }),
+		"herdr pane read": () => ({ stdout: "$ plain shell" }),
+	});
+	zero.deps.inputWaitMs = 0;
+	zero.deps.sleep = async (ms) => {
+		zeroSleeps.push(ms);
+		zero.advance(ms);
+	};
+	const immediate = await deliverPrompt(zero.deps, { pane: "wE:p2", text: "ls", raw: true }, SENDER);
+	assert.equal(immediate.ok, false);
+	assert.equal(immediate.status, "not_sent");
+	assert.equal(immediate.waitedMs, undefined);
+	assert.equal(zeroSleeps.length, 0);
+	assert.equal(zero.count("herdr pane get"), 1);
+	assert.equal(zero.count("herdr pane read"), 1);
+	assert.equal(SENDS(zero.calls).length, 0);
+});
+
+test("raw retry lookups bound sequential name resolution by waitDeadline, include final lookup time, and keep focused refusal on small remainders", async () => {
+	let timedGets = 0;
+	let timedReads = 0;
+	const timed = fakeExec({
+		"herdr pane get": () => {
+			if (++timedGets === 1) return paneGet("wE:p2", {}, { focused: true });
+			timed.advance(500);
+			return paneGet("wE:p2", {}, { focused: false });
+		},
+		"herdr pane read": () => {
+			if (++timedReads > 1) timed.advance(100);
+			return { stdout: "$ plain shell" };
+		},
+		"herdr pane send-text": () => ({}),
+		"herdr pane send-keys": () => ({}),
+	});
+	const timedResult = await deliverPrompt(timed.deps, { pane: "wE:p2", text: "ls", raw: true }, SENDER);
+	assert.equal(timedResult.status, "raw_written");
+	assert.equal(timedResult.waitedMs, 2_600);
+
+	for (const overMode of ["killed", "late-unfocused"] as const) {
+		let agentGets = 0;
+		let paneGets = 0;
+		let paneReads = 0;
+		const over = fakeExec({
+			"herdr agent get": (_args, options) => {
+				if (++agentGets > 1) {
+					assert.equal(options?.timeout, 1_200);
+					over.advance(700);
+				}
+				return ok({ result: { agent: { pane_id: "wE:p2" } } });
+			},
+			"herdr pane get": (_args, options) => {
+				if (++paneGets === 1) return paneGet("wE:p2", {}, { focused: true });
+				assert.equal(options?.timeout, 500);
+				if (overMode === "killed") {
+					over.advance(options?.timeout ?? 0);
+					return { killed: true, code: 0, stdout: "", stderr: "" };
+				}
+				over.advance(2_000);
+				return paneGet("wE:p2", {}, { focused: false });
+			},
+			"herdr pane read": () => {
+				if (++paneReads > 1) over.advance(300);
+				return { stdout: "$ plain shell" };
+			},
+		});
+		over.deps.inputWaitMs = 3_500;
+		const overResult = await deliverPrompt(over.deps, { pane: "receiver", text: "ls", raw: true }, SENDER);
+		assert.equal(overResult.status, "not_sent");
+		assert.match(overResult.error ?? "", /could not be read and the pane is focused/);
+		assert.equal(SENDS(over.calls).length, 0);
+		if (overMode === "killed") assert.equal(overResult.waitedMs, 3_500);
+	}
+
+	const subRecheck = fakeExec({
+		"herdr pane get": () => paneGet("wE:p2", {}, { focused: true }),
+		"herdr pane read": () => {
+			subRecheck.advance(0.4);
+			return { stdout: "$ plain shell" };
+		},
+	});
+	subRecheck.deps.inputWaitMs = 2_001.5;
+	const subResult = await deliverPrompt(subRecheck.deps, { pane: "wE:p2", text: "ls", raw: true }, SENDER);
+	assert.equal(subResult.status, "not_sent");
+	assert.match(subResult.error ?? "", /could not be read and the pane is focused/);
+	assert.equal(subResult.waitedMs, 2_000.4);
+	assert.equal(subRecheck.count("herdr pane read"), 1);
 });

@@ -15,6 +15,8 @@ const SEND_TIMEOUT_MS = 30_000;
 const WAIT_CLI_TIMEOUT_MS = 30_000;
 const WAIT_TIMEOUT_MS = 60_000;
 const PANE_ID = /^w[^:\s]+:p[^:\s]+$/;
+const POLL_INTERVAL_MS = 2_000;
+const MIN_RECHECK_MS = 1_000;
 
 export const USAGE = "Usage: /herdr-send [--wait|--raw] <pane> <text>";
 export const GJC_NOT_FOUND = "gjc CLI not found on PATH";
@@ -98,12 +100,17 @@ async function herdrJson(
 	deps: SendDeps,
 	args: string[],
 	target: string,
+	timeoutMs = HERDR_TIMEOUT_MS,
 ): Promise<Json> {
 	const operation = `${args[0]} ${args[1]}`;
+	const timeout = Math.floor(timeoutMs);
+	if (timeout < 1) {
+		throw new Error(`Herdr is unavailable: ${operation} timed out`);
+	}
 	let result: ExecResult;
 	try {
 		result = await deps.exec(deps.herdrBin, args, {
-			timeout: HERDR_TIMEOUT_MS,
+			timeout,
 		});
 	} catch (error) {
 		throw new Error(`Herdr is unavailable: ${errorMessage(error)}`);
@@ -136,12 +143,21 @@ async function herdrJson(
 export async function resolveTargetPane(
 	deps: SendDeps,
 	target: string,
+	timeoutMs?: number,
 ): Promise<TargetPane> {
+	const now = deps.now ?? (() => performance.now());
+	const deadline = timeoutMs !== undefined ? now() + timeoutMs : undefined;
+	const stepTimeout = () =>
+		deadline !== undefined
+			? Math.min(HERDR_TIMEOUT_MS, deadline - now())
+			: HERDR_TIMEOUT_MS;
 	let paneId = target;
 	if (!PANE_ID.test(target)) {
 		const agent = record(
-			record((await herdrJson(deps, ["agent", "get", target], target)).result)
-				?.agent,
+			record(
+				(await herdrJson(deps, ["agent", "get", target], target, stepTimeout()))
+					.result,
+			)?.agent,
 		);
 		if (typeof agent?.pane_id !== "string" || !agent.pane_id) {
 			throw new Error("Herdr agent get returned an invalid response.");
@@ -149,8 +165,10 @@ export async function resolveTargetPane(
 		paneId = agent.pane_id;
 	}
 	const pane = record(
-		record((await herdrJson(deps, ["pane", "get", paneId], target)).result)
-			?.pane,
+		record(
+			(await herdrJson(deps, ["pane", "get", paneId], target, stepTimeout()))
+				.result,
+		)?.pane,
 	);
 	if (typeof pane?.pane_id !== "string" || !pane.pane_id) {
 		throw new Error("Herdr pane get returned an invalid response.");
@@ -430,56 +448,129 @@ export async function deliverPrompt(
 		if (pane.paneId === sender.pane) {
 			return fail("Cannot send raw input to the current Herdr pane.", pane.paneId);
 		}
-		const guard = await waitForEmptyInput(
-			deps,
-			pane.paneId,
-			deps.inputWaitMs ?? inputWaitMs(),
-			signal,
-			pane.agent,
-		);
-		const waited = guard.waitedMs > 0 ? { waitedMs: guard.waitedMs } : {};
-		if (signal?.aborted) {
-			return { ...fail("Raw delivery aborted before sending.", pane.paneId), ...waited };
-		}
-		if (guard.waitedMs > 0) {
-			try {
-				pane = await resolveTargetPane(deps, target);
-			} catch (error) {
-				return { ...fail(errorMessage(error), pane.paneId), ...waited };
+		const maxWaitMs = deps.inputWaitMs ?? inputWaitMs();
+		const now = deps.now ?? (() => performance.now());
+		const sleep =
+			deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+		const waitStart = now();
+		const waitDeadline = waitStart + maxWaitMs;
+		let waitActive = false;
+		let retrying = false;
+		let totalWaitedMs = 0;
+		let lastUnready: "typing" | "focused" = "typing";
+		const syncWait = () => {
+			if (waitActive) totalWaitedMs = Math.max(0, now() - waitStart);
+		};
+		const waited = () => (totalWaitedMs > 0 ? { waitedMs: totalWaitedMs } : {});
+		const failTyping = () => {
+			syncWait();
+			return {
+				...fail(
+					`Target input box still has text after ${Math.round(totalWaitedMs / 1000)}s; raw input not sent. Retry later.`,
+					pane.paneId,
+				),
+				...waited(),
+			};
+		};
+		const failFocused = () => {
+			syncWait();
+			return {
+				...fail(
+					`Target input box could not be read and the pane is focused by a person who may be typing after ${Math.round(totalWaitedMs / 1000)}s; raw input not sent. Retry later.`,
+					pane.paneId,
+				),
+				...waited(),
+			};
+		};
+		const failLastUnready = () =>
+			lastUnready === "focused" ? failFocused() : failTyping();
+		for (;;) {
+			const guardedPaneId = pane.paneId;
+			let paneReads = 0;
+			const guard = await waitForEmptyInput(
+				{
+					...deps,
+					exec: async (command, args, options) => {
+						if (args[0] === "pane" && args[1] === "read") paneReads++;
+						return deps.exec(command, args, options);
+					},
+				},
+				guardedPaneId,
+				retrying ? waitDeadline - now() : maxWaitMs,
+				signal,
+				pane.agent,
+			);
+			if (guard.waitedMs > 0) waitActive = true;
+			if (paneReads > 1 || (guard.state === "typing" && paneReads > 0)) {
+				lastUnready = "typing";
 			}
+			syncWait();
 			if (signal?.aborted) {
-				return { ...fail("Raw delivery aborted before sending.", pane.paneId), ...waited };
+				return { ...fail("Raw delivery aborted before sending.", pane.paneId), ...waited() };
 			}
-			if (pane.agentStatus === "blocked") {
-				return {
-					...fail("Target is blocked on an approval or question; answer it first, then retry.", pane.paneId),
-					...waited,
-				};
+			if (guard.state === "typing") {
+				if (retrying && paneReads === 0) return failLastUnready();
+				return failTyping();
 			}
-			if (pane.paneId === sender.pane) {
-				return { ...fail("Cannot send raw input to the current Herdr pane.", pane.paneId), ...waited };
+			if (waitActive) {
+				const remainingForResolve = waitDeadline - now();
+				if (Math.floor(remainingForResolve) < 1) {
+					return failLastUnready();
+				}
+				try {
+					pane = await resolveTargetPane(deps, target, remainingForResolve);
+				} catch (error) {
+					syncWait();
+					if (now() >= waitDeadline && /timed out/.test(errorMessage(error))) {
+						return failLastUnready();
+					}
+					return { ...fail(errorMessage(error), pane.paneId), ...waited() };
+				}
+				syncWait();
+				if (signal?.aborted) {
+					return { ...fail("Raw delivery aborted before sending.", pane.paneId), ...waited() };
+				}
+				if (pane.agentStatus === "blocked") {
+					return {
+						...fail("Target is blocked on an approval or question; answer it first, then retry.", pane.paneId),
+						...waited(),
+					};
+				}
+				if (pane.paneId === sender.pane) {
+					return { ...fail("Cannot send raw input to the current Herdr pane.", pane.paneId), ...waited() };
+				}
+				if (pane.paneId !== guardedPaneId) {
+					return {
+						...fail(
+							`Target ${target} moved from pane ${guardedPaneId} to ${pane.paneId} while waiting; raw input not sent. Retry later.`,
+							pane.paneId,
+						),
+						...waited(),
+					};
+				}
+				if (now() > waitDeadline) {
+					return failLastUnready();
+				}
 			}
+			// Input box unreadable: fall back to the focus rule (a focused pane may have a person typing).
+			if (guard.state === "unknown" && pane.focused) {
+				lastUnready = "focused";
+				const remainingBeforeSleep = waitDeadline - now();
+				if (remainingBeforeSleep >= 1) {
+					waitActive = true;
+					retrying = true;
+					await sleep(Math.min(POLL_INTERVAL_MS, remainingBeforeSleep));
+					syncWait();
+					if (signal?.aborted) {
+						return { ...fail("Raw delivery aborted before sending.", pane.paneId), ...waited() };
+					}
+					if (waitDeadline - now() >= MIN_RECHECK_MS) continue;
+				}
+				return failFocused();
+			}
+			syncWait();
+			return { ...(await sendRawPrompt(deps, pane.paneId, request.text, signal)), ...waited() };
 		}
-		if (guard.state === "typing") {
-			return {
-				...fail(
-					`Target input box still has text after ${Math.round(guard.waitedMs / 1000)}s; raw input not sent. Retry later.`,
-					pane.paneId,
-				),
-				...waited,
-			};
-		}
-		// Input box unreadable: fall back to the focus rule (a focused pane may have a person typing).
-		if (guard.state === "unknown" && pane.focused) {
-			return {
-				...fail(
-					"Target input box could not be read and the pane is focused by a person who may be typing; raw input not sent. Retry later.",
-					pane.paneId,
-				),
-				...waited,
-			};
-		}
-		return { ...(await sendRawPrompt(deps, pane.paneId, request.text, signal)), ...waited };
 	}
 
 	let sessionId: string;
