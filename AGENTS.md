@@ -87,7 +87,10 @@
 - **우선순위:** 이 머신에 설치된 바이너리의 `--help`, 소스, 실측이 우선이다(기존 "명령 문법은 설치된 binary가 기준" 규칙과 같다). Context7은 그다음 근거다. 둘이 다르면 로컬을 따르고, 차이를 결과 파일에 적는다.
 - **기록:** 결과 파일에는 라이브러리 ID와 확인 내용을 짧게 적는다. 문서 버전·날짜는 응답에 있을 때만 적고, 없으면 "버전·날짜 미제공"으로 적는다. 라이브러리를 찾지 못했으면 "Context7 미수록", 라이브러리는 있으나 관련 문서를 찾지 못했으면 "관련 문서 미확인"이라고 적고, 사용한 다른 근거를 적는다.
 - **쓸 수 없을 때:** 도구 미노출·sandbox 차단·연결 실패면 우회하거나 설정을 바꾸지 않는다. 사유를 결과 파일에 적은 뒤 허용된 로컬 근거로 진행한다.
-- **agy 확인창:** agy는 Context7 MCP 도구 호출마다 확인창을 띄운다(2026-10-16 실측: `resolve-library-id`, `query-docs`). 배정 범위 안의 읽기 전용 `context7/resolve-library-id`·`context7/query-docs` 호출에 한해, 팀장이 도구 이름과 조회 인자 전체를 확인한 뒤 "이번만"(1번)으로 답한다. 전문을 확인할 수 없으면 승인하지 않고 아래 확인창 전문 확인 절차를 따른다. 대화 한정·영구 허용(`settings.json`)은 사용자 승인으로만 쓴다.
+- **agy 영구 허용:** agy의 읽기 전용 Context7 도구 두 개(`context7/query-docs`, `context7/resolve-library-id`)는 사용자 승인(2026-10-16, #41)으로 **영구 허용**한다(확인창 3번, `~/.gemini/antigravity-cli/settings.json`). 그래서 보통은 확인창이 뜨지 않는다.
+  - 새 머신이나 설정 초기화로 확인창이 다시 뜨면, 팀장은 전체 도구 식별자가 `context7/query-docs` 또는 `context7/resolve-library-id`인지 확인한다. 선택지 문구가 그 도구 하나만 영구 허용하는지도 확인한 뒤 그 선택지로 답한다(2026-10-16 화면에서는 3번 "always allow tool '<도구>' (Persist to settings.json)"). 서버 전체나 다른 도구까지 허용하는 선택지는 고르지 않는다. 범위를 확인할 수 없으면 승인하지 않는다.
+  - 다른 MCP 도구(notebooklm 등)는 영구 허용하지 않는다. 아래 확인창 응답 규칙대로 도구 이름과 인자 전체를 확인한 뒤 "이번만"(1번)으로만 답한다. 전문을 확인할 수 없으면 승인하지 않고 아래 확인창 전문 확인 절차를 따른다.
+- **질의 내용:** Context7 질의는 외부 서비스로 나간다. 질의에는 라이브러리·API 이름과 일반 질문만 쓴다. 코드, 비밀값, 개인정보, 내부 경로는 넣지 않는다.
 - **확인된 수록(2026-10-16):** Bun `/oven-sh/bun`, Herdr `/herdrdev/herdr`·`/websites/herdr_dev`, Claude Code `/anthropics/claude-code`다. 다른 라이브러리는 그때그때 `resolve-library-id`로 찾는다.
 - **설정 위치:** GJC는 플러그인 `@upstash/context7-pi`, agy는 `~/.gemini/config/mcp_config.json`의 `context7`, Codex는 `~/.codex/config.toml`의 `[mcp_servers.context7]`에 있다(팀장 Claude는 미설정). 모두 사용자 설정이므로 이 저장소 작업에서 바꾸지 않는다.
 
@@ -103,9 +106,9 @@ LFAI 합본 보고서와 GJCH 시범(#21·#23)에서 확인된 조건에, 같은
 - `.gjc/RULES.md`는 자동으로 실리지 않으니, 필요한 규칙은 지시서에 넣는다.
 - 실행 옵션을 `--mode accept-edits --sandbox`로 두는 이유는 공통 설정이 `proceed-in-sandbox`라서, sandbox 안의 셸·편집은 무확인이고 sandbox 밖 실행만 확인하기 때문이다.
 - sandbox 안에서는 홈 설정 파일을 읽는 `git`·`gh`가 실패하므로(`~/.gitconfig`·`~/.config/gh` 접근 거부) diff·이슈 확인은 팀장이 하고, 필요한 배경은 지시서에 싣는다.
-- 확인창 응답 규칙: 폴더 신뢰 창은 사용자가 답한다. 명령·편집 확인창은 팀장이 명령 원문을 확인한 뒤 "이번만"(1번)으로만 답한다. 대화 한정·영구 저장(`settings.json`) 선택지는 사용자 승인으로만 쓴다.
+- 확인창 응답 규칙: 폴더 신뢰 창은 사용자가 답한다. 명령·편집 확인창은 팀장이 명령 원문을 확인한 뒤 "이번만"(1번)으로만 답한다. 대화 한정·영구 저장(`settings.json`) 선택지는 사용자 승인으로만 쓴다. 이미 승인된 예외는 Context7 읽기 전용 도구 두 개뿐이다("문서 확인(Context7)" 참조).
 - 확인창의 명령이 잘려 보이면 `herdr pane zoom <agy pane>`으로 키우고, 확인창에서 `ctrl+g`(Full Command 보기)로 전문을 읽은 뒤 `esc`로 확인창에 돌아오고, `herdr pane zoom`으로 원래 크기로 되돌린다. 전문을 다 읽을 수 없으면 확인창의 취소 선택지(4번 "No, cancel")를 고르고, 짧은 명령이나 편집 도구로 나눠서 다시 하게 한다. 이 절차는 CF 팀 관측에서 가져왔고 이 저장소에서 독립 재현하지 않았다.
-- `~/.gemini/antigravity-cli/settings.json`은 이 머신의 모든 agy가 함께 쓰는 사용자 설정이므로 이 저장소 작업에서 바꾸지 않는다.
+- `~/.gemini/antigravity-cli/settings.json`은 이 머신의 모든 agy가 함께 쓰는 사용자 설정이다. 이 저장소 작업에서는 직접 편집하지 않는다. 예외로 사용자 승인(#41)에 따른 `context7/query-docs`·`context7/resolve-library-id`의 영구 허용만 확인창에서 저장할 수 있다. 다른 설정은 바꾸지 않는다.
 
 **협업 중에도 절대 하지 않는 일:**
 
