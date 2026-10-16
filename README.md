@@ -227,6 +227,7 @@ GJC 0.18.7은 플러그인이 skill을 등록할 수 없다(파일시스템 기�
 - **팀장 우편 스크립트(Claude Code 등)**:
   - `scripts/mail-watch.sh <받는이> [--timeout <초>]`: 읽기 전용으로 `<루트>/<받는이>/<ULID>.md`를 살핀다(기본 `--timeout 1800`, `--timeout 0`은 1회만 확인, 첫 경계 검사 성공 직후 stderr에 `mail-watch: root=<우편함 루트> recipient=<이름> timeout=<초>`를 1회 표시). 대기(pending) 우편이 있으면 절대 경로를 ULID 오름차순으로 줄마다 출력하고 종료 코드 `0`, 시간 한도에 닿으면 빈 출력과 종료 코드 `2`, 경계·링크·비정상 ack·읽기 오류는 stderr 진단과 종료 코드 `1`로 끝난다.
   - `scripts/mail-ack.sh <받는이> <id> received|rejected [사유]`: 원본을 검증한 뒤 `via: manual`로 `<id>.ack`를 기록한다(`received`는 사유 금지·원본 유효성 및 `body_sha256` 검증, `rejected`는 1–200바이트 사유 필수, 기존 `uncertain`은 `rename`으로 교체). 성공 시 ack 경로를 출력하고 종료 코드 `0`, 거절·오류는 종료 코드 `1`이다. `mail-ack.sh`는 한 번에 하나씩(단일 팀장 세션, 직렬 호출) 실행한다. 동시에 같은 id로 실행하면 나중 결과가 앞 결과를 덮어쓸 수 있다(`uncertain` 교체 구간).
+  - `scripts/mail-send.sh <받는이> --subject <제목> [--from <이름>] [--reply-to <ULID>] [--body-file <경로> | -]`: 발신 이름(`--from` 우선, 없으면 `GJC_HERDR_MAILBOX`)과 본문(`--body-file`, stdin `-`, 생략 시 빈 본문)을 검증한 뒤 `<루트>/<받는이>/<id>.md`에 배타적으로 공개한다. 성공 시 메시지 절대 경로를 출력하고 종료 코드 `0`, 인자·경계·형식·공개 오류는 stderr 진단(`mail-send error [<코드>]: <사유>`)과 종료 코드 `1`이다. 제목이 `-`이거나 옵션 이름과 같으면 `--subject=<제목>`으로 붙여 쓴다.
 
 ## 제거
 

@@ -5,6 +5,7 @@ import type { ExecResult } from "@gajae-code/coding-agent";
 import {
 	ackMailbox,
 	runMailCli,
+	sendMailbox,
 	watchMailbox,
 	type MailCliDeps,
 } from "../scripts/mail-cli.ts";
@@ -14,7 +15,9 @@ import {
 	formatMailMessage,
 	MAIL_DIR_MODE,
 	MAIL_FILE_MODE,
+	MAX_MESSAGE_BYTES,
 	parseMailAck,
+	parseMailMessage,
 	type MailDeps,
 	type MailFileHandle,
 	type MailFs,
@@ -1045,4 +1048,492 @@ test("runMailCli: argument validation and exit code mapping for watch and ack", 
 		assert.equal(res.exitCode, 1);
 		assert.notEqual(res.stderr, "");
 	}
+});
+
+test("send: publishes mail using --from, GJC_HERDR_MAILBOX env, and --from overriding env, and rejects missing or invalid sender name", async () => {
+	// 1. --from provided (with empty env)
+	const envFromFlag = createFakeCliEnv();
+	const resFromFlag = await runMailCli(
+		[
+			"send",
+			"gjc-herdr-mate",
+			"--from",
+			"gjc-herdr-lead",
+			"--subject",
+			"지시서 전달",
+		],
+		{ ...envFromFlag.deps, env: {} },
+	);
+	assert.equal(resFromFlag.exitCode, 0);
+	assert.equal(resFromFlag.stderr, "");
+	const pathFromFlag = resFromFlag.stdout.trim();
+	assert.match(
+		pathFromFlag,
+		/^\/repo\/\.gjc-herdr\/mailbox\/gjc-herdr-mate\/[0-9A-HJKMNP-TV-Z]{26}\.md$/,
+	);
+	const msgFromFlag = parseMailMessage(
+		envFromFlag.nodes.get(pathFromFlag)!.bytes,
+	);
+	assert.equal(msgFromFlag.ok, true);
+	if (msgFromFlag.ok) {
+		assert.equal(msgFromFlag.value.from, "gjc-herdr-lead");
+		assert.equal(msgFromFlag.value.to, "gjc-herdr-mate");
+		assert.equal(msgFromFlag.value.subject, "지시서 전달");
+		assert.equal(msgFromFlag.value.body, "");
+	}
+
+	// 2. GJC_HERDR_MAILBOX env used when --from is omitted
+	const envFromEnv = createFakeCliEnv();
+	const resFromEnv = await sendMailbox(
+		["gjc-herdr-mate", "--subject", "환경변수 발신"],
+		{
+			...envFromEnv.deps,
+			env: { GJC_HERDR_MAILBOX: "gjc-herdr-lead" },
+		},
+	);
+	assert.equal(resFromEnv.exitCode, 0);
+	const msgFromEnv = parseMailMessage(
+		envFromEnv.nodes.get(resFromEnv.stdout.trim())!.bytes,
+	);
+	assert.equal(msgFromEnv.ok, true);
+	if (msgFromEnv.ok) {
+		assert.equal(msgFromEnv.value.from, "gjc-herdr-lead");
+	}
+
+	// 3. --from overrides GJC_HERDR_MAILBOX env
+	const envOverride = createFakeCliEnv();
+	const resOverride = await sendMailbox(
+		[
+			"gjc-herdr-mate",
+			"--from",
+			"gjc-herdr-lead",
+			"--subject",
+			"우선순위 확인",
+		],
+		{
+			...envOverride.deps,
+			env: { GJC_HERDR_MAILBOX: "gjc-herdr-deputy" },
+		},
+	);
+	assert.equal(resOverride.exitCode, 0);
+	const msgOverride = parseMailMessage(
+		envOverride.nodes.get(resOverride.stdout.trim())!.bytes,
+	);
+	assert.equal(msgOverride.ok, true);
+	if (msgOverride.ok) {
+		assert.equal(msgOverride.value.from, "gjc-herdr-lead");
+	}
+
+	// 4. Missing sender name (neither --from nor GJC_HERDR_MAILBOX) -> exit 1
+	const envNoSender = createFakeCliEnv();
+	const resNoSender = await sendMailbox(
+		["gjc-herdr-mate", "--subject", "발신자 없음"],
+		{ ...envNoSender.deps, env: {} },
+	);
+	assert.equal(resNoSender.exitCode, 1);
+	assert.equal(resNoSender.stdout, "");
+	assert.match(
+		resNoSender.stderr,
+		/^mail-send error \[missing_sender_mailbox\]:/,
+	);
+	assert.deepEqual(envNoSender.writeCalls, []);
+
+	// 5. Invalid sender name (via --from and via env) -> exit 1
+	for (const badCall of [
+		{
+			args: ["gjc-herdr-mate", "--from", "Bad_Sender", "--subject", "제목"],
+			env: {},
+		},
+		{
+			args: ["gjc-herdr-mate", "--subject", "제목"],
+			env: { GJC_HERDR_MAILBOX: "Bad_Sender" },
+		},
+	]) {
+		const envBad = createFakeCliEnv();
+		const resBad = await sendMailbox(badCall.args, {
+			...envBad.deps,
+			env: badCall.env,
+		});
+		assert.equal(resBad.exitCode, 1);
+		assert.equal(resBad.stdout, "");
+		assert.match(resBad.stderr, /^mail-send error \[invalid_sender_mailbox\]:/);
+		assert.deepEqual(envBad.writeCalls, []);
+	}
+});
+
+test("send: --body-file reads valid UTF-8 regular file and rejects symlink, non-regular file, size over 256 KiB, and invalid UTF-8", async () => {
+	// 1. Valid --body-file
+	const envOk = createFakeCliEnv();
+	envOk.setFile("/repo/brief.md", "본문 파일 내용입니다.\n둘째 줄입니다.\n");
+	const resOk = await sendMailbox(
+		[
+			RECIPIENT,
+			"--from",
+			"gjc-herdr-lead",
+			"--subject",
+			"파일 본문 전송",
+			"--body-file",
+			"/repo/brief.md",
+		],
+		envOk.deps,
+	);
+	assert.equal(resOk.exitCode, 0);
+	const msgOk = parseMailMessage(envOk.nodes.get(resOk.stdout.trim())!.bytes);
+	assert.equal(msgOk.ok, true);
+	if (msgOk.ok) {
+		assert.equal(msgOk.value.body, "본문 파일 내용입니다.\n둘째 줄입니다.\n");
+	}
+
+	// 2. Symlink --body-file -> exit 1 (symlink_rejected)
+	const envSym = createFakeCliEnv();
+	envSym.setFile("/repo/link.md", "링크 본문\n", "symlink");
+	const resSym = await sendMailbox(
+		[
+			RECIPIENT,
+			"--from",
+			"gjc-herdr-lead",
+			"--subject",
+			"링크 거절",
+			"--body-file",
+			"/repo/link.md",
+		],
+		envSym.deps,
+	);
+	assert.equal(resSym.exitCode, 1);
+	assert.match(resSym.stderr, /^mail-send error \[symlink_rejected\]:/);
+	assert.deepEqual(envSym.writeCalls, []);
+
+	// 3. Non-regular file (FIFO and directory) -> exit 1 (not_regular_file)
+	for (const kind of ["fifo", "dir"] as const) {
+		const envNonReg = createFakeCliEnv();
+		envNonReg.setFile("/repo/nonreg", "x", kind);
+		const resNonReg = await sendMailbox(
+			[
+				RECIPIENT,
+				"--from",
+				"gjc-herdr-lead",
+				"--subject",
+				"비일반 파일 거절",
+				"--body-file",
+				"/repo/nonreg",
+			],
+			envNonReg.deps,
+		);
+		assert.equal(resNonReg.exitCode, 1);
+		assert.match(resNonReg.stderr, /^mail-send error \[not_regular_file\]:/);
+		assert.deepEqual(envNonReg.writeCalls, []);
+	}
+
+	// 4. Size limit exceeded (file > 256 KiB and file where header + body > 256 KiB) -> exit 1 (size_exceeded)
+	for (const bodyLen of [MAX_MESSAGE_BYTES + 10, MAX_MESSAGE_BYTES]) {
+		const envBig = createFakeCliEnv();
+		envBig.setFile("/repo/big.md", new Uint8Array(bodyLen).fill(0x61));
+		const resBig = await sendMailbox(
+			[
+				RECIPIENT,
+				"--from",
+				"gjc-herdr-lead",
+				"--subject",
+				"크기 초과",
+				"--body-file",
+				"/repo/big.md",
+			],
+			envBig.deps,
+		);
+		assert.equal(resBig.exitCode, 1);
+		assert.match(resBig.stderr, /^mail-send error \[size_exceeded\]:/);
+		assert.deepEqual(envBig.writeCalls, []);
+	}
+
+	// 5. Invalid UTF-8 in --body-file -> exit 1 (invalid_utf8)
+	const envBadUtf8 = createFakeCliEnv();
+	envBadUtf8.setFile("/repo/bad.md", new Uint8Array([0x61, 0xff, 0xfe, 0x0a]));
+	const resBadUtf8 = await sendMailbox(
+		[
+			RECIPIENT,
+			"--from",
+			"gjc-herdr-lead",
+			"--subject",
+			"잘못된 UTF-8",
+			"--body-file",
+			"/repo/bad.md",
+		],
+		envBadUtf8.deps,
+	);
+	assert.equal(resBadUtf8.exitCode, 1);
+	assert.match(resBadUtf8.stderr, /^mail-send error \[invalid_utf8\]:/);
+	assert.deepEqual(envBadUtf8.writeCalls, []);
+});
+
+test("send: reads body from stdin (-), supports empty body when neither --body-file nor - is given, and enforces stdin size and UTF-8 limits", async () => {
+	// 1. Stdin body (-) from chunked async iterable
+	const envStdin = createFakeCliEnv();
+	async function* fakeStdinChunks() {
+		yield new TextEncoder().encode("표준 입력 첫 줄\n");
+		yield new TextEncoder().encode("표준 입력 둘째 줄\n");
+	}
+	const resStdin = await sendMailbox(
+		[RECIPIENT, "--from", "gjc-herdr-lead", "--subject", "stdin 본문", "-"],
+		{ ...envStdin.deps, stdin: fakeStdinChunks() },
+	);
+	assert.equal(resStdin.exitCode, 0);
+	const msgStdin = parseMailMessage(
+		envStdin.nodes.get(resStdin.stdout.trim())!.bytes,
+	);
+	assert.equal(msgStdin.ok, true);
+	if (msgStdin.ok) {
+		assert.equal(msgStdin.value.body, "표준 입력 첫 줄\n표준 입력 둘째 줄\n");
+	}
+
+	// 2. Empty body when neither --body-file nor - is provided
+	const envEmpty = createFakeCliEnv();
+	const resEmpty = await sendMailbox(
+		[RECIPIENT, "--from", "gjc-herdr-lead", "--subject", "빈 본문 확인"],
+		envEmpty.deps,
+	);
+	assert.equal(resEmpty.exitCode, 0);
+	const msgEmpty = parseMailMessage(
+		envEmpty.nodes.get(resEmpty.stdout.trim())!.bytes,
+	);
+	assert.equal(msgEmpty.ok, true);
+	if (msgEmpty.ok) {
+		assert.equal(msgEmpty.value.body, "");
+	}
+
+	// 3. Stdin size limit: reads at most MAX_MESSAGE_BYTES + 1 bytes and stops consuming further chunks
+	const envStdinBig = createFakeCliEnv();
+	let chunksYielded = 0;
+	async function* hugeStdin() {
+		for (let i = 0; i < 5; i++) {
+			chunksYielded += 1;
+			yield new Uint8Array(100 * 1_024).fill(0x62);
+		}
+	}
+	const resStdinBig = await sendMailbox(
+		[RECIPIENT, "--from", "gjc-herdr-lead", "--subject", "stdin 초과", "-"],
+		{ ...envStdinBig.deps, stdin: hugeStdin() },
+	);
+	assert.equal(resStdinBig.exitCode, 1);
+	assert.equal(chunksYielded, 3); // 300 KiB > 256 KiB + 1, stops on 3rd chunk without reading 4th/5th
+	assert.match(resStdinBig.stderr, /^mail-send error \[size_exceeded\]:/);
+
+	// 4. Stdin invalid UTF-8 -> exit 1 (invalid_utf8)
+	const envStdinUtf8 = createFakeCliEnv();
+	const resStdinUtf8 = await sendMailbox(
+		[
+			RECIPIENT,
+			"--from",
+			"gjc-herdr-lead",
+			"--subject",
+			"stdin 잘못된 인코딩",
+			"-",
+		],
+		{ ...envStdinUtf8.deps, stdin: new Uint8Array([0xc3, 0x28]) },
+	);
+	assert.equal(resStdinUtf8.exitCode, 1);
+	assert.match(resStdinUtf8.stderr, /^mail-send error \[invalid_utf8\]:/);
+});
+
+test("send: supports valid --reply-to ULID and rejects invalid --reply-to format", async () => {
+	// 1. Valid --reply-to
+	const envOk = createFakeCliEnv();
+	const resOk = await sendMailbox(
+		[
+			RECIPIENT,
+			"--from",
+			"gjc-herdr-lead",
+			"--subject",
+			"답장 제목",
+			"--reply-to",
+			ID_1,
+		],
+		envOk.deps,
+	);
+	assert.equal(resOk.exitCode, 0);
+	const msgOk = parseMailMessage(envOk.nodes.get(resOk.stdout.trim())!.bytes);
+	assert.equal(msgOk.ok, true);
+	if (msgOk.ok) {
+		assert.equal(msgOk.value.replyTo, ID_1);
+	}
+
+	// 2. Invalid --reply-to -> exit 1 (invalid_reply_to)
+	const envBad = createFakeCliEnv();
+	const resBad = await sendMailbox(
+		[
+			RECIPIENT,
+			"--from",
+			"gjc-herdr-lead",
+			"--subject",
+			"잘못된 답장 ID",
+			"--reply-to",
+			"not-a-valid-ulid",
+		],
+		envBad.deps,
+	);
+	assert.equal(resBad.exitCode, 1);
+	assert.match(resBad.stderr, /^mail-send error \[invalid_reply_to\]:/);
+	assert.deepEqual(envBad.writeCalls, []);
+});
+
+test("send: a subject that looks like an option needs --subject=<value>", async () => {
+	for (const subject of ["-", "--from"]) {
+		// The split form reads the option-like word as a missing value.
+		const envSplit = createFakeCliEnv();
+		const resSplit = await sendMailbox(
+			[RECIPIENT, "--subject", subject, "--from", "gjc-herdr-lead"],
+			envSplit.deps,
+		);
+		assert.equal(resSplit.exitCode, 1);
+		assert.match(resSplit.stderr, /^mail-send error \[invalid_args\]:/);
+		assert.deepEqual(envSplit.writeCalls, []);
+
+		// The joined form keeps it as the subject.
+		const envJoined = createFakeCliEnv();
+		const resJoined = await sendMailbox(
+			[RECIPIENT, `--subject=${subject}`, "--from", "gjc-herdr-lead"],
+			envJoined.deps,
+		);
+		assert.equal(resJoined.exitCode, 0);
+		const msg = parseMailMessage(envJoined.nodes.get(resJoined.stdout.trim())!.bytes);
+		assert.equal(msg.ok, true);
+		if (msg.ok) {
+			assert.equal(msg.value.subject, subject);
+		}
+	}
+});
+
+test("send: rejects all four argument error classes with exit code 1", async () => {
+	const env = createFakeCliEnv();
+
+	for (const badArgs of [
+		// (1) Unknown option / unexpected positional arg
+		[RECIPIENT, "--from", "gjc-herdr-lead", "--subject", "제목", "--unknown"],
+		[RECIPIENT, "--from", "gjc-herdr-lead", "--subject", "제목", "extra-pos"],
+		// (2) Option missing its value
+		[RECIPIENT, "--from", "gjc-herdr-lead", "--subject"],
+		[RECIPIENT, "--subject", "제목", "--from"],
+		[RECIPIENT, "--from", "gjc-herdr-lead", "--subject", "제목", "--reply-to"],
+		[RECIPIENT, "--from", "gjc-herdr-lead", "--subject", "제목", "--body-file"],
+		[RECIPIENT, "--from", "--subject", "제목"],
+		[RECIPIENT, "--from", "gjc-herdr-lead", "--subject="],
+		// (3) Missing --subject
+		[RECIPIENT, "--from", "gjc-herdr-lead"],
+		// (4) Both --body-file and '-' (stdin) specified together
+		[
+			RECIPIENT,
+			"--from",
+			"gjc-herdr-lead",
+			"--subject",
+			"제목",
+			"--body-file",
+			"/repo/body.md",
+			"-",
+		],
+	]) {
+		const res = await sendMailbox(badArgs, env.deps);
+		assert.equal(res.exitCode, 1);
+		assert.equal(res.stdout, "");
+		assert.match(res.stderr, /^mail-send error \[invalid_args\]:/);
+	}
+	assert.deepEqual(env.writeCalls, []);
+});
+
+test("send: propagates sendMail failure codes (id_conflict, not_ignored, boundary violations) to stderr with exit code 1, and emits warnings on exit code 0", async () => {
+	// 1. id_conflict: target message file already exists at the generated ULID path
+	const envConflict = createFakeCliEnv();
+	const firstRes = await sendMailbox(
+		[RECIPIENT, "--from", "gjc-herdr-lead", "--subject", "첫 전송"],
+		envConflict.deps,
+	);
+	assert.equal(firstRes.exitCode, 0);
+	// Sending again at the exact same fake timestamp + deterministic randomBytes hits EEXIST on link -> id_conflict
+	const secondRes = await sendMailbox(
+		[RECIPIENT, "--from", "gjc-herdr-lead", "--subject", "충돌 전송"],
+		envConflict.deps,
+	);
+	assert.equal(secondRes.exitCode, 1);
+	assert.equal(secondRes.stdout, "");
+	assert.match(secondRes.stderr, /^mail-send error \[id_conflict\]:/);
+
+	// 2. not_ignored: git check-ignore returns code 1
+	const envNotIgnored = createFakeCliEnv({
+		gitHandler(args) {
+			if (args[2] === "check-ignore") {
+				return { stdout: "", stderr: "", code: 1 };
+			}
+			return undefined;
+		},
+	});
+	const resNotIgnored = await sendMailbox(
+		[RECIPIENT, "--from", "gjc-herdr-lead", "--subject", "미무시 경로"],
+		envNotIgnored.deps,
+	);
+	assert.equal(resNotIgnored.exitCode, 1);
+	assert.match(resNotIgnored.stderr, /^mail-send error \[not_ignored\]:/);
+
+	// 3. Boundary violations: tracked_files, symlink_rejected, outside_repo
+	const envTracked = createFakeCliEnv({
+		gitHandler(args) {
+			if (args[2] === "ls-files") {
+				return { stdout: ".gjc-herdr/mailbox/tracked.md\n", code: 0 };
+			}
+			return undefined;
+		},
+	});
+	const resTracked = await sendMailbox(
+		[RECIPIENT, "--from", "gjc-herdr-lead", "--subject", "추적 파일 존재"],
+		envTracked.deps,
+	);
+	assert.equal(resTracked.exitCode, 1);
+	assert.match(resTracked.stderr, /^mail-send error \[tracked_files\]:/);
+
+	const envSymlinkDir = createFakeCliEnv();
+	envSymlinkDir.nodes.set(RECIPIENT_DIR, {
+		kind: "symlink",
+		mode: MAIL_DIR_MODE,
+		bytes: new Uint8Array(0),
+	});
+	const resSymlinkDir = await sendMailbox(
+		[RECIPIENT, "--from", "gjc-herdr-lead", "--subject", "심볼릭 링크 폴더"],
+		envSymlinkDir.deps,
+	);
+	assert.equal(resSymlinkDir.exitCode, 1);
+	assert.match(resSymlinkDir.stderr, /^mail-send error \[symlink_rejected\]:/);
+
+	const envOutside = createFakeCliEnv();
+	envOutside.nodes.set(RECIPIENT_DIR, {
+		kind: "dir",
+		mode: MAIL_DIR_MODE,
+		bytes: new Uint8Array(0),
+		realPath: "/tmp/escaped",
+	});
+	const resOutside = await sendMailbox(
+		[RECIPIENT, "--from", "gjc-herdr-lead", "--subject", "저장소 밖 탈출"],
+		envOutside.deps,
+	);
+	assert.equal(resOutside.exitCode, 1);
+	assert.match(resOutside.stderr, /^mail-send error \[outside_repo\]:/);
+
+	// 4. Post-publication cleanup failure + dir_mode_not_0700 -> exit 0 + stderr warnings
+	const envWarn = createFakeCliEnv({
+		unlinkHook(path) {
+			if (path.endsWith(".tmp")) {
+				throw Object.assign(new Error("EACCES: unlink failed"), {
+					code: "EACCES",
+				});
+			}
+		},
+	});
+	envWarn.nodes.get(RECIPIENT_DIR)!.mode = 0o755;
+	const resWarn = await sendMailbox(
+		[RECIPIENT, "--from", "gjc-herdr-lead", "--subject", "경고 확인"],
+		envWarn.deps,
+	);
+	assert.equal(resWarn.exitCode, 0);
+	assert.match(
+		resWarn.stdout,
+		/^\/repo\/\.gjc-herdr\/mailbox\/gjc-herdr-lead\/[0-9A-HJKMNP-TV-Z]{26}\.md\n$/,
+	);
+	assert.match(resWarn.stderr, /mail-send warning \[dir_mode_not_0700\]/);
+	assert.match(resWarn.stderr, /mail-send warning \[tmp_cleanup_failed\]/);
 });

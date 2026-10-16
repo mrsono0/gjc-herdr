@@ -8,6 +8,7 @@ import {
 	inspectMailboxReadBoundary,
 	isValidMailboxName,
 	isValidUlid,
+	MAILBOX_ENV_KEY,
 	MAX_MESSAGE_BYTES,
 	parseMailMessage,
 	prepareMailboxWriteBoundary,
@@ -17,6 +18,7 @@ import {
 	readMailboxFileBytes,
 	readMailMessageFile,
 	replaceUncertainAckFile,
+	sendMail,
 	validateFieldValue,
 	type MailDeps,
 	type MailFileHandle,
@@ -28,13 +30,21 @@ export const DEFAULT_WATCH_TIMEOUT_SEC = 1_800;
 export const WATCH_POLL_INTERVAL_MS = 1_000;
 export const MAILBOX_FILE_WARN_THRESHOLD = 1_000;
 
+export type MailStdinSource =
+	| AsyncIterable<Uint8Array | string>
+	| Iterable<Uint8Array | string>
+	| Uint8Array
+	| string;
+
 export interface MailCliDeps {
 	exec?: MailDeps["exec"];
 	fs?: MailFs;
+	env?: Record<string, string | undefined>;
 	now?: () => number;
 	sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
 	randomBytes?: (target: Uint8Array) => Uint8Array;
 	writeStderr?: (text: string) => void;
+	stdin?: MailStdinSource;
 	signal?: AbortSignal;
 }
 
@@ -890,6 +900,413 @@ export async function ackMailbox(
 	};
 }
 
+const SEND_OPTION_FLAGS = new Set([
+	"--subject",
+	"--from",
+	"--reply-to",
+	"--body-file",
+]);
+
+function parseSendArgs(
+	args: readonly string[],
+):
+	| {
+			ok: true;
+			recipient: string;
+			subject: string;
+			from?: string;
+			replyTo?: string;
+			bodyFile?: string;
+			useStdin: boolean;
+	  }
+	| { ok: false; code: string; message: string } {
+	if (args.length === 0) {
+		return {
+			ok: false,
+			code: "invalid_args",
+			message:
+				"Usage: mail-send.sh <recipient> --subject <subject> [--from <name>] [--reply-to <ulid>] [--body-file <path> | -]",
+		};
+	}
+	const recipient = args[0]!;
+	if (recipient.startsWith("-")) {
+		return {
+			ok: false,
+			code: "invalid_args",
+			message:
+				"Usage: mail-send.sh <recipient> --subject <subject> [--from <name>] [--reply-to <ulid>] [--body-file <path> | -]",
+		};
+	}
+
+	let subject: string | undefined;
+	let from: string | undefined;
+	let replyTo: string | undefined;
+	let bodyFile: string | undefined;
+	let useStdin = false;
+
+	let i = 1;
+	while (i < args.length) {
+		const arg = args[i]!;
+		if (arg === "-") {
+			if (useStdin) {
+				return {
+					ok: false,
+					code: "invalid_args",
+					message: "Duplicate '-' (stdin) argument.",
+				};
+			}
+			useStdin = true;
+			i += 1;
+			continue;
+		}
+
+		let optName: string | undefined;
+		let optValue: string | undefined;
+		if (SEND_OPTION_FLAGS.has(arg)) {
+			optName = arg;
+			const nextArg = args[i + 1];
+			if (
+				nextArg === undefined ||
+				nextArg === "-" ||
+				SEND_OPTION_FLAGS.has(nextArg) ||
+				nextArg.startsWith("--subject=") ||
+				nextArg.startsWith("--from=") ||
+				nextArg.startsWith("--reply-to=") ||
+				nextArg.startsWith("--body-file=")
+			) {
+				return {
+					ok: false,
+					code: "invalid_args",
+					message: `Missing value for ${arg}.`,
+				};
+			}
+			optValue = nextArg;
+			i += 2;
+		} else {
+			for (const flag of SEND_OPTION_FLAGS) {
+				if (arg.startsWith(`${flag}=`)) {
+					optName = flag;
+					optValue = arg.slice(flag.length + 1);
+					break;
+				}
+			}
+			if (optName === undefined) {
+				return {
+					ok: false,
+					code: "invalid_args",
+					message: `Unknown argument for send: ${arg}`,
+				};
+			}
+			if (optValue === "") {
+				return {
+					ok: false,
+					code: "invalid_args",
+					message: `Missing value for ${optName}.`,
+				};
+			}
+			i += 1;
+		}
+
+		if (optName === "--subject") {
+			if (subject !== undefined) {
+				return {
+					ok: false,
+					code: "invalid_args",
+					message: "Duplicate --subject option.",
+				};
+			}
+			subject = optValue!;
+		} else if (optName === "--from") {
+			if (from !== undefined) {
+				return {
+					ok: false,
+					code: "invalid_args",
+					message: "Duplicate --from option.",
+				};
+			}
+			from = optValue!;
+		} else if (optName === "--reply-to") {
+			if (replyTo !== undefined) {
+				return {
+					ok: false,
+					code: "invalid_args",
+					message: "Duplicate --reply-to option.",
+				};
+			}
+			replyTo = optValue!;
+		} else if (optName === "--body-file") {
+			if (bodyFile !== undefined) {
+				return {
+					ok: false,
+					code: "invalid_args",
+					message: "Duplicate --body-file option.",
+				};
+			}
+			if (optValue === "") {
+				return {
+					ok: false,
+					code: "invalid_args",
+					message: "Missing value for --body-file.",
+				};
+			}
+			bodyFile = optValue!;
+		}
+	}
+
+	if (bodyFile !== undefined && useStdin) {
+		return {
+			ok: false,
+			code: "invalid_args",
+			message: "Cannot specify both --body-file and '-' (stdin).",
+		};
+	}
+	if (subject === undefined) {
+		return {
+			ok: false,
+			code: "invalid_args",
+			message: "Missing required --subject option.",
+		};
+	}
+
+	return {
+		ok: true,
+		recipient,
+		subject,
+		...(from !== undefined ? { from } : {}),
+		...(replyTo !== undefined ? { replyTo } : {}),
+		...(bodyFile !== undefined ? { bodyFile } : {}),
+		useStdin,
+	};
+}
+
+function decodeBodyUtf8(
+	bytes: Uint8Array,
+): { ok: true; value: string } | { ok: false; code: string; reason: string } {
+	try {
+		const text = new TextDecoder("utf-8", {
+			fatal: true,
+			ignoreBOM: true,
+		}).decode(bytes);
+		return { ok: true, value: text };
+	} catch (error) {
+		return {
+			ok: false,
+			code: "invalid_utf8",
+			reason: `Message body is not valid UTF-8: ${errorMessage(error)}`,
+		};
+	}
+}
+
+async function readStdinBytes(
+	stdinSource: MailStdinSource,
+	maxBytes = MAX_MESSAGE_BYTES,
+	signal?: AbortSignal,
+): Promise<
+	| { ok: true; value: Uint8Array }
+	| { ok: false; code: string; reason: string }
+> {
+	if (signal?.aborted) {
+		return {
+			ok: false,
+			code: "aborted",
+			reason: "Mail send operation was aborted.",
+		};
+	}
+	const maxRead = maxBytes + 1;
+	const buffer = new Uint8Array(maxRead);
+	let totalBytes = 0;
+
+	const appendChunk = (chunk: Uint8Array | string): boolean => {
+		const bytes =
+			typeof chunk === "string" ? new TextEncoder().encode(chunk) : chunk;
+		if (bytes.byteLength === 0) return true;
+		const copyLen = Math.min(bytes.byteLength, maxRead - totalBytes);
+		if (copyLen > 0) {
+			buffer.set(bytes.subarray(0, copyLen), totalBytes);
+			totalBytes += copyLen;
+		}
+		return totalBytes <= maxBytes;
+	};
+
+	try {
+		if (typeof stdinSource === "string" || stdinSource instanceof Uint8Array) {
+			appendChunk(stdinSource);
+		} else {
+			for await (const chunk of stdinSource) {
+				if (signal?.aborted) {
+					return {
+						ok: false,
+						code: "aborted",
+						reason: "Mail send operation was aborted.",
+					};
+				}
+				if (!appendChunk(chunk)) {
+					break;
+				}
+			}
+		}
+	} catch (error) {
+		return {
+			ok: false,
+			code: "stdin_read_failed",
+			reason: `Cannot read message body from stdin: ${errorMessage(error)}`,
+		};
+	}
+
+	if (totalBytes > maxBytes) {
+		return {
+			ok: false,
+			code: "size_exceeded",
+			reason: `Message body from stdin exceeds the ${maxBytes}-byte limit.`,
+		};
+	}
+	return { ok: true, value: buffer.subarray(0, totalBytes) };
+}
+
+/**
+ * `send <recipient> --subject <subject> [--from <name>] [--reply-to <ulid>] [--body-file <path> | -]`
+ */
+export async function sendMailbox(
+	args: readonly string[],
+	deps?: MailCliDeps,
+): Promise<MailCliResult> {
+	const parsedArgs = parseSendArgs(args);
+	if (!parsedArgs.ok) {
+		return {
+			exitCode: 1,
+			stdout: "",
+			stderr: `mail-send error [${parsedArgs.code}]: ${parsedArgs.message}\n`,
+		};
+	}
+
+	const fsOps = deps?.fs ?? defaultMailFs;
+	const exec = deps?.exec ?? defaultCliExec;
+	const nowFn = deps?.now ?? (() => Date.now());
+	const baseEnv = deps?.env ?? process.env;
+	const stdinSource = deps?.stdin ?? process.stdin;
+	const signal = deps?.signal;
+
+	const sender =
+		parsedArgs.from !== undefined ? parsedArgs.from : baseEnv[MAILBOX_ENV_KEY];
+	if (!sender) {
+		return {
+			exitCode: 1,
+			stdout: "",
+			stderr: `mail-send error [missing_sender_mailbox]: --from or ${MAILBOX_ENV_KEY} is required to send mail.\n`,
+		};
+	}
+	if (!isValidMailboxName(sender)) {
+		return {
+			exitCode: 1,
+			stdout: "",
+			stderr: `mail-send error [invalid_sender_mailbox]: Sender mailbox '${sender}' does not match ^[a-z][a-z0-9-]{0,31}$.\n`,
+		};
+	}
+	if (!isValidMailboxName(parsedArgs.recipient)) {
+		return {
+			exitCode: 1,
+			stdout: "",
+			stderr: `mail-send error [invalid_recipient]: Recipient 'to' (${parsedArgs.recipient}) does not match ^[a-z][a-z0-9-]{0,31}$.\n`,
+		};
+	}
+	if (parsedArgs.replyTo !== undefined && !isValidUlid(parsedArgs.replyTo)) {
+		return {
+			exitCode: 1,
+			stdout: "",
+			stderr: `mail-send error [invalid_reply_to]: reply_to (${parsedArgs.replyTo}) is not a valid 26-character ULID.\n`,
+		};
+	}
+
+	let body = "";
+	if (parsedArgs.bodyFile !== undefined) {
+		const rawFile = await readMailboxFileBytes(
+			fsOps,
+			parsedArgs.bodyFile,
+			MAX_MESSAGE_BYTES,
+		);
+		if (!rawFile.ok) {
+			return {
+				exitCode: 1,
+				stdout: "",
+				stderr: `mail-send error [${rawFile.code}]: ${rawFile.reason}\n`,
+			};
+		}
+		const decoded = decodeBodyUtf8(rawFile.value);
+		if (!decoded.ok) {
+			return {
+				exitCode: 1,
+				stdout: "",
+				stderr: `mail-send error [${decoded.code}]: ${decoded.reason}\n`,
+			};
+		}
+		body = decoded.value;
+	} else if (parsedArgs.useStdin) {
+		const rawStdin = await readStdinBytes(
+			stdinSource,
+			MAX_MESSAGE_BYTES,
+			signal,
+		);
+		if (!rawStdin.ok) {
+			return {
+				exitCode: 1,
+				stdout: "",
+				stderr: `mail-send error [${rawStdin.code}]: ${rawStdin.reason}\n`,
+			};
+		}
+		const decoded = decodeBodyUtf8(rawStdin.value);
+		if (!decoded.ok) {
+			return {
+				exitCode: 1,
+				stdout: "",
+				stderr: `mail-send error [${decoded.code}]: ${decoded.reason}\n`,
+			};
+		}
+		body = decoded.value;
+	}
+
+	const mailDeps: MailDeps = {
+		exec,
+		fs: fsOps,
+		env: { ...baseEnv, [MAILBOX_ENV_KEY]: sender },
+		now: nowFn,
+		...(deps?.randomBytes ? { randomBytes: deps.randomBytes } : {}),
+	};
+
+	const sendRes = await sendMail(
+		mailDeps,
+		{
+			to: parsedArgs.recipient,
+			subject: parsedArgs.subject,
+			body,
+			...(parsedArgs.replyTo !== undefined
+				? { reply_to: parsedArgs.replyTo }
+				: {}),
+		},
+		signal,
+	);
+
+	const stderrLines: string[] = [];
+	for (const w of sendRes.warnings ?? []) {
+		stderrLines.push(formatWarningLine("mail-send", w));
+	}
+	if (!sendRes.ok || !sendRes.path) {
+		const code = sendRes.error?.code ?? "send_failed";
+		const message = sendRes.error?.message ?? "Mail send failed.";
+		stderrLines.push(`mail-send error [${code}]: ${message}`);
+		return {
+			exitCode: 1,
+			stdout: "",
+			stderr: `${stderrLines.join("\n")}\n`,
+		};
+	}
+
+	return {
+		exitCode: 0,
+		stdout: `${sendRes.path}\n`,
+		stderr: stderrLines.length > 0 ? `${stderrLines.join("\n")}\n` : "",
+	};
+}
+
 export async function runMailCli(
 	argv: readonly string[],
 	deps?: MailCliDeps,
@@ -901,11 +1318,14 @@ export async function runMailCli(
 	if (subcommand === "ack") {
 		return ackMailbox(rest, deps);
 	}
+	if (subcommand === "send") {
+		return sendMailbox(rest, deps);
+	}
 	return {
 		exitCode: 1,
 		stdout: "",
 		stderr:
-			"mail-cli error [invalid_subcommand]: Expected 'watch' or 'ack'.\n",
+			"mail-cli error [invalid_subcommand]: Expected 'watch', 'ack', or 'send'.\n",
 	};
 }
 
