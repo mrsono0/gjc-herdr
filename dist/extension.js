@@ -19546,6 +19546,8 @@ var SEND_TIMEOUT_MS = 30000;
 var WAIT_CLI_TIMEOUT_MS = 30000;
 var WAIT_TIMEOUT_MS = 60000;
 var PANE_ID = /^w[^:\s]+:p[^:\s]+$/;
+var POLL_INTERVAL_MS2 = 2000;
+var MIN_RECHECK_MS = 1000;
 var USAGE = "Usage: /herdr-send [--wait|--raw] <pane> <text>";
 var GJC_NOT_FOUND = "gjc CLI not found on PATH";
 function record(value) {
@@ -19564,12 +19566,16 @@ function errorMessage(error) {
 function isMissingExecutable(error) {
   return error?.code === "ENOENT";
 }
-async function herdrJson(deps, args, target) {
+async function herdrJson(deps, args, target, timeoutMs = HERDR_TIMEOUT_MS) {
   const operation = `${args[0]} ${args[1]}`;
+  const timeout = Math.floor(timeoutMs);
+  if (timeout < 1) {
+    throw new Error(`Herdr is unavailable: ${operation} timed out`);
+  }
   let result;
   try {
     result = await deps.exec(deps.herdrBin, args, {
-      timeout: HERDR_TIMEOUT_MS
+      timeout
     });
   } catch (error) {
     throw new Error(`Herdr is unavailable: ${errorMessage(error)}`);
@@ -19593,16 +19599,19 @@ async function herdrJson(deps, args, target) {
     throw new Error(`Herdr ${operation} returned an invalid response.`);
   return data;
 }
-async function resolveTargetPane(deps, target) {
+async function resolveTargetPane(deps, target, timeoutMs) {
+  const now = deps.now ?? (() => performance.now());
+  const deadline = timeoutMs !== undefined ? now() + timeoutMs : undefined;
+  const stepTimeout = () => deadline !== undefined ? Math.min(HERDR_TIMEOUT_MS, deadline - now()) : HERDR_TIMEOUT_MS;
   let paneId = target;
   if (!PANE_ID.test(target)) {
-    const agent = record(record((await herdrJson(deps, ["agent", "get", target], target)).result)?.agent);
+    const agent = record(record((await herdrJson(deps, ["agent", "get", target], target, stepTimeout())).result)?.agent);
     if (typeof agent?.pane_id !== "string" || !agent.pane_id) {
       throw new Error("Herdr agent get returned an invalid response.");
     }
     paneId = agent.pane_id;
   }
-  const pane = record(record((await herdrJson(deps, ["pane", "get", paneId], target)).result)?.pane);
+  const pane = record(record((await herdrJson(deps, ["pane", "get", paneId], target, stepTimeout())).result)?.pane);
   if (typeof pane?.pane_id !== "string" || !pane.pane_id) {
     throw new Error("Herdr pane get returned an invalid response.");
   }
@@ -19812,43 +19821,116 @@ async function deliverPrompt(deps, request, sender, signal) {
     if (pane.paneId === sender.pane) {
       return fail("Cannot send raw input to the current Herdr pane.", pane.paneId);
     }
-    const guard = await waitForEmptyInput(deps, pane.paneId, deps.inputWaitMs ?? inputWaitMs(), signal, pane.agent);
-    const waited = guard.waitedMs > 0 ? { waitedMs: guard.waitedMs } : {};
-    if (signal?.aborted) {
-      return { ...fail("Raw delivery aborted before sending.", pane.paneId), ...waited };
-    }
-    if (guard.waitedMs > 0) {
-      try {
-        pane = await resolveTargetPane(deps, target);
-      } catch (error) {
-        return { ...fail(errorMessage(error), pane.paneId), ...waited };
+    const maxWaitMs = deps.inputWaitMs ?? inputWaitMs();
+    const now = deps.now ?? (() => performance.now());
+    const sleep = deps.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+    const waitStart = now();
+    const waitDeadline = waitStart + maxWaitMs;
+    let waitActive = false;
+    let retrying = false;
+    let totalWaitedMs = 0;
+    let lastUnready = "typing";
+    const syncWait = () => {
+      if (waitActive)
+        totalWaitedMs = Math.max(0, now() - waitStart);
+    };
+    const waited = () => totalWaitedMs > 0 ? { waitedMs: totalWaitedMs } : {};
+    const failTyping = () => {
+      syncWait();
+      return {
+        ...fail(`Target input box still has text after ${Math.round(totalWaitedMs / 1000)}s; raw input not sent. Retry later.`, pane.paneId),
+        ...waited()
+      };
+    };
+    const failFocused = () => {
+      syncWait();
+      return {
+        ...fail(`Target input box could not be read and the pane is focused by a person who may be typing after ${Math.round(totalWaitedMs / 1000)}s; raw input not sent. Retry later.`, pane.paneId),
+        ...waited()
+      };
+    };
+    const failLastUnready = () => lastUnready === "focused" ? failFocused() : failTyping();
+    for (;; ) {
+      const guardedPaneId = pane.paneId;
+      let paneReads = 0;
+      const guard = await waitForEmptyInput({
+        ...deps,
+        exec: async (command, args, options) => {
+          if (args[0] === "pane" && args[1] === "read")
+            paneReads++;
+          return deps.exec(command, args, options);
+        }
+      }, guardedPaneId, retrying ? waitDeadline - now() : maxWaitMs, signal, pane.agent);
+      if (guard.waitedMs > 0)
+        waitActive = true;
+      if (paneReads > 1 || guard.state === "typing" && paneReads > 0) {
+        lastUnready = "typing";
       }
+      syncWait();
       if (signal?.aborted) {
-        return { ...fail("Raw delivery aborted before sending.", pane.paneId), ...waited };
+        return { ...fail("Raw delivery aborted before sending.", pane.paneId), ...waited() };
       }
-      if (pane.agentStatus === "blocked") {
-        return {
-          ...fail("Target is blocked on an approval or question; answer it first, then retry.", pane.paneId),
-          ...waited
-        };
+      if (guard.state === "typing") {
+        if (retrying && paneReads === 0)
+          return failLastUnready();
+        return failTyping();
       }
-      if (pane.paneId === sender.pane) {
-        return { ...fail("Cannot send raw input to the current Herdr pane.", pane.paneId), ...waited };
+      if (waitActive) {
+        const remainingForResolve = waitDeadline - now();
+        if (Math.floor(remainingForResolve) < 1) {
+          return failLastUnready();
+        }
+        try {
+          pane = await resolveTargetPane(deps, target, remainingForResolve);
+        } catch (error) {
+          syncWait();
+          if (now() >= waitDeadline && /timed out/.test(errorMessage(error))) {
+            return failLastUnready();
+          }
+          return { ...fail(errorMessage(error), pane.paneId), ...waited() };
+        }
+        syncWait();
+        if (signal?.aborted) {
+          return { ...fail("Raw delivery aborted before sending.", pane.paneId), ...waited() };
+        }
+        if (pane.agentStatus === "blocked") {
+          return {
+            ...fail("Target is blocked on an approval or question; answer it first, then retry.", pane.paneId),
+            ...waited()
+          };
+        }
+        if (pane.paneId === sender.pane) {
+          return { ...fail("Cannot send raw input to the current Herdr pane.", pane.paneId), ...waited() };
+        }
+        if (pane.paneId !== guardedPaneId) {
+          return {
+            ...fail(`Target ${target} moved from pane ${guardedPaneId} to ${pane.paneId} while waiting; raw input not sent. Retry later.`, pane.paneId),
+            ...waited()
+          };
+        }
+        if (now() > waitDeadline) {
+          return failLastUnready();
+        }
       }
+      if (guard.state === "unknown" && pane.focused) {
+        lastUnready = "focused";
+        const remainingBeforeSleep = waitDeadline - now();
+        if (remainingBeforeSleep >= 1) {
+          waitActive = true;
+          retrying = true;
+          await sleep(Math.min(POLL_INTERVAL_MS2, remainingBeforeSleep));
+          syncWait();
+          if (signal?.aborted) {
+            return { ...fail("Raw delivery aborted before sending.", pane.paneId), ...waited() };
+          }
+          if (waitDeadline - now() >= MIN_RECHECK_MS)
+            continue;
+        }
+        return failFocused();
+      }
+      syncWait();
+      return { ...await sendRawPrompt(deps, pane.paneId, request.text, signal), ...waited() };
     }
-    if (guard.state === "typing") {
-      return {
-        ...fail(`Target input box still has text after ${Math.round(guard.waitedMs / 1000)}s; raw input not sent. Retry later.`, pane.paneId),
-        ...waited
-      };
-    }
-    if (guard.state === "unknown" && pane.focused) {
-      return {
-        ...fail("Target input box could not be read and the pane is focused by a person who may be typing; raw input not sent. Retry later.", pane.paneId),
-        ...waited
-      };
-    }
-    return { ...await sendRawPrompt(deps, pane.paneId, request.text, signal), ...waited };
   }
   let sessionId;
   try {
@@ -19940,13 +20022,27 @@ function registerSendFeatures(api, herdrBin, senderPane) {
 
 // src/call.ts
 import { randomUUID as randomUUID3 } from "crypto";
+import {
+  constants as fsConstants,
+  lstat as nodeLstat,
+  open as nodeOpen
+} from "fs/promises";
+import { isAbsolute as isAbsolute2 } from "path";
 var PANE_ID2 = /^w[^:\s]+:p[^:\s]+$/;
 var LOOKUP_TIMEOUT_MS = 3000;
 var READ_TIMEOUT_MS2 = 3000;
 var CALL_BUDGET_MS = 60000;
 var READ_RESERVE_MS = 3000;
 var READ_LINES2 = "200";
-var USAGE2 = "Usage: /herdr-call <pane-id-or-unique-agent-name> <text>";
+var POLL_INTERVAL_MS3 = 2000;
+var MIN_RECHECK_MS2 = 1000;
+var MAX_RESULT_FILE_BYTES = 1024 * 1024;
+var RESULT_FILE_OPEN_FLAGS = fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0) | (fsConstants.O_NONBLOCK ?? 0);
+var USAGE2 = "Usage: /herdr-call [--result-file <abs-path>] <pane-id-or-unique-agent-name> <text>";
+var defaultFs = {
+  lstat: (path) => nodeLstat(path),
+  open: (path, flags) => nodeOpen(path, flags)
+};
 
 class CallFailure extends Error {
   partial;
@@ -20150,8 +20246,8 @@ var AGENT_STATES = new Set([
   "done",
   "unknown"
 ]);
-async function getPreflightAgent(deps, paneId, deadline, signal) {
-  const result = await runHerdr(deps, ["agent", "get", paneId], Math.min(LOOKUP_TIMEOUT_MS, deadline - (deps.now?.() ?? performance.now())), signal, "lookup");
+async function getPreflightAgent(deps, paneId, deadline, signal, budgetMs = LOOKUP_TIMEOUT_MS) {
+  const result = await runHerdr(deps, ["agent", "get", paneId], Math.min(LOOKUP_TIMEOUT_MS, budgetMs, deadline - (deps.now?.() ?? performance.now())), signal, "lookup");
   if (result.code === 2)
     throw usageFailure(result, "agent get");
   if (result.code !== 0)
@@ -20194,6 +20290,148 @@ function markerInstruction(requestId) {
   return `
 
 Answer with the exact token GJC_HERDR_BEGIN_${requestId} on the first line ` + `of your final answer and GJC_HERDR_END_${requestId} on the last line.`;
+}
+function resultFileInstruction(requestId, resultFile) {
+  return `
+
+Write your complete final answer as a new file at ${resultFile}, ` + `and reply on screen with only three lines: the exact token GJC_HERDR_BEGIN_${requestId} ` + `on the first line, ${resultFile} on the second line, and GJC_HERDR_END_${requestId} on the last line.`;
+}
+function isMissingPath(error) {
+  if (isMissingExecutable2(error))
+    return true;
+  return error instanceof Error && /\bENOENT\b/.test(error.message);
+}
+async function checkResultFileAbsent(fsOps, resultFile) {
+  try {
+    await fsOps.lstat(resultFile);
+    return `result_file already exists at ${resultFile}; use a new path for each call.`;
+  } catch (error) {
+    if (isMissingPath(error))
+      return;
+    return `Cannot inspect result_file ${resultFile}: ${errorMessage2(error)}`;
+  }
+}
+function abortedResultFile() {
+  return {
+    ok: false,
+    code: "aborted",
+    message: "Answer read aborted; the prompt was already delivered."
+  };
+}
+async function recoverResultFile(fsOps, resultFile, signal) {
+  if (signal?.aborted)
+    return abortedResultFile();
+  let handle;
+  try {
+    handle = await fsOps.open(resultFile, RESULT_FILE_OPEN_FLAGS);
+  } catch (error) {
+    if (signal?.aborted)
+      return abortedResultFile();
+    if (isMissingPath(error)) {
+      return {
+        ok: false,
+        code: "result_file_missing",
+        message: `Result file was not created at ${resultFile}.`
+      };
+    }
+    return {
+      ok: false,
+      code: "result_file_invalid",
+      message: `Result file at ${resultFile} could not be opened: ${errorMessage2(error)}`
+    };
+  }
+  try {
+    if (signal?.aborted)
+      return abortedResultFile();
+    let stat;
+    try {
+      stat = await handle.stat();
+    } catch (error) {
+      if (signal?.aborted)
+        return abortedResultFile();
+      return {
+        ok: false,
+        code: "result_file_invalid",
+        message: `Result file at ${resultFile} could not be inspected: ${errorMessage2(error)}`
+      };
+    }
+    if (signal?.aborted)
+      return abortedResultFile();
+    if (!stat.isFile()) {
+      return {
+        ok: false,
+        code: "result_file_invalid",
+        message: `Result file at ${resultFile} is not a regular file.`
+      };
+    }
+    if (stat.nlink !== 1) {
+      return {
+        ok: false,
+        code: "result_file_invalid",
+        message: `Result file at ${resultFile} must have link count 1 (got ${stat.nlink}).`
+      };
+    }
+    if (stat.size <= 0 || stat.size > MAX_RESULT_FILE_BYTES) {
+      return {
+        ok: false,
+        code: "result_file_invalid",
+        message: stat.size <= 0 ? `Result file at ${resultFile} is empty.` : `Result file at ${resultFile} exceeds the 1 MiB limit (${stat.size} bytes).`
+      };
+    }
+    const maxReadBytes = MAX_RESULT_FILE_BYTES + 1;
+    const buffer = new Uint8Array(maxReadBytes);
+    let totalBytes = 0;
+    try {
+      while (totalBytes < maxReadBytes) {
+        const { bytesRead, buffer: chunkBuffer } = await handle.read(buffer, totalBytes, maxReadBytes - totalBytes, totalBytes);
+        if (signal?.aborted)
+          return abortedResultFile();
+        if (bytesRead <= 0)
+          break;
+        if (chunkBuffer && chunkBuffer !== buffer) {
+          const copyLen = Math.min(bytesRead, maxReadBytes - totalBytes);
+          buffer.set(chunkBuffer.subarray(0, copyLen), totalBytes);
+        }
+        totalBytes += bytesRead;
+      }
+    } catch (error) {
+      if (signal?.aborted)
+        return abortedResultFile();
+      return {
+        ok: false,
+        code: "result_file_invalid",
+        message: `Result file at ${resultFile} could not be read: ${errorMessage2(error)}`
+      };
+    }
+    if (signal?.aborted)
+      return abortedResultFile();
+    if (totalBytes <= 0 || totalBytes > MAX_RESULT_FILE_BYTES) {
+      return {
+        ok: false,
+        code: "result_file_invalid",
+        message: totalBytes <= 0 ? `Result file at ${resultFile} is empty.` : `Result file at ${resultFile} exceeds the 1 MiB limit (${totalBytes} bytes).`
+      };
+    }
+    let answer;
+    try {
+      answer = new TextDecoder("utf-8", { fatal: true }).decode(buffer.subarray(0, totalBytes));
+    } catch (error) {
+      if (signal?.aborted)
+        return abortedResultFile();
+      return {
+        ok: false,
+        code: "result_file_invalid",
+        message: `Result file at ${resultFile} is not valid UTF-8: ${errorMessage2(error)}`
+      };
+    }
+    if (signal?.aborted)
+      return abortedResultFile();
+    return { ok: true, answer };
+  } finally {
+    try {
+      await handle.close();
+    } catch {}
+  }
 }
 function extractMarkedAnswer(capture, requestId) {
   const id = requestId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -20307,11 +20545,13 @@ async function callRegisteredAgent(deps, request, senderPane, signal) {
   let deadline = startedAt + CALL_BUDGET_MS;
   let waitedMs = 0;
   const requestId = randomUUID3();
+  const rawResultFile = request.resultFile ?? request.result_file;
   const finish = (partial) => ({
     ok: false,
     requestId,
     elapsedMs: now() - startedAt,
     ...waitedMs > 0 ? { waitedMs } : {},
+    ...rawResultFile !== undefined ? { resultFile: rawResultFile } : {},
     ...partial
   });
   const target = request.target.trim();
@@ -20339,12 +20579,43 @@ async function callRegisteredAgent(deps, request, senderPane, signal) {
       error: { code: "invalid_request", message: "Prompt text must not be empty." }
     });
   }
+  if (rawResultFile !== undefined && (!rawResultFile || !rawResultFile.trim() || rawResultFile !== rawResultFile.trim() || /[\0\r\n]/.test(rawResultFile) || !isAbsolute2(rawResultFile))) {
+    return finish({
+      status: "not_sent",
+      delivery: "not_sent",
+      error: {
+        code: "invalid_request",
+        message: "result_file must be a non-empty absolute path without NUL or newline characters."
+      }
+    });
+  }
   if (signal?.aborted) {
     return finish({
       status: "not_sent",
       delivery: "not_sent",
       error: { code: "aborted", message: "Call aborted before delivery." }
     });
+  }
+  const fsOps = deps.fs ?? defaultFs;
+  if (rawResultFile !== undefined) {
+    const fileConflict = await checkResultFileAbsent(fsOps, rawResultFile);
+    if (signal?.aborted) {
+      return finish({
+        status: "not_sent",
+        delivery: "not_sent",
+        error: { code: "aborted", message: "Call aborted before delivery." }
+      });
+    }
+    if (fileConflict !== undefined) {
+      return finish({
+        status: "not_sent",
+        delivery: "not_sent",
+        error: {
+          code: "invalid_request",
+          message: fileConflict
+        }
+      });
+    }
   }
   try {
     const { paneId, agentKind } = await resolveTargetPaneId(deps, target, deadline, signal);
@@ -20372,105 +20643,217 @@ async function callRegisteredAgent(deps, request, senderPane, signal) {
     }
     deps.inFlight.add(paneId);
     try {
-      const guard = await waitForEmptyInput({
-        exec: deps.exec,
-        herdrBin: deps.herdrBin,
-        sleep: deps.sleep,
-        now,
-        agentKind: async (budgetMs, s, waited = 0) => agentKind ?? await readAgentKind(deps, paneId, budgetMs, deadline + waited, s)
-      }, paneId, deps.inputWaitMs ?? inputWaitMs(), signal);
-      waitedMs = guard.waitedMs;
-      deadline += guard.waitedMs;
-      if (signal?.aborted) {
+      const maxWaitMs = deps.inputWaitMs ?? inputWaitMs();
+      const sleep = deps.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+      const baseDeadline = deadline;
+      let initialGuardWaitedMs = 0;
+      let firstSleepStart;
+      let waitDeadline = 0;
+      let knownKind = agentKind;
+      let lastUnready;
+      const syncWait = () => {
+        waitedMs = initialGuardWaitedMs + (firstSleepStart !== undefined ? Math.max(0, now() - firstSleepStart) : 0);
+        deadline = baseDeadline + waitedMs;
+      };
+      const finishUnready = (state, focusedUnknown) => {
+        syncWait();
+        if (focusedUnknown) {
+          return finish({
+            status: "not_sent",
+            delivery: "not_sent",
+            pane: paneId,
+            state,
+            error: {
+              code: "target_focused",
+              message: `Target input box could not be read and the pane is focused by a person who may be typing after ${Math.round(waitedMs / 1000)}s; not sent. Retry later.`
+            }
+          });
+        }
         return finish({
           status: "not_sent",
           delivery: "not_sent",
           pane: paneId,
-          error: { code: "aborted", message: "Call aborted before delivery." }
-        });
-      }
-      if (guard.state === "typing") {
-        return finish({
-          status: "not_sent",
-          delivery: "not_sent",
-          pane: paneId,
-          error: {
-            code: "target_typing",
-            message: `Target input box still has text after ${Math.round(guard.waitedMs / 1000)}s; not sent. Retry later.`
-          }
-        });
-      }
-      const preflight = await getPreflightAgent(deps, paneId, deadline, signal);
-      if (preflight.paneId !== paneId) {
-        return finish({
-          status: "not_sent",
-          delivery: "not_sent",
-          pane: paneId,
-          error: {
-            code: "protocol_error",
-            message: "Herdr agent get returned a different pane than requested."
-          }
-        });
-      }
-      if (preflight.launchPending) {
-        return finish({
-          status: "not_sent",
-          delivery: "not_sent",
-          pane: paneId,
-          state: preflight.state,
-          error: {
-            code: "target_not_ready",
-            message: "Target agent launch is still pending."
-          }
-        });
-      }
-      if (guard.state === "unknown" && preflight.focused) {
-        return finish({
-          status: "not_sent",
-          delivery: "not_sent",
-          pane: paneId,
-          state: preflight.state,
-          error: {
-            code: "target_focused",
-            message: "Target input box could not be read and the pane is focused by a person who may be typing; not sent. Retry later."
-          }
-        });
-      }
-      if (preflight.state === "blocked") {
-        return finish({
-          status: "blocked",
-          delivery: "not_sent",
-          pane: paneId,
-          state: preflight.state,
-          error: {
-            code: "agent_blocked",
-            message: "Target is blocked waiting for a user decision; no input was sent."
-          }
-        });
-      }
-      if (preflight.state === "working") {
-        return finish({
-          status: "not_sent",
-          delivery: "not_sent",
-          pane: paneId,
-          state: preflight.state,
+          state,
           error: {
             code: "target_busy",
-            message: "Target agent is already working; not interrupted."
+            message: `Target agent is still working after ${Math.round(waitedMs / 1000)}s; not sent. Retry later.`
           }
         });
+      };
+      let preflight;
+      for (;; ) {
+        const retrying = firstSleepStart !== undefined;
+        let paneReads = 0;
+        let lastPaneScreen;
+        let kindLookupFailed = false;
+        const guard = await waitForEmptyInput({
+          exec: async (command, args, options) => {
+            if (args[0] === "pane" && args[1] === "read")
+              paneReads++;
+            const res = await deps.exec(command, args, options);
+            if (args[0] === "pane" && args[1] === "read" && !res.killed && res.code === 0) {
+              lastPaneScreen = res.stdout;
+            }
+            return res;
+          },
+          herdrBin: deps.herdrBin,
+          sleep: deps.sleep,
+          now,
+          agentKind: async (budgetMs, s, waited = 0) => {
+            if (knownKind !== undefined)
+              return knownKind;
+            const kindBudget = retrying ? Math.min(budgetMs, waitDeadline - now()) : budgetMs;
+            const resolved = await readAgentKind(deps, paneId, kindBudget, deadline + (retrying ? 0 : waited), s);
+            if (resolved !== undefined)
+              knownKind = resolved;
+            else
+              kindLookupFailed = true;
+            return resolved;
+          }
+        }, paneId, retrying ? waitDeadline - now() : maxWaitMs, signal, knownKind);
+        if (!retrying)
+          initialGuardWaitedMs = guard.waitedMs;
+        syncWait();
+        if (signal?.aborted) {
+          return finish({
+            status: "not_sent",
+            delivery: "not_sent",
+            pane: paneId,
+            error: { code: "aborted", message: "Call aborted before delivery." }
+          });
+        }
+        if (guard.state === "typing") {
+          const agyKindExhausted = retrying && knownKind === undefined && lastPaneScreen !== undefined && classifyInput(lastPaneScreen, "agy") === "empty" && (kindLookupFailed || waitDeadline - now() < 1);
+          if (retrying && lastUnready && (paneReads === 0 || agyKindExhausted)) {
+            return finishUnready(lastUnready.state, lastUnready.focusedUnknown);
+          }
+          return finish({
+            status: "not_sent",
+            delivery: "not_sent",
+            pane: paneId,
+            error: {
+              code: "target_typing",
+              message: `Target input box still has text after ${Math.round(waitedMs / 1000)}s; not sent. Retry later.`
+            }
+          });
+        }
+        if (retrying && Math.floor(waitDeadline - now()) < 1 && lastUnready) {
+          return finishUnready(lastUnready.state, lastUnready.focusedUnknown);
+        }
+        try {
+          preflight = await getPreflightAgent(deps, paneId, deadline, signal, retrying ? waitDeadline - now() : LOOKUP_TIMEOUT_MS);
+        } catch (error) {
+          syncWait();
+          if (retrying && lastUnready && error instanceof CallFailure && error.partial.error?.code === "timeout" && now() >= waitDeadline) {
+            return finishUnready(lastUnready.state, lastUnready.focusedUnknown);
+          }
+          throw error;
+        }
+        syncWait();
+        knownKind ??= preflight.agentLabel;
+        if (preflight.paneId !== paneId) {
+          return finish({
+            status: "not_sent",
+            delivery: "not_sent",
+            pane: paneId,
+            error: {
+              code: "protocol_error",
+              message: "Herdr agent get returned a different pane than requested."
+            }
+          });
+        }
+        if (preflight.launchPending) {
+          return finish({
+            status: "not_sent",
+            delivery: "not_sent",
+            pane: paneId,
+            state: preflight.state,
+            error: {
+              code: "target_not_ready",
+              message: "Target agent launch is still pending."
+            }
+          });
+        }
+        if (preflight.state === "blocked") {
+          return finish({
+            status: "blocked",
+            delivery: "not_sent",
+            pane: paneId,
+            state: preflight.state,
+            error: {
+              code: "agent_blocked",
+              message: "Target is blocked waiting for a user decision; no input was sent."
+            }
+          });
+        }
+        if (preflight.state === "unknown") {
+          return finish({
+            status: "not_sent",
+            delivery: "not_sent",
+            pane: paneId,
+            state: preflight.state,
+            error: {
+              code: "target_state_unknown",
+              message: "Target agent state is unknown; not prompted."
+            }
+          });
+        }
+        const focusedUnknown = guard.state === "unknown" && preflight.focused;
+        const busy = preflight.state === "working";
+        if (!focusedUnknown && !busy) {
+          if (retrying && now() > waitDeadline && lastUnready) {
+            return finishUnready(lastUnready.state, lastUnready.focusedUnknown);
+          }
+          break;
+        }
+        lastUnready = { state: preflight.state, focusedUnknown };
+        if (firstSleepStart === undefined) {
+          if (maxWaitMs - initialGuardWaitedMs < 1) {
+            return finishUnready(preflight.state, focusedUnknown);
+          }
+          firstSleepStart = now();
+          waitDeadline = firstSleepStart + (maxWaitMs - initialGuardWaitedMs);
+        }
+        const remainingBeforeSleep = waitDeadline - now();
+        if (remainingBeforeSleep >= 1) {
+          await sleep(Math.min(POLL_INTERVAL_MS3, remainingBeforeSleep));
+          syncWait();
+          if (signal?.aborted) {
+            return finish({
+              status: "not_sent",
+              delivery: "not_sent",
+              pane: paneId,
+              error: { code: "aborted", message: "Call aborted before delivery." }
+            });
+          }
+          if (waitDeadline - now() >= MIN_RECHECK_MS2)
+            continue;
+        }
+        return finishUnready(preflight.state, focusedUnknown);
       }
-      if (preflight.state === "unknown") {
-        return finish({
-          status: "not_sent",
-          delivery: "not_sent",
-          pane: paneId,
-          state: preflight.state,
-          error: {
-            code: "target_state_unknown",
-            message: "Target agent state is unknown; not prompted."
-          }
-        });
+      if (rawResultFile !== undefined) {
+        const fileConflict = await checkResultFileAbsent(fsOps, rawResultFile);
+        if (signal?.aborted) {
+          return finish({
+            status: "not_sent",
+            delivery: "not_sent",
+            pane: paneId,
+            state: preflight.state,
+            error: { code: "aborted", message: "Call aborted before delivery." }
+          });
+        }
+        if (fileConflict !== undefined) {
+          return finish({
+            status: "not_sent",
+            delivery: "not_sent",
+            pane: paneId,
+            state: preflight.state,
+            error: {
+              code: "invalid_request",
+              message: fileConflict
+            }
+          });
+        }
       }
       const promptBudget = Math.floor(deadline - now() - READ_RESERVE_MS);
       if (promptBudget <= 0) {
@@ -20485,7 +20868,7 @@ async function callRegisteredAgent(deps, request, senderPane, signal) {
           }
         });
       }
-      const patchedText = request.text + markerInstruction(requestId);
+      const patchedText = request.text + (rawResultFile !== undefined ? resultFileInstruction(requestId, rawResultFile) : markerInstruction(requestId));
       const promptArgs = [
         "agent",
         "prompt",
@@ -20552,6 +20935,73 @@ async function callRegisteredAgent(deps, request, senderPane, signal) {
             message: "Prompt settled but no read budget remained."
           }
         });
+      }
+      if (rawResultFile !== undefined) {
+        let capture;
+        let screenError;
+        let screenErrorMeta;
+        try {
+          const read = await runHerdr(deps, ["agent", "read", paneId, "--source", "recent-unwrapped", "--lines", READ_LINES2], Math.min(READ_TIMEOUT_MS2, readRemaining), signal, "read");
+          if (read.code === 0) {
+            capture = read.stdout;
+          } else {
+            const error = stderrEnvelope(read);
+            const detail = typeof error?.message === "string" ? error.message : read.stderr.trim() || `exit ${read.code}`;
+            screenError = `screen read failed: ${detail}`;
+            screenErrorMeta = {
+              herdrCode: typeof error?.code === "string" ? error.code : undefined,
+              exitCode: read.code
+            };
+          }
+        } catch (error) {
+          if (signal?.aborted || error instanceof CallFailure && error.partial.error.code === "aborted") {
+            throw error;
+          }
+          const detail = error instanceof CallFailure ? error.partial.error.message : errorMessage2(error);
+          screenError = `screen read failed: ${detail}`;
+        }
+        const marked = capture !== undefined ? extractMarkedAnswer(capture, requestId) : undefined;
+        const markerVerified = marked !== undefined && marked.trim() === rawResultFile;
+        const recovered = await recoverResultFile(fsOps, rawResultFile, signal);
+        if (signal?.aborted || !recovered.ok && recovered.code === "aborted") {
+          return finish({
+            status: "read_failed",
+            delivery: "submitted",
+            pane: paneId,
+            state: settled,
+            error: {
+              code: "aborted",
+              message: "Answer read aborted; the prompt was already delivered."
+            }
+          });
+        }
+        if (!recovered.ok) {
+          return finish({
+            status: "response_unverified",
+            delivery: "submitted",
+            pane: paneId,
+            state: settled,
+            ...capture !== undefined ? { capture } : {},
+            error: {
+              code: recovered.code,
+              message: screenError ? `${recovered.message} (${screenError})` : recovered.message,
+              ...screenErrorMeta
+            }
+          });
+        }
+        return {
+          ok: true,
+          status: "answered",
+          delivery: "submitted",
+          requestId,
+          pane: paneId,
+          state: settled,
+          answer: recovered.answer,
+          resultFile: rawResultFile,
+          markerVerified,
+          elapsedMs: now() - startedAt,
+          ...waitedMs > 0 ? { waitedMs } : {}
+        };
       }
       const read = await runHerdr(deps, ["agent", "read", paneId, "--source", "recent-unwrapped", "--lines", READ_LINES2], Math.min(READ_TIMEOUT_MS2, readRemaining), signal, "read");
       if (read.code !== 0) {
@@ -20625,16 +21075,32 @@ async function callRegisteredAgent(deps, request, senderPane, signal) {
   }
 }
 function parseCallCommandArgs(args) {
-  const rest = args.replace(/^\s+/, "");
-  if (rest.startsWith("-"))
-    return USAGE2;
+  let rest = args.replace(/^\s+/, "");
+  let resultFile;
+  while (rest.startsWith("-")) {
+    const [flag] = rest.split(/\s/, 1);
+    if (flag !== "--result-file" || resultFile !== undefined)
+      return USAGE2;
+    rest = rest.slice(flag.length).replace(/^\s+/, "");
+    if (!rest)
+      return USAGE2;
+    const [fileToken] = rest.split(/\s/, 1);
+    if (!fileToken)
+      return USAGE2;
+    resultFile = fileToken;
+    rest = rest.slice(fileToken.length).replace(/^\s+/, "");
+  }
   const match = /^(\S+)(?:\s([\s\S]*))?$/.exec(rest);
   if (!match)
     return USAGE2;
-  return { target: match[1], text: match[2] ?? "" };
+  return {
+    target: match[1],
+    text: match[2] ?? "",
+    ...resultFile !== undefined ? { resultFile } : {}
+  };
 }
 function describeCallResult(result) {
-  const header = `herdr-call ${result.status} (delivery ${result.delivery}, request ${result.requestId}${result.pane ? `, pane ${result.pane}` : ""})`;
+  const header = `herdr-call ${result.status} (delivery ${result.delivery}, request ${result.requestId}${result.pane ? `, pane ${result.pane}` : ""}${result.resultFile ? `, resultFile ${result.resultFile}` : ""})`;
   if (result.ok && result.status === "answered") {
     return `${header}
 
@@ -20664,11 +21130,13 @@ function registerCallFeatures(api, herdrBin, senderPane) {
       status: result.status,
       delivery: result.delivery,
       elapsedMs: result.elapsedMs,
-      code: result.error?.code
+      code: result.error?.code,
+      resultFile: result.resultFile,
+      markerVerified: result.markerVerified
     });
   }
   api.registerCommand("herdr-call", {
-    description: "Call a Herdr-registered agent in another pane and get its answer back: <pane-id-or-unique-agent-name> <text>",
+    description: "Call a Herdr-registered agent in another pane and get its answer back: [--result-file <abs-path>] <pane-id-or-unique-agent-name> <text>",
     handler: async (args) => {
       const request = parseCallCommandArgs(args);
       const result = typeof request === "string" ? {
@@ -20693,13 +21161,18 @@ function registerCallFeatures(api, herdrBin, senderPane) {
   api.registerTool({
     name: "herdr_agent_call",
     label: "Herdr Agent Call",
-    description: "Call a Herdr-registered agent (Claude Code, Codex, Copilot, Gemini, ...) in another Herdr pane and get its answer text back. " + "`target` must be an explicit Herdr pane ID or a name that resolves to exactly one agent; the target must be observed idle/done, " + "and Herdr's own known-agent/foreground gate decides finally whether the prompt is sent (zero input on rejection). " + "One prompt with a bounded wait (60s total budget) and one bounded screen read (200 lines); the answer is recovered from " + "per-request marker lines, and anything less is returned as an unverified capture instead of a success. " + "No remote approvals, key presses, or retries are ever sent. For GJC targets use the existing herdr_send tool instead.",
+    description: "Call a Herdr-registered agent (Claude Code, Codex, Copilot, Gemini, ...) in another Herdr pane and get its answer text back. " + "`target` must be an explicit Herdr pane ID or a name that resolves to exactly one agent; the target must be observed idle/done, " + "and Herdr's own known-agent/foreground gate decides finally whether the prompt is sent (zero input on rejection). " + "One prompt with a bounded wait (60s total budget) and one bounded screen read (200 lines); the answer is recovered from " + "per-request marker lines, or from `result_file` when a new absolute file path is provided (must not already exist before sending; resilient to long answers and folded/truncated terminal output; the target agent must be able to write to that path, e.g. inside the repository for sandboxed agy). " + "Anything less is returned as an unverified capture instead of a success. " + "No remote approvals, key presses, or retries are ever sent. For GJC targets use the existing herdr_send tool instead.",
     parameters: z.object({
       target: z.string().describe("Target Herdr pane ID (e.g. wC:p2) or unique agent name"),
-      text: z.string().describe("Prompt text to deliver verbatim")
+      text: z.string().describe("Prompt text to deliver verbatim"),
+      result_file: z.string().optional().describe("Optional new absolute path (must not exist before sending) where the target agent writes its full answer (resilient to long output or screen folding; target agent must have write access, e.g. inside the workspace for sandboxed agy)")
     }),
     async execute(_toolCallId, params, signal) {
-      const result = await callRegisteredAgent(deps, { target: params.target, text: params.text }, senderPane, signal);
+      const result = await callRegisteredAgent(deps, {
+        target: params.target,
+        text: params.text,
+        ...params.result_file !== undefined ? { resultFile: params.result_file } : {}
+      }, senderPane, signal);
       summarize(result);
       return {
         content: [{ type: "text", text: describeCallResult(result) }],
