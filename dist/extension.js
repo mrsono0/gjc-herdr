@@ -22825,6 +22825,9 @@ var LOCK_CONFLICT_MANUAL_ACTION = "\uADF8 GJC\uAC00 \uB05D\uB0AC\uB294\uC9C0 \uD
 var SHUTDOWN_TIMEOUT_MANUAL_ACTION = "\uC774\uC804 GJC\uAC00 \uB05D\uB0AC\uB294\uC9C0 \uD655\uC778\uD55C \uB4A4 \uC7A0\uAE08\uB9CC \uC9C0\uC6B0\uACE0 \uB2E4\uC2DC \uC2DC\uC791. \uBA54\uC2DC\uC9C0\xB7attempt\uB294 \uC9C0\uC6B0\uC9C0 \uC54A\uC74C";
 var HOLD_RETRY_NOTICE = "\uB2E4\uC2DC \uC2DC\uC791\uD574\uC57C \uC7AC\uC2DC\uB3C4\uB428";
 var SESSION_ID_RE = /^[A-Za-z0-9-]{1,64}$/;
+function isInteractiveMainSession(ctx) {
+  return Boolean(ctx) && ctx.hasUI === true && isMainSession(ctx);
+}
 function errorMessage4(error) {
   return error instanceof Error ? error.message : String(error);
 }
@@ -22963,6 +22966,7 @@ function registerMailReceiver(api, overrides) {
   let lockAcquired = false;
   let startupBannerShown = false;
   let invalidEnvNotified = false;
+  let nonInteractiveNotified = false;
   let warnedOver1000Files = false;
   let mailboxName = "";
   let topLevel = "";
@@ -23045,6 +23049,12 @@ function registerMailReceiver(api, overrides) {
       } catch {}
     }
   }
+  function emitNonInteractiveOnce() {
+    if (nonInteractiveNotified)
+      return;
+    nonInteractiveNotified = true;
+    emitDiagnostic("non_interactive_session", "info", "gjc-herdr \uC6B0\uD3B8 \uBC1B\uAE30 \uBE44\uD65C\uC131\uD654: UI\uAC00 \uC5C6\uB294 \uBE44\uB300\uD654\uD615 \uC138\uC158(hasUI=false)\uC5D0\uC11C\uB294 \uC6B0\uD3B8 \uBC1B\uAE30\uB97C \uCF1C\uC9C0 \uC54A\uC2B5\uB2C8\uB2E4.", { notifyUi: false });
+  }
   function emitWarnings(warnings) {
     for (const w of warnings) {
       emitDiagnostic(w.code, "warning", w.message, {
@@ -23098,9 +23108,25 @@ function registerMailReceiver(api, overrides) {
       clearRecordTimer(rec);
     }
   }
+  function stillActive(expectedGen) {
+    return !closing && !disabled && currentCtx !== undefined && isInteractiveMainSession(currentCtx) && (expectedGen === undefined || currentGeneration === expectedGen);
+  }
+  function ensurePollTimer() {
+    if (!lockAcquired || !stillActive() || pollTimer !== undefined) {
+      return;
+    }
+    const timer = setIntervalFn(() => {
+      if (stillActive()) {
+        requestScan();
+      }
+    }, POLL_INTERVAL_MS4);
+    timer?.unref?.();
+    pollTimer = timer;
+  }
   function isCurrentlyIdle() {
-    if (closing || disabled || !currentCtx)
+    if (!stillActive()) {
       return false;
+    }
     try {
       return Boolean(currentCtx.isIdle());
     } catch {
@@ -23396,8 +23422,8 @@ function registerMailReceiver(api, overrides) {
     scheduleInFlightWarning(record);
     return "sent";
   }
-  async function ensureWatcher() {
-    if (closing || disabled || !lockAcquired || !recipientDir) {
+  async function ensureWatcher(expectedGen = currentGeneration) {
+    if (!lockAcquired || !recipientDir || !stillActive(expectedGen)) {
       return false;
     }
     const dotDir = posix2.join(topLevel, ".gjc-herdr");
@@ -23406,6 +23432,12 @@ function registerMailReceiver(api, overrides) {
       try {
         stat = await fsOps.lstat(dir);
       } catch (error) {
+        if (!stillActive(expectedGen)) {
+          if (!stillActive()) {
+            closeCurrentWatcher();
+          }
+          return false;
+        }
         if (isMissingPath3(error)) {
           closeCurrentWatcher();
           return false;
@@ -23413,34 +23445,60 @@ function registerMailReceiver(api, overrides) {
         emitDiagnostic("path_boundary_failed", "warning", `gjc-herdr \uC6B0\uD3B8\uD568 \uACBD\uB85C \uD655\uC778 \uC2E4\uD328 (${dir}): ${errorMessage4(error)}`, { path: dir, notifyUi: false });
         return false;
       }
-      if (closing || disabled)
+      if (!stillActive(expectedGen)) {
+        if (!stillActive()) {
+          closeCurrentWatcher();
+        }
         return false;
+      }
       if (stat.isSymbolicLink() || !stat.isDirectory()) {
         emitDiagnostic(stat.isSymbolicLink() ? "symlink_rejected" : "not_a_directory", "error", `gjc-herdr \uC6B0\uD3B8\uD568 \uACBD\uB85C \uACBD\uACC4 \uC704\uBC18 (${dir}): \uC77C\uBC18 \uB514\uB809\uD130\uB9AC\uAC00 \uC544\uB2D9\uB2C8\uB2E4.`, { path: dir });
         return false;
       }
       try {
         const realDir = await fsOps.realpath(dir);
-        if (closing || disabled)
+        if (!stillActive(expectedGen)) {
+          if (!stillActive()) {
+            closeCurrentWatcher();
+          }
           return false;
+        }
         if (!isInsideRepo2(realDir, realTopLevel)) {
           emitDiagnostic("outside_repo", "error", `gjc-herdr \uC6B0\uD3B8\uD568 \uACBD\uB85C\uAC00 \uC800\uC7A5\uC18C \uBC16\uC744 \uAC00\uB9AC\uD0B5\uB2C8\uB2E4: ${realDir}`, { path: dir });
           return false;
         }
       } catch (error) {
+        if (!stillActive(expectedGen)) {
+          if (!stillActive()) {
+            closeCurrentWatcher();
+          }
+          return false;
+        }
         emitDiagnostic("path_boundary_failed", "warning", `gjc-herdr \uC6B0\uD3B8\uD568 realpath \uD655\uC778 \uC2E4\uD328 (${dir}): ${errorMessage4(error)}`, { path: dir, notifyUi: false });
         return false;
       }
       if (dir === recipientDir) {
+        if (!stillActive(expectedGen)) {
+          if (!stillActive()) {
+            closeCurrentWatcher();
+          }
+          return false;
+        }
         const inoChanged = stat.ino !== undefined && watchedIno !== undefined && stat.ino !== watchedIno;
         if (!activeWatcher || watcherFailed || inoChanged) {
           closeCurrentWatcher();
           try {
             const w = watchFn(recipientDir, () => {
-              if (!closing && !disabled) {
+              if (stillActive()) {
                 requestScan();
               }
             });
+            if (!stillActive(expectedGen)) {
+              try {
+                w.close();
+              } catch {}
+              return false;
+            }
             activeWatcher = w;
             watchedIno = stat.ino;
             watcherFailed = false;
@@ -23465,7 +23523,7 @@ function registerMailReceiver(api, overrides) {
         }
       }
     }
-    return true;
+    return stillActive(expectedGen);
   }
   async function runStartupRecovery() {
     if (closing || disabled || !fsOps.readdir)
@@ -23846,14 +23904,15 @@ function registerMailReceiver(api, overrides) {
     }
   }
   async function runScanLoop() {
-    if (closing || disabled || !lockAcquired)
+    if (closing || disabled || !lockAcquired || !currentCtx || !isInteractiveMainSession(currentCtx)) {
       return;
+    }
     scanRequested = true;
     if (scanRunning)
       return;
     scanRunning = true;
     try {
-      while (scanRequested && !closing && !disabled) {
+      while (scanRequested && !closing && !disabled && currentCtx !== undefined && isInteractiveMainSession(currentCtx)) {
         scanRequested = false;
         await performScanPass();
       }
@@ -23862,7 +23921,7 @@ function registerMailReceiver(api, overrides) {
     }
   }
   function requestScan() {
-    if (closing || disabled || !lockAcquired) {
+    if (closing || disabled || !lockAcquired || !currentCtx || !isInteractiveMainSession(currentCtx)) {
       return serialTail;
     }
     scanRequested = true;
@@ -23977,12 +24036,51 @@ function registerMailReceiver(api, overrides) {
       emitDiagnostic("invalid_session_id", "error", "gjc-herdr \uC6B0\uD3B8 \uBC1B\uAE30 \uBE44\uD65C\uC131\uD654: \uC720\uD6A8\uD55C \uC138\uC158 ID\uB97C \uC5BB\uC744 \uC218 \uC5C6\uC2B5\uB2C8\uB2E4.");
       return;
     }
-    if (!closing && !disabled && currentGeneration === targetGen) {
+    if (stillActive(targetGen)) {
+      ensurePollTimer();
       requestScan();
     }
   }
+  async function handleInactiveSessionTransition(ctx, isStartEvent) {
+    if (isMainSession(ctx) && !isInteractiveMainSession(ctx)) {
+      emitNonInteractiveOnce();
+    }
+    if (isStartEvent && !lockAcquired) {
+      return;
+    }
+    currentGeneration += 1;
+    const switchGen = currentGeneration;
+    lastEventSeq += 1;
+    const switchSeq = lastEventSeq;
+    currentCtx = undefined;
+    currentSessionId = "";
+    scanRequested = false;
+    rotateAttemptFence(true);
+    clearAllTimersAndWatch();
+    if (lockAcquired && !closing && !disabled) {
+      pendingBarrierSeqs.push(switchSeq);
+      await enqueueSerial(async () => {
+        try {
+          await flushPendingMessageEnds(switchSeq);
+          if (closing || disabled || !lockAcquired)
+            return;
+          const staleRecords = Array.from(activeRecords.values()).filter((r) => r.generation !== switchGen).sort((a, b) => a.id.localeCompare(b.id));
+          for (const record of staleRecords) {
+            if (closing || disabled)
+              return;
+            await transitionToUncertain(record, "session_changed");
+          }
+        } finally {
+          removeBarrierSeq(switchSeq);
+        }
+      }, { allowDuringClosing: true });
+    }
+  }
   async function startReceiver(ctx, targetGen, sessionIdValid, barrierSeq) {
-    if (!isMainSession(ctx)) {
+    if (!isInteractiveMainSession(ctx)) {
+      if (isMainSession(ctx)) {
+        emitNonInteractiveOnce();
+      }
       return;
     }
     if (closing || disabled) {
@@ -24057,18 +24155,20 @@ function registerMailReceiver(api, overrides) {
     if (closing)
       return;
     await runStartupRecovery();
-    if (closing || disabled)
-      return;
-    await ensureWatcher();
-    if (closing || disabled)
-      return;
-    const timer = setIntervalFn(() => {
-      if (!closing && !disabled) {
-        requestScan();
+    if (!stillActive(targetGen)) {
+      if (!stillActive()) {
+        clearAllTimersAndWatch();
       }
-    }, POLL_INTERVAL_MS4);
-    timer?.unref?.();
-    pollTimer = timer;
+      return;
+    }
+    await ensureWatcher(targetGen);
+    if (!stillActive(targetGen)) {
+      if (!stillActive()) {
+        clearAllTimersAndWatch();
+      }
+      return;
+    }
+    ensurePollTimer();
     requestScan();
   }
   async function waitWithTimeout(promise, timeoutMs) {
@@ -24161,8 +24261,10 @@ function registerMailReceiver(api, overrides) {
   }
   if (rawMailbox !== undefined) {
     api.on("session_start", async (_event, ctx) => {
-      if (!isMainSession(ctx))
+      if (!isInteractiveMainSession(ctx)) {
+        await handleInactiveSessionTransition(ctx, true);
         return;
+      }
       closing = false;
       currentGeneration += 1;
       const startGen = currentGeneration;
@@ -24182,10 +24284,8 @@ function registerMailReceiver(api, overrides) {
       }, { allowDuringClosing: true });
     });
     api.on("session_switch", async (_event, ctx) => {
-      if (!isMainSession(ctx)) {
-        currentGeneration += 1;
-        currentCtx = undefined;
-        rotateAttemptFence(true);
+      if (!isInteractiveMainSession(ctx)) {
+        await handleInactiveSessionTransition(ctx, false);
         return;
       }
       currentGeneration += 1;
@@ -24199,7 +24299,11 @@ function registerMailReceiver(api, overrides) {
       pendingBarrierSeqs.push(switchSeq);
       await enqueueSerial(async () => {
         try {
-          await handleSessionSwitch(switchGen, resolvedSid !== undefined, switchSeq);
+          if (!lockAcquired) {
+            await startReceiver(ctx, switchGen, resolvedSid !== undefined, switchSeq);
+          } else {
+            await handleSessionSwitch(switchGen, resolvedSid !== undefined, switchSeq);
+          }
         } finally {
           removeBarrierSeq(switchSeq);
         }
