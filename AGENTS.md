@@ -15,8 +15,24 @@
 - native reporter 중지·위임, 프로세스 전체 `process.env` mask·변경, native source/seq/owner 재사용, lifecycle report/release 호출로 native를 대체하는 방식은 대상에서 제외한다. 플러그인은 전용 source·seq·token key만 쓰고, native 상태·session/resume·다른 source의 키는 건드리지 않으며, 정리할 때도 플러그인 키만 clear-token/TTL로 정리한다.
 - 미확인·불가능한 기능은 근거와 함께 밝히며 본체 수정으로 우회하지 않는다. 목표를 진단·북마크 전용 제품으로 바꾸지 않는다.
 - 개발 루트는 이 저장소 폴더 자체다. 하위 프로젝트나 외부 코딩 루트를 만들지 않는다.
+- **목표 운영 환경:** 최종 환경은 원격 서버의 Herdr 서버다. 대부분 화면을 보는 Herdr TUI 클라이언트가 없고, 팀장도 화면 밖에서 다룬다. 설계·검토는 사람이 화면을 보지 않는다는 전제로 한다(`docs/dev-environment.md` §0).
 - 사용자 프로세스·pane·focus·설정·credentials·PATH·권한·plugin registry를 보호한다. 사용자 승인 없이 commit·push·tag·npm 발행·전역 설치·물리 rename을 하지 않는다. 사용자가 요청한 인접 세션과의 대화는 허용되지만 종료·재설정·무단 입력 덮어쓰기는 허용되지 않는다.
 - 과거 실패·blocked 이력과 비추적 증거(`.gjc/`, `.local/`, `tests/`, `e2e-results/`, `backups/`)는 삭제하거나 위조하지 않는다. `.gjc/` 공식 기록은 공식 writer로만 작성한다.
+
+### 인터페이스 우선순위 (2026-10-17 사용자 확정)
+
+이 플러그인을 만든 이유는, Herdr 안에서 여러 에이전트가 원활하게 소통하게 하는 것이다. 그런데 GJC는 Herdr에 감지(detected) agent로 등록되어 있지 않아 Herdr 호출 게이트가 GJC를 대상으로 받지 않는다. 플러그인은 이 제약을 공개 인터페이스로 보완한다. 그래서 기능을 만들거나 고칠 때는 다음 순서를 따른다.
+
+1. **Herdr 표준 인터페이스가 우선이다.** 새 기능은 먼저 Herdr의 공개 CLI·소켓 API로 할 수 있는지 본다. 예: `herdr agent list/get/prompt/read/wait`, `pane read`, token, 이벤트 구독, 플러그인
+2. **Herdr로 안 되는 부분만 보조한다.** GJC 공개 SDK(`gjc sdk …`)나 파일 우편함(`.gjc-herdr/mailbox`)은 Herdr 표준으로 할 수 없을 때만 쓴다. 이 경우 이슈에 "왜 Herdr 표준으로는 안 되는지"를 적는다.
+3. **Herdr가 지원하게 되면 보조를 걷어낸다.** 예: [herdrdev/herdr#5005](https://github.com/herdrdev/herdr/discussions/5005)가 수락돼 GJC가 감지 agent가 되면, 보조 경로를 줄이거나 없애는 방향으로 다시 설계한다.
+
+- 2026-10-17 현재: #5005는 열려 있고 댓글·답변이 없다. 같은 벽의 #4732, #2935도 열려 있다. `HERDR_AGENT=<agent>` 힌트는 이미 있는 manifest만 고를 수 있어서(#5311), 사용자 쪽에서 GJC 감지를 추가할 수 없다.
+- 지금 기능의 위치는 다음과 같다.
+  - Herdr 표준: 메타데이터 token 보고, `/herdr-send --raw`, `/herdr-call`
+  - GJC 전용 보조: `/herdr-send`의 SDK 모드
+  - 저장소 파일 보조: 파일 우편함. Herdr로 닿지 않는 상대(외부 팀장)와 작업 중에 넣기 위험한 보고를 위해 둔다.
+- 원격 목표 환경(`docs/dev-environment.md` §0)에서도 GJC 팀원은 Herdr pane 안의 대화형 GJC로 띄우는 것을 기준으로 한다. Herdr 밖 헤드리스 GJC(`gjc sdk` 세션)는 Herdr 표준으로 다룰 수 없으므로 기준으로 삼지 않는다.
 
 ### 범용 에이전트 간 호출·답변 회수 (2026-10-07 사용자 확정)
 
