@@ -57,6 +57,12 @@ export const HOLD_RETRY_NOTICE = "다시 시작해야 재시도됨";
 
 const SESSION_ID_RE = /^[A-Za-z0-9-]{1,64}$/;
 
+export function isInteractiveMainSession(
+	ctx: Pick<ExtensionContext, "hasUI" | "sessionMetadata">,
+): boolean {
+	return Boolean(ctx) && ctx.hasUI === true && isMainSession(ctx);
+}
+
 export type MailItemState =
 	| "reserved"
 	| "waiting_call"
@@ -377,6 +383,7 @@ export function registerMailReceiver(
 	let lockAcquired = false;
 	let startupBannerShown = false;
 	let invalidEnvNotified = false;
+	let nonInteractiveNotified = false;
 	let warnedOver1000Files = false;
 
 	let mailboxName = "";
@@ -488,6 +495,17 @@ export function registerMailReceiver(
 		}
 	}
 
+	function emitNonInteractiveOnce(): void {
+		if (nonInteractiveNotified) return;
+		nonInteractiveNotified = true;
+		emitDiagnostic(
+			"non_interactive_session",
+			"info",
+			"gjc-herdr 우편 받기 비활성화: UI가 없는 비대화형 세션(hasUI=false)에서는 우편 받기를 켜지 않습니다.",
+			{ notifyUi: false },
+		);
+	}
+
 	function emitWarnings(warnings: readonly MailWarning[]): void {
 		for (const w of warnings) {
 			emitDiagnostic(w.code, "warning", w.message, {
@@ -554,10 +572,35 @@ export function registerMailReceiver(
 		}
 	}
 
+	function stillActive(expectedGen?: number): boolean {
+		return (
+			!closing &&
+			!disabled &&
+			currentCtx !== undefined &&
+			isInteractiveMainSession(currentCtx) &&
+			(expectedGen === undefined || currentGeneration === expectedGen)
+		);
+	}
+
+	function ensurePollTimer(): void {
+		if (!lockAcquired || !stillActive() || pollTimer !== undefined) {
+			return;
+		}
+		const timer = setIntervalFn(() => {
+			if (stillActive()) {
+				void requestScan();
+			}
+		}, POLL_INTERVAL_MS);
+		timer?.unref?.();
+		pollTimer = timer;
+	}
+
 	function isCurrentlyIdle(): boolean {
-		if (closing || disabled || !currentCtx) return false;
+		if (!stillActive()) {
+			return false;
+		}
 		try {
-			return Boolean(currentCtx.isIdle());
+			return Boolean(currentCtx!.isIdle());
 		} catch {
 			return false;
 		}
@@ -950,8 +993,10 @@ export function registerMailReceiver(
 		return "sent";
 	}
 
-	async function ensureWatcher(): Promise<boolean> {
-		if (closing || disabled || !lockAcquired || !recipientDir) {
+	async function ensureWatcher(
+		expectedGen = currentGeneration,
+	): Promise<boolean> {
+		if (!lockAcquired || !recipientDir || !stillActive(expectedGen)) {
 			return false;
 		}
 		const dotDir = posix.join(topLevel, ".gjc-herdr");
@@ -960,6 +1005,12 @@ export function registerMailReceiver(
 			try {
 				stat = await fsOps.lstat(dir);
 			} catch (error) {
+				if (!stillActive(expectedGen)) {
+					if (!stillActive()) {
+						closeCurrentWatcher();
+					}
+					return false;
+				}
 				if (isMissingPath(error)) {
 					closeCurrentWatcher();
 					return false;
@@ -972,7 +1023,12 @@ export function registerMailReceiver(
 				);
 				return false;
 			}
-			if (closing || disabled) return false;
+			if (!stillActive(expectedGen)) {
+				if (!stillActive()) {
+					closeCurrentWatcher();
+				}
+				return false;
+			}
 			if (stat.isSymbolicLink() || !stat.isDirectory()) {
 				emitDiagnostic(
 					stat.isSymbolicLink() ? "symlink_rejected" : "not_a_directory",
@@ -984,7 +1040,12 @@ export function registerMailReceiver(
 			}
 			try {
 				const realDir = await fsOps.realpath(dir);
-				if (closing || disabled) return false;
+				if (!stillActive(expectedGen)) {
+					if (!stillActive()) {
+						closeCurrentWatcher();
+					}
+					return false;
+				}
 				if (!isInsideRepo(realDir, realTopLevel)) {
 					emitDiagnostic(
 						"outside_repo",
@@ -995,6 +1056,12 @@ export function registerMailReceiver(
 					return false;
 				}
 			} catch (error) {
+				if (!stillActive(expectedGen)) {
+					if (!stillActive()) {
+						closeCurrentWatcher();
+					}
+					return false;
+				}
 				emitDiagnostic(
 					"path_boundary_failed",
 					"warning",
@@ -1005,6 +1072,12 @@ export function registerMailReceiver(
 			}
 
 			if (dir === recipientDir) {
+				if (!stillActive(expectedGen)) {
+					if (!stillActive()) {
+						closeCurrentWatcher();
+					}
+					return false;
+				}
 				const inoChanged =
 					stat.ino !== undefined &&
 					watchedIno !== undefined &&
@@ -1013,10 +1086,18 @@ export function registerMailReceiver(
 					closeCurrentWatcher();
 					try {
 						const w = watchFn(recipientDir, () => {
-							if (!closing && !disabled) {
+							if (stillActive()) {
 								void requestScan();
 							}
 						});
+						if (!stillActive(expectedGen)) {
+							try {
+								w.close();
+							} catch {
+								// Ignore watcher close error.
+							}
+							return false;
+						}
 						activeWatcher = w;
 						watchedIno = stat.ino;
 						watcherFailed = false;
@@ -1041,7 +1122,7 @@ export function registerMailReceiver(
 				}
 			}
 		}
-		return true;
+		return stillActive(expectedGen);
 	}
 
 	async function runStartupRecovery(): Promise<void> {
@@ -1566,12 +1647,26 @@ export function registerMailReceiver(
 	}
 
 	async function runScanLoop(): Promise<void> {
-		if (closing || disabled || !lockAcquired) return;
+		if (
+			closing ||
+			disabled ||
+			!lockAcquired ||
+			!currentCtx ||
+			!isInteractiveMainSession(currentCtx)
+		) {
+			return;
+		}
 		scanRequested = true;
 		if (scanRunning) return;
 		scanRunning = true;
 		try {
-			while (scanRequested && !closing && !disabled) {
+			while (
+				scanRequested &&
+				!closing &&
+				!disabled &&
+				currentCtx !== undefined &&
+				isInteractiveMainSession(currentCtx)
+			) {
 				scanRequested = false;
 				await performScanPass();
 			}
@@ -1581,7 +1676,13 @@ export function registerMailReceiver(
 	}
 
 	function requestScan(): Promise<void> {
-		if (closing || disabled || !lockAcquired) {
+		if (
+			closing ||
+			disabled ||
+			!lockAcquired ||
+			!currentCtx ||
+			!isInteractiveMainSession(currentCtx)
+		) {
 			return serialTail;
 		}
 		scanRequested = true;
@@ -1763,8 +1864,51 @@ export function registerMailReceiver(
 			return;
 		}
 
-		if (!closing && !disabled && currentGeneration === targetGen) {
+		if (stillActive(targetGen)) {
+			ensurePollTimer();
 			void requestScan();
+		}
+	}
+
+	async function handleInactiveSessionTransition(
+		ctx: ExtensionContext,
+		isStartEvent: boolean,
+	): Promise<void> {
+		if (isMainSession(ctx) && !isInteractiveMainSession(ctx)) {
+			emitNonInteractiveOnce();
+		}
+		if (isStartEvent && !lockAcquired) {
+			return;
+		}
+		currentGeneration += 1;
+		const switchGen = currentGeneration;
+		lastEventSeq += 1;
+		const switchSeq = lastEventSeq;
+		currentCtx = undefined;
+		currentSessionId = "";
+		scanRequested = false;
+		rotateAttemptFence(true);
+		clearAllTimersAndWatch();
+		if (lockAcquired && !closing && !disabled) {
+			pendingBarrierSeqs.push(switchSeq);
+			await enqueueSerial(
+				async () => {
+					try {
+						await flushPendingMessageEnds(switchSeq);
+						if (closing || disabled || !lockAcquired) return;
+						const staleRecords = Array.from(activeRecords.values())
+							.filter((r) => r.generation !== switchGen)
+							.sort((a, b) => a.id.localeCompare(b.id));
+						for (const record of staleRecords) {
+							if (closing || disabled) return;
+							await transitionToUncertain(record, "session_changed");
+						}
+					} finally {
+						removeBarrierSeq(switchSeq);
+					}
+				},
+				{ allowDuringClosing: true },
+			);
 		}
 	}
 
@@ -1774,7 +1918,10 @@ export function registerMailReceiver(
 		sessionIdValid: boolean,
 		barrierSeq: number,
 	): Promise<void> {
-		if (!isMainSession(ctx)) {
+		if (!isInteractiveMainSession(ctx)) {
+			if (isMainSession(ctx)) {
+				emitNonInteractiveOnce();
+			}
 			return;
 		}
 		if (closing || disabled) {
@@ -1905,18 +2052,22 @@ export function registerMailReceiver(
 		if (closing) return;
 
 		await runStartupRecovery();
-		if (closing || disabled) return;
-
-		await ensureWatcher();
-		if (closing || disabled) return;
-
-		const timer = setIntervalFn(() => {
-			if (!closing && !disabled) {
-				void requestScan();
+		if (!stillActive(targetGen)) {
+			if (!stillActive()) {
+				clearAllTimersAndWatch();
 			}
-		}, POLL_INTERVAL_MS);
-		timer?.unref?.();
-		pollTimer = timer;
+			return;
+		}
+
+		await ensureWatcher(targetGen);
+		if (!stillActive(targetGen)) {
+			if (!stillActive()) {
+				clearAllTimersAndWatch();
+			}
+			return;
+		}
+
+		ensurePollTimer();
 
 		void requestScan();
 	}
@@ -2076,7 +2227,10 @@ export function registerMailReceiver(
 
 	if (rawMailbox !== undefined) {
 		api.on("session_start", async (_event, ctx) => {
-			if (!isMainSession(ctx)) return;
+			if (!isInteractiveMainSession(ctx)) {
+				await handleInactiveSessionTransition(ctx, true);
+				return;
+			}
 			closing = false;
 			currentGeneration += 1;
 			const startGen = currentGeneration;
@@ -2105,10 +2259,8 @@ export function registerMailReceiver(
 		});
 
 		api.on("session_switch", async (_event, ctx) => {
-			if (!isMainSession(ctx)) {
-				currentGeneration += 1;
-				currentCtx = undefined;
-				rotateAttemptFence(true);
+			if (!isInteractiveMainSession(ctx)) {
+				await handleInactiveSessionTransition(ctx, false);
 				return;
 			}
 			// §5 Synchronously bump generation, abort in-flight attempt publication, and replace ctx on handler entry.
@@ -2124,11 +2276,20 @@ export function registerMailReceiver(
 			await enqueueSerial(
 				async () => {
 					try {
-						await handleSessionSwitch(
-							switchGen,
-							resolvedSid !== undefined,
-							switchSeq,
-						);
+						if (!lockAcquired) {
+							await startReceiver(
+								ctx,
+								switchGen,
+								resolvedSid !== undefined,
+								switchSeq,
+							);
+						} else {
+							await handleSessionSwitch(
+								switchGen,
+								resolvedSid !== undefined,
+								switchSeq,
+							);
+						}
 					} finally {
 						removeBarrierSeq(switchSeq);
 					}

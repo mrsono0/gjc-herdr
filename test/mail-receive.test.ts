@@ -28,6 +28,7 @@ import {
 	formatInjectedMailContent,
 	HOLD_RETRY_NOTICE,
 	IN_FLIGHT_WARN_MS,
+	isInteractiveMainSession,
 	LOCK_CONFLICT_MANUAL_ACTION,
 	MAIL_BODY_END,
 	MAIL_BODY_START,
@@ -617,6 +618,7 @@ function writeValidMailToFs(
 function createTestHarness(custom?: {
 	mailboxEnv?: string | undefined;
 	idle?: boolean;
+	hasUI?: boolean;
 	sessionId?: string;
 	sessionMetadata?: { kind: string; taskDepth: number };
 	fs?: MemoryMailFs;
@@ -630,6 +632,7 @@ function createTestHarness(custom?: {
 	const sentMessages: SentCustomMessageCall[] = [];
 	const notifications: Array<{ message: string; level?: string }> = [];
 	const diagnostics: MailReceiverDiagnostic[] = [];
+	const loggerCalls: Array<{ level: "info" | "warn" | "error"; message: string }> = [];
 
 	let isIdleState = custom?.idle ?? true;
 	let currentSessionId = custom?.sessionId ?? "sess-main-1";
@@ -639,9 +642,11 @@ function createTestHarness(custom?: {
 	const makeCtx = (overridesCtx?: {
 		sessionId?: string;
 		sessionMetadata?: { kind: string; taskDepth: number };
+		hasUI?: boolean;
 	}): ExtensionContext => {
 		const sid = overridesCtx?.sessionId ?? currentSessionId;
 		return {
+			hasUI: overridesCtx?.hasUI ?? custom?.hasUI ?? true,
 			isIdle: () => isIdleState,
 			sessionMetadata:
 				overridesCtx?.sessionMetadata ??
@@ -661,9 +666,15 @@ function createTestHarness(custom?: {
 
 	const api = {
 		logger: {
-			info() {},
-			warn() {},
-			error() {},
+			info(message: string) {
+				loggerCalls.push({ level: "info", message });
+			},
+			warn(message: string) {
+				loggerCalls.push({ level: "warn", message });
+			},
+			error(message: string) {
+				loggerCalls.push({ level: "error", message });
+			},
 		},
 		zod: { z: {} },
 		exec: custom?.exec ?? makeGitExec(),
@@ -739,6 +750,7 @@ function createTestHarness(custom?: {
 		sentMessages,
 		notifications,
 		diagnostics,
+		loggerCalls,
 		controller,
 		makeCtx,
 		getIdle: () => isIdleState,
@@ -3242,5 +3254,215 @@ describe("#33 Phase 2 Round 3: Codex N1 & Pre-Publication Slot Tests", () => {
 		expect(finalSnap.slotCount).toBe(3);
 		expect(finalSnap.activeRecords.has(idSlot4)).toBe(false);
 		expect(h.fs.getFileText(`/repo/.gjc-herdr/mailbox/gjc-worker/${idSlot4}.attempt`)).toBeUndefined();
+	});
+
+	test("#44: hasUI=false with valid GJC_HERDR_MAILBOX and pending mail creates 0 locks, 0 attempts, 0 sendMessage calls, 0 watchers, 0 timers, logs non_interactive_session once, and sends 0 UI notifications", async () => {
+		expect(
+			isInteractiveMainSession({
+				hasUI: true,
+				sessionMetadata: { kind: "main", taskDepth: 0 },
+			}),
+		).toBe(true);
+		expect(
+			isInteractiveMainSession({
+				hasUI: false,
+				sessionMetadata: { kind: "main", taskDepth: 0 },
+			}),
+		).toBe(false);
+		expect(
+			isInteractiveMainSession({
+				hasUI: true,
+				sessionMetadata: { kind: "subagent", taskDepth: 1 },
+			} as unknown as Pick<ExtensionContext, "hasUI" | "sessionMetadata">),
+		).toBe(false);
+
+		const idPending = makeUlid(7001);
+		const lockPath = `/repo/.gjc-herdr/mailbox/gjc-worker/${CONSUMER_LOCK_FILE}`;
+		const attemptPath = `/repo/.gjc-herdr/mailbox/gjc-worker/${idPending}.attempt`;
+		const ackPath = `/repo/.gjc-herdr/mailbox/gjc-worker/${idPending}.ack`;
+
+		const h = createTestHarness({
+			idle: true,
+			hasUI: false,
+			sessionMetadata: { kind: "main", taskDepth: 0 },
+		});
+		writeValidMailToFs(h.fs, { id: idPending });
+
+		await h.emit("session_start");
+		await h.controller.triggerScan();
+		await h.emit("agent_end", { stopReason: "completed" });
+		await h.emit("session_start");
+		await h.controller.waitForIdleQueue();
+
+		const snap = h.controller.getStateSnapshot();
+		expect(snap.lockAcquired).toBe(false);
+		expect(h.fs.getFileText(lockPath)).toBeUndefined();
+		expect(h.fs.getFileText(attemptPath)).toBeUndefined();
+		expect(h.fs.getFileText(ackPath)).toBeUndefined();
+		expect(h.sentMessages.length).toBe(0);
+		expect(h.watchReg.watchers.length).toBe(0);
+		expect(h.clock.timers.size).toBe(0);
+
+		const nonInteractiveDiags = h.diagnostics.filter(
+			(d) => d.code === "non_interactive_session",
+		);
+		expect(nonInteractiveDiags.length).toBe(1);
+		expect(nonInteractiveDiags[0]?.level).toBe("info");
+		expect(h.loggerCalls.length).toBe(1);
+		expect(h.loggerCalls[0]?.level).toBe("info");
+		expect(h.notifications.length).toBe(0);
+	});
+
+	test("#44: hasUI=true interactive main session continues to acquire lock, start watch/timer, and inject pending mail; session_switch between hasUI=true and hasUI=false cleans up and stops receiving when UI is absent", async () => {
+		const idInteractive = makeUlid(7002);
+		const idAfterSwitchOff = makeUlid(7003);
+		const lockPath = `/repo/.gjc-herdr/mailbox/gjc-worker/${CONSUMER_LOCK_FILE}`;
+
+		const h = createTestHarness({
+			idle: true,
+			hasUI: true,
+			sessionMetadata: { kind: "main", taskDepth: 0 },
+		});
+		writeValidMailToFs(h.fs, { id: idInteractive });
+
+		// 1) Interactive start (hasUI: true) works as before.
+		await h.emit("session_start");
+		await h.controller.waitForIdleQueue();
+
+		expect(h.controller.getStateSnapshot().lockAcquired).toBe(true);
+		expect(h.fs.getFileText(lockPath)).toBeDefined();
+		expect(h.watchReg.watchers.length).toBe(1);
+		expect(h.watchReg.latestWatcher()?.closed).toBe(false);
+		expect(h.clock.timers.size).toBeGreaterThanOrEqual(1);
+		expect(h.sentMessages.length).toBe(1);
+		expect(h.sentMessages[0]?.message.details?.id).toBe(idInteractive);
+		expect(
+			h.controller.getStateSnapshot().activeRecords.get(idInteractive)?.state,
+		).toBe("in_flight");
+
+		// 2) session_switch to non-interactive (hasUI: false) turns off receiving, stops watcher/timers, transitions in-flight record from previous generation to uncertain(session_changed), and logs non_interactive_session once with 0 UI notifications.
+		const notificationsBeforeSwitch = h.notifications.length;
+		writeValidMailToFs(h.fs, { id: idAfterSwitchOff });
+		await h.emit(
+			"session_switch",
+			{},
+			h.makeCtx({ sessionId: "sess-print-2", hasUI: false }),
+		);
+		await h.controller.triggerScan();
+		await h.emit(
+			"agent_end",
+			{ stopReason: "completed" },
+			h.makeCtx({ sessionId: "sess-print-2", hasUI: false }),
+		);
+		await h.controller.waitForIdleQueue();
+
+		expect(h.watchReg.latestWatcher()?.closed).toBe(true);
+		expect(h.clock.timers.size).toBe(0);
+		expect(h.sentMessages.length).toBe(1);
+		expect(
+			h.fs.getFileText(
+				`/repo/.gjc-herdr/mailbox/gjc-worker/${idAfterSwitchOff}.attempt`,
+			),
+		).toBeUndefined();
+
+		const switchedAck = parseMailAck(
+			h.fs.getFileText(
+				`/repo/.gjc-herdr/mailbox/gjc-worker/${idInteractive}.ack`,
+			)!,
+			{ expectedId: idInteractive, expectedBy: "gjc-worker" },
+		);
+		expect(switchedAck.ok).toBe(true);
+		if (switchedAck.ok) {
+			expect(switchedAck.value.state).toBe("uncertain");
+			expect(switchedAck.value.reason).toBe("session_changed");
+		}
+
+		const nonInteractiveDiags = h.diagnostics.filter(
+			(d) => d.code === "non_interactive_session",
+		);
+		expect(nonInteractiveDiags.length).toBe(1);
+		expect(h.notifications.length).toBe(notificationsBeforeSwitch);
+
+		// 3) session_switch back to interactive (hasUI: true) re-arms watcher/poll timer and injects idAfterSwitchOff.
+		h.setSessionId("sess-main-3");
+		await h.emit(
+			"session_switch",
+			{},
+			h.makeCtx({ sessionId: "sess-main-3", hasUI: true }),
+		);
+		await h.controller.waitForIdleQueue();
+
+		expect(h.watchReg.latestWatcher()?.closed).toBe(false);
+		expect(h.clock.timers.size).toBeGreaterThanOrEqual(1);
+		expect(h.sentMessages.length).toBe(2);
+		expect(h.sentMessages[1]?.message.details?.id).toBe(idAfterSwitchOff);
+	});
+
+	test("#44 R1 regression: session_switch to hasUI=false during ensureWatcher realpath await leaves 0 open watchers and 0 timers", async () => {
+		const h = createTestHarness({
+			idle: true,
+			hasUI: true,
+			sessionMetadata: { kind: "main", taskDepth: 0 },
+		});
+		const recipientDir = "/repo/.gjc-herdr/mailbox/gjc-worker";
+
+		await h.emit("session_start");
+		await h.controller.waitForIdleQueue();
+		expect(h.watchReg.watchers.filter((w) => !w.closed).length).toBe(1);
+
+		let triggerNonInteractiveSwitch = true;
+		let switchPromises: Array<Promise<void> | void> = [];
+		const origRealpath = h.fs.realpath.bind(h.fs);
+		h.fs.realpath = async (path: string) => {
+			const res = await origRealpath(path);
+			if (triggerNonInteractiveSwitch && path === recipientDir) {
+				triggerNonInteractiveSwitch = false;
+				switchPromises = h.emitNoWait(
+					"session_switch",
+					{},
+					h.makeCtx({ sessionId: "sess-print-r1", hasUI: false }),
+				);
+			}
+			return res;
+		};
+
+		await h.controller.triggerScan();
+		await Promise.all(switchPromises);
+		await h.controller.waitForIdleQueue();
+
+		expect(h.watchReg.watchers.filter((w) => !w.closed).length).toBe(0);
+		expect(h.clock.timers.size).toBe(0);
+	});
+
+	test("#44 R2 regression: initial session_start with hasUI=false followed by session_switch with hasUI=true acquires lock and injects pending mail once", async () => {
+		const idPending = makeUlid(7004);
+		const lockPath = `/repo/.gjc-herdr/mailbox/gjc-worker/${CONSUMER_LOCK_FILE}`;
+
+		const h = createTestHarness({
+			idle: true,
+			hasUI: false,
+			sessionMetadata: { kind: "main", taskDepth: 0 },
+		});
+		writeValidMailToFs(h.fs, { id: idPending });
+
+		await h.emit("session_start");
+		await h.controller.waitForIdleQueue();
+		expect(h.controller.getStateSnapshot().lockAcquired).toBe(false);
+		expect(h.sentMessages.length).toBe(0);
+
+		h.setSessionId("sess-main-interactive");
+		await h.emit(
+			"session_switch",
+			{},
+			h.makeCtx({ sessionId: "sess-main-interactive", hasUI: true }),
+		);
+		await h.controller.waitForIdleQueue();
+
+		expect(h.controller.getStateSnapshot().lockAcquired).toBe(true);
+		expect(h.fs.getFileText(lockPath)).toBeDefined();
+		expect(h.watchReg.watchers.filter((w) => !w.closed).length).toBe(1);
+		expect(h.clock.timers.size).toBeGreaterThanOrEqual(1);
+		expect(h.sentMessages.length).toBe(1);
+		expect(h.sentMessages[0]?.message.details?.id).toBe(idPending);
 	});
 });
