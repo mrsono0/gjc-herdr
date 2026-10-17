@@ -229,9 +229,9 @@ valid=(a.get("workspace_id")==ws and a.get("pane_id")!=caller and a.get("agent")
        and (not terminal or a.get("terminal_id")==terminal)
        and a.get("name") in (None,"",name))
 if require_name=="1": valid=valid and a.get("name")==name
-if send=="1": valid=valid and a.get("focused") is False and a.get("agent_status") in ("idle","done") and a.get("interactive_ready") is True
+if send=="1": valid=valid and a.get("agent_status") in ("idle","done") and a.get("interactive_ready") is True
 if not valid:
-    print("대상 거부: 소유 Codex·workspace·이름·입력 준비·비포커스 조건을 확인하세요. 상태="+str(a.get("agent_status"))+", focused="+str(a.get("focused")),file=sys.stderr)
+    print("대상 거부: 소유 Codex·workspace·이름·입력 준비 조건을 확인하세요. 상태="+str(a.get("agent_status"))+", focused="+str(a.get("focused")),file=sys.stderr)
     sys.exit(1)' "$team_ws" "$caller" "$ROOT" "${pane:-}" "${terminal:-}" "$CRITIC_NAME" "$2" "$3"
 }
 agent="$(herdr agent get "$CRITIC_NAME")" || fail '검토 agent 이름을 확인하지 못했습니다.'
@@ -244,7 +244,7 @@ prompt="$(python3 -c 'import sys; text=open(sys.argv[1],encoding="utf-8").read()
 deadline=$(( $(now_ms) + timeout ))
 ready_deadline=$(( $(now_ms) + 30000 ))
 [ "$ready_deadline" -le "$deadline" ] || ready_deadline="$deadline"
-# 입력 직전에 다시 확인한다. 이후의 focus/occupant 변경과 입력은 원자적이지 않다.
+# 입력 직전에 다시 확인한다. 이후의 대상/입력란 변경과 입력은 원자적이지 않다.
 agent="$(herdr agent get "$CRITIC_NAME")" || fail '새 대화 전 대상 확인 실패.'
 validate_agent "$agent" 1 1 || exit 1
 screen="$(herdr pane read "$pane" --source visible --format ansi)" || fail '전송 전 입력란 확인 실패.'
@@ -290,11 +290,10 @@ fi
 # 1초 간격 세 번 연속 관측해야 준비로 본다. 대기는 준비 확인 한도(ready_deadline) 안에서만 한다.
 draft_reads=0
 worktree_enter_sent=0
-# /new 뒤 재대기 예외: 상태가 working이고 대상·비포커스가 맞을 때만 참이다(interactive_ready 값은 보지 않는다).
+# /new 뒤 재대기 예외: 상태가 working이고 대상이 맞을 때만 참이다(interactive_ready 값은 보지 않는다).
 # working이 아니면 호출한 쪽의 validate 거부로 끝낸다: blocked·unknown, idle/done인데 interactive_ready=False 등.
 new_working() { # JSON
 	[ "$(printf '%s' "$1" | jget result.agent.agent_status)" = working ] \
-		&& [ "$(printf '%s' "$1" | jget result.agent.focused)" = False ] \
 		&& validate_agent "$1" 0 1 2>/dev/null
 }
 wait_new_conversation() {
@@ -306,8 +305,6 @@ while :; do
 	fi
 	agent="$(herdr agent get "$pane")" || fail '새 입력란 상태 확인 실패. 지시서는 보내지 않았습니다.'
 	validate_agent "$agent" 0 1 || exit 1
-	focused="$(printf '%s' "$agent" | jget result.agent.focused)"
-	[ "$focused" = False ] || fail 'pane에 focus가 생겨 지시서를 보내지 않았습니다.'
 	status="$(printf '%s' "$agent" | jget result.agent.agent_status)"
 	case "$status" in blocked|unknown) fail "새 입력란 상태=$status. 지시서를 보내지 않았습니다." ;; esac
 	screen="$(herdr pane read "$pane" --source visible --format ansi)" || fail '새 대화 화면 확인 실패.'
@@ -325,7 +322,7 @@ while :; do
 		fi
 		screen_matches "$screen" worktree || { echo '/new 뒤 worktree 메뉴의 선택이 1번(현재 worktree)이 아닙니다. 지시서는 보내지 않았습니다. 자동 Esc·Enter 없음.' >&2; exit 2; }
 		agent="$(herdr agent get "$pane")" || fail 'worktree 선택 전 대상 확인 실패. 지시서는 보내지 않았습니다.'
-		# 대상·비포커스는 맞고 상태만 working이면 Enter 없이 기다린다. 그 밖의 실패는 거부한다.
+		# 대상은 맞고 상태만 working이면 Enter 없이 기다린다. 그 밖의 실패는 거부한다.
 		if new_working "$agent"; then
 			sleep 1
 			continue
@@ -368,7 +365,7 @@ while :; do
 	[ "$new_sent" -eq 0 ] || wait_new_conversation
 	agent="$(herdr agent get "$CRITIC_NAME")" || fail '전송 직전 이름 확인 실패.'
 	# /new를 보낸 뒤에는 준비 확인과 이 확인 사이에 working이 다시 시작될 수 있다.
-	# 대상·이름·비포커스는 맞고 상태만 working이면 거부하지 않고 준비 대기로 돌아간다(한도는 그대로).
+	# 대상·이름은 맞고 상태만 working이면 거부하지 않고 준비 대기로 돌아간다(한도는 그대로).
 	# 세 관측 뒤에 시작되는 working을 미리 막지는 못하며, 이 확인과 prompt 사이도 원자적이지 않다.
 	if [ "$new_sent" -eq 1 ] && new_working "$agent"; then
 		echo '/new 뒤 Codex 상태=working. 새 입력란 준비를 다시 기다립니다.'
