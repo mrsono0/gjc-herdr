@@ -37,6 +37,37 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 . "$ROOT/scripts/worktree-guard.sh"
 mode="${1:-}"
 
+CODEX_STATUS_LINE='tui.status_line=["context-remaining","total-input-tokens","total-output-tokens"]'
+MATE_START_ARGS=(--model "$MATE_MODEL" --mode accept-edits --sandbox)
+CRITIC_START_ARGS=(--no-daemon --yolo -m "$CODEX_MODEL" -C "$ROOT" --disable worktrees -c "$CODEX_STATUS_LINE")
+
+# 시작 인자 배열(argv 조각)을 기대 단위("<깃발> <값>" 또는 "<깃발>") 줄 목록으로 바꾼다(#42).
+# 전제: 기대 옵션에는 위치 인자가 없고 옵션 값은 '-'로 시작하지 않는다.
+format_expected_units() {
+	while [ $# -gt 0 ]; do
+		if [ $# -ge 2 ] && case "$2" in -*) false ;; *) true ;; esac; then
+			printf '%s %s\n' "$1" "$2"
+			shift 2
+		else
+			printf '%s\n' "$1"
+			shift
+		fi
+	done
+}
+
+print_expected_units() { # agy|codex
+	case "${1:-}" in
+		agy) format_expected_units "${MATE_START_ARGS[@]}" ;;
+		codex) format_expected_units "${CRITIC_START_ARGS[@]}" ;;
+		*) return 1 ;;
+	esac
+}
+
+if [ "$mode" = "--print-expected-units" ]; then
+	print_expected_units "${2:-}"
+	exit $?
+fi
+
 # --- 가드: Herdr 안 또는 외부 팀장(GJCH_EXTERNAL_LEAD=1), 이 프로젝트 안, 팀원 역할이 아닐 때만 ---
 if [ "${HERDR_ENV:-}" = 1 ] && [ -n "${HERDR_PANE_ID:-}" ]; then
 	lead_mode=inside
@@ -86,36 +117,6 @@ print_role_line() {
 	fi
 }
 
-if [ "$mode" = "--hook" ]; then
-	hook_source=""
-	if [ ! -t 0 ]; then
-		hook_source="$(python3 -c 'import json,os,select,sys,time
-deadline=time.monotonic()+2
-raw=bytearray()
-try:
-    while True:
-        remaining=deadline-time.monotonic()
-        if remaining<=0 or not select.select([sys.stdin],[],[],remaining)[0]: sys.exit(0)
-        chunk=os.read(sys.stdin.fileno(),65536)
-        if not chunk: break
-        raw.extend(chunk)
-    value=json.loads(raw)
-    if isinstance(value,dict) and value.get("source")=="clear": print("clear")
-except (OSError, ValueError): pass')"
-	fi
-	print_role_line
-	if [ "$lead_mode" = inside ]; then
-		if [ "$hook_source" = clear ]; then
-			GJCH_FROM_HOOK=1 nohup "$0" >/dev/null 2>&1 &
-		else
-			GJCH_FROM_HOOK=1 nohup "$0" --spawn >/dev/null 2>&1 &
-		fi
-	elif [ "$lead_rc" = 0 ] && [ "$hook_source" != clear ]; then
-		nohup "$0" --spawn >/dev/null 2>&1 &
-	fi
-	exit 0
-fi
-
 jget() { python3 -c 'import sys,json
 try: d=json.load(sys.stdin)
 except Exception: sys.exit(1)
@@ -123,6 +124,80 @@ for k in sys.argv[1].split("."): d=d.get(k) if isinstance(d,dict) else None
 print("" if d is None else d)' "$1"; }
 
 realpath() { python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$1"; }
+
+codex_enabled() { [ "${GJCH_TEAM_CODEX:-1}" != 0 ] && command -v codex >/dev/null; }
+
+HOOK_ARGV_TIMEOUT=3
+hook_deadline=""
+
+# hook 전용: 공통 기한(hook_deadline) 안에서 herdr를 실행한다.
+# 첫 인자가 --combined이면 stderr도 stdout으로 합치고(agent get용), 아니면 stdout만 돌려준다.
+# 기한 초과 시 124를 반환한다.
+hook_herdr() {
+	local mode=stdout
+	if [ "${1:-}" = "--combined" ]; then
+		mode=combined
+		shift
+	fi
+	python3 -c 'import os,signal,subprocess,sys,time
+mode,deadline=sys.argv[1],float(sys.argv[2])
+rem=deadline-time.monotonic()
+if rem<=0: sys.exit(124)
+err=subprocess.STDOUT if mode=="combined" else subprocess.DEVNULL
+try:
+    p=subprocess.Popen(["herdr"]+sys.argv[3:],stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=err,text=True,start_new_session=True)
+except Exception:
+    sys.exit(1)
+try:
+    out,_=p.communicate(timeout=rem)
+except subprocess.TimeoutExpired:
+    try: os.killpg(p.pid,signal.SIGKILL)
+    except Exception: p.kill()
+    try: p.communicate(timeout=0.2)
+    except Exception: pass
+    sys.exit(124)
+if out: sys.stdout.write(out)
+sys.exit(p.returncode)' "$mode" "$hook_deadline" "$@"
+}
+
+hook_timeout_msg() {
+	echo "GJCH: ↳ 팀원 옵션 점검 시간 초과 — scripts/check-env.sh로 다시 점검"
+}
+
+# 기존 팀원·검토 pane의 foreground argv를 기대 시작 옵션과 비교한다(#42).
+# 일치하면 무출력·rc 0, 불일치·판정 불가는 한 줄 출력 후 rc 1(hook 문맥은 stdout에 GJCH: 접두사를 쓰고 rc 0, 시간 초과는 rc 124).
+check_member_argv() { # name pane kind [status]
+	local name="$1" pane="$2" kind="$3" status="${4:-idle}" recovery info_out info_rc=0 msg
+	[ -n "$status" ] || status=idle
+	if [ "$lead_mode" = external ]; then
+		recovery="idle·빈 입력란 확인 → /quit → GJCH_EXTERNAL_LEAD=1 scripts/team-up.sh --spawn"
+	else
+		recovery="idle·빈 입력란 확인 → /quit → scripts/team-up.sh --spawn"
+	fi
+	local -a expected=()
+	case "$kind" in
+		agy) expected=("${MATE_START_ARGS[@]}") ;;
+		codex) expected=("${CRITIC_START_ARGS[@]}") ;;
+		*) return 1 ;;
+	esac
+	if [ "${in_hook_check:-0}" = 1 ]; then
+		info_out="$(hook_herdr pane process-info --pane "$pane")" || info_rc=$?
+		[ "$info_rc" = 124 ] && return 124
+	else
+		info_out="$(herdr pane process-info --pane "$pane" 2>/dev/null)" || info_rc=$?
+	fi
+	if [ "$info_rc" = 0 ]; then
+		msg="$(printf '%s' "$info_out" | python3 "$ROOT/scripts/agent-argv-check.py" --status "$status" "$kind" "$name" "$recovery" -- "${expected[@]}")" && return 0
+	else
+		msg="$(python3 "$ROOT/scripts/agent-argv-check.py" --process-info-failed --status "$status" "$kind" "$name" "$recovery" -- "${expected[@]}")"
+	fi
+	if [ "$mode" = "--hook" ] || [ "${GJCH_FROM_HOOK:-}" = 1 ]; then
+		[ -n "$msg" ] && printf 'GJCH: %s\n' "$msg"
+		return 0
+	fi
+	[ -n "$msg" ] && printf '%s\n' "$msg" >&2
+	return 1
+}
 
 # agent 이름 → pane ID. agent_not_found로 확인되면 빈 값(rc 0), 조회·파싱 실패면 rc 1.
 # herdr는 오류 JSON을 stderr로 내므로 함께 읽는다.
@@ -137,6 +212,27 @@ p=((d.get("result") or {}).get("agent") or {}).get("pane_id")
 if sys.argv[1]=="0":
     if not p: sys.exit(1)
     print(p)
+elif ((d.get("error") or {}).get("code"))!="agent_not_found": sys.exit(1)' "$rc"
+}
+
+# agent 이름 → "<pane_id>|<agent_status>". agent_not_found면 빈 값(rc 0), 조회·파싱 실패면 rc 1(hook 시간 초과는 124).
+agent_pane_status() { # name
+	local out rc=0
+	if [ "${in_hook_check:-0}" = 1 ]; then
+		out="$(hook_herdr --combined agent get "$1")" || rc=$?
+		[ "$rc" = 124 ] && return 124
+	else
+		out="$(herdr agent get "$1" 2>&1)" || rc=$?
+	fi
+	printf '%s' "$out" | python3 -c 'import sys,json
+try: d=json.load(sys.stdin)
+except Exception: sys.exit(1)
+a=((d.get("result") or {}).get("agent") or {})
+p=a.get("pane_id")
+s=a.get("agent_status") or "idle"
+if sys.argv[1]=="0":
+    if not p: sys.exit(1)
+    print("%s|%s" % (p, s))
 elif ((d.get("error") or {}).get("code"))!="agent_not_found": sys.exit(1)' "$rc"
 }
 
@@ -247,10 +343,15 @@ move_via_temp_tab() { # pane tab target split ratio
 }
 
 # 외부 팀장용 기존 agent 검증(이름 → "<workspace_id>|<pane_id>|<state>").
-# agent_not_found로 확인되면 빈 값(rc 0), 조회·파싱 실패나 agent 종류·cwd 불일치면 stderr에 이유를 쓰고 rc 1.
+# agent_not_found로 확인되면 빈 값(rc 0), 조회·파싱 실패나 agent 종류·cwd 불일치면 stderr에 이유를 쓰고 rc 1(hook 시간 초과는 124).
 ext_agent_info() { # name expected_kind cwd_mode(inside|exact)
-	local name="$1" expected_kind="$2" cwd_mode="$3" out rc parsed tag rest pane_out
-	out="$(herdr agent get "$name" 2>&1)"; rc=$?
+	local name="$1" expected_kind="$2" cwd_mode="$3" out rc=0 parsed tag rest pane_out pane_rc=0
+	if [ "${in_hook_check:-0}" = 1 ]; then
+		out="$(hook_herdr --combined agent get "$name")" || rc=$?
+		[ "$rc" = 124 ] && return 124
+	else
+		out="$(herdr agent get "$name" 2>&1)" || rc=$?
+	fi
 	parsed="$(printf '%s' "$out" | python3 -c 'import sys,json
 rc=sys.argv[1]
 try: d=json.load(sys.stdin)
@@ -269,10 +370,10 @@ k=a.get("agent") or ""
 c=a.get("foreground_cwd") or a.get("cwd") or ""
 s=a.get("agent_status") or ""
 r=a.get("interactive_ready")
-if s=="blocked": st="blocked|"+p
-elif s=="working" or (s in ("idle","done") and r is True): st="ready|"+p
+if s=="blocked": st="blocked|"+p+"|blocked"
+elif s=="working" or (s in ("idle","done") and r is True): st="ready|"+p+"|"+s
 elif s: st="not_ready|"+p+"|"+s
-else: st=""
+else: st="not_ready|"+p+"|idle"
 print("ok\t%s\t%s\t%s\t%s\t%s" % (p, w, k, c, st))' "$rc")" || {
 		echo "could not look up agent '$name'" >&2
 		return 1
@@ -285,7 +386,13 @@ p,w,k,c=parts[1],parts[2],parts[3],parts[4]
 print("need" if (not w or not k or not c) else "ok")')"
 	if [ "$tag" = need ]; then
 		rest="${parsed#*$'\t'}"
-		pane_out="$(herdr pane get "${rest%%$'\t'*}" 2>/dev/null)" || pane_out=""
+		if [ "${in_hook_check:-0}" = 1 ]; then
+			pane_out="$(hook_herdr pane get "${rest%%$'\t'*}")" || pane_rc=$?
+			[ "$pane_rc" = 124 ] && return 124
+			[ "$pane_rc" = 0 ] || pane_out=""
+		else
+			pane_out="$(herdr pane get "${rest%%$'\t'*}" 2>/dev/null)" || pane_out=""
+		fi
 	fi
 	printf '%s' "$parsed" | python3 -c 'import os,sys,json
 name,expected_kind,cwd_mode,root,pane_raw=sys.argv[1:6]
@@ -320,11 +427,106 @@ else:
 print("%s|%s|%s" % (w, p, st))' "$name" "$expected_kind" "$cwd_mode" "$ROOT" "$pane_out"
 }
 
+# SessionStart(startup) hook에서 기존 팀원·검토가 이미 떠 있으면 상태와 상관없이 argv를 동기로 점검해 stdout(GJCH: 접두사)에 알린다(#42).
+hook_check_existing_argv() {
+	local in_hook_check=1 pane_out pane_rc=0 pane_cwd mate_ps mate_rc=0 critic_ps critic_rc=0 mate_info ext_rest mate_pane mate_state critic_info critic_pane critic_state chk_rc=0
+	hook_deadline="$(python3 -c 'import sys,time; print("%.6f" % (time.monotonic()+float(sys.argv[1])))' "$HOOK_ARGV_TIMEOUT")" || return 0
+	if [ "$lead_mode" = inside ]; then
+		pane_out="$(hook_herdr pane get "$HERDR_PANE_ID")" || pane_rc=$?
+		if [ "$pane_rc" = 124 ]; then hook_timeout_msg; return 0; fi
+		[ "$pane_rc" = 0 ] || return 0
+		pane_cwd="$(printf '%s' "$pane_out" | jget result.pane.cwd)" || pane_cwd=""
+		if [ -n "$pane_cwd" ]; then
+			pane_cwd="$(realpath "$pane_cwd")" || return 0
+		fi
+		case "$pane_cwd/" in "$ROOT"/*) ;; *) return 0 ;; esac
+		mate_ps="$(agent_pane_status "$MATE_NAME" 2>/dev/null)" || mate_rc=$?
+		if [ "$mate_rc" = 124 ]; then hook_timeout_msg; return 0; fi
+		if [ "$mate_rc" = 0 ] && [ -n "$mate_ps" ]; then
+			chk_rc=0
+			check_member_argv "$MATE_NAME" "${mate_ps%%|*}" agy "${mate_ps#*|}" || chk_rc=$?
+			if [ "$chk_rc" = 124 ]; then hook_timeout_msg; return 0; fi
+		fi
+		if codex_enabled; then
+			critic_ps="$(agent_pane_status "$CRITIC_NAME" 2>/dev/null)" || critic_rc=$?
+			if [ "$critic_rc" = 124 ]; then hook_timeout_msg; return 0; fi
+			if [ "$critic_rc" = 0 ] && [ -n "$critic_ps" ]; then
+				chk_rc=0
+				check_member_argv "$CRITIC_NAME" "${critic_ps%%|*}" codex "${critic_ps#*|}" || chk_rc=$?
+				if [ "$chk_rc" = 124 ]; then hook_timeout_msg; return 0; fi
+			fi
+		fi
+	else
+		mate_info="$(ext_agent_info "$MATE_NAME" agy inside 2>/dev/null)" || mate_rc=$?
+		if [ "$mate_rc" = 124 ]; then hook_timeout_msg; return 0; fi
+		if [ "$mate_rc" = 0 ] && [ -n "$mate_info" ]; then
+			ext_rest="${mate_info#*|}"
+			mate_pane="${ext_rest%%|*}"
+			mate_state="${ext_rest#*|}"
+			if [ -n "$mate_pane" ]; then
+				chk_rc=0
+				check_member_argv "$MATE_NAME" "$mate_pane" agy "${mate_state##*|}" || chk_rc=$?
+				if [ "$chk_rc" = 124 ]; then hook_timeout_msg; return 0; fi
+			fi
+		fi
+		if codex_enabled; then
+			critic_info="$(ext_agent_info "$CRITIC_NAME" codex exact 2>/dev/null)" || critic_rc=$?
+			if [ "$critic_rc" = 124 ]; then hook_timeout_msg; return 0; fi
+			if [ "$critic_rc" = 0 ] && [ -n "$critic_info" ]; then
+				ext_rest="${critic_info#*|}"
+				critic_pane="${ext_rest%%|*}"
+				critic_state="${ext_rest#*|}"
+				if [ -n "$critic_pane" ]; then
+					chk_rc=0
+					check_member_argv "$CRITIC_NAME" "$critic_pane" codex "${critic_state##*|}" || chk_rc=$?
+					if [ "$chk_rc" = 124 ]; then hook_timeout_msg; return 0; fi
+				fi
+			fi
+		fi
+	fi
+}
+
+if [ "$mode" = "--hook" ]; then
+	hook_source=""
+	if [ ! -t 0 ]; then
+		hook_source="$(python3 -c 'import json,os,select,sys,time
+deadline=time.monotonic()+2
+raw=bytearray()
+try:
+    while True:
+        remaining=deadline-time.monotonic()
+        if remaining<=0 or not select.select([sys.stdin],[],[],remaining)[0]: sys.exit(0)
+        chunk=os.read(sys.stdin.fileno(),65536)
+        if not chunk: break
+        raw.extend(chunk)
+    value=json.loads(raw)
+    if isinstance(value,dict) and value.get("source")=="clear": print("clear")
+except (OSError, ValueError): pass')"
+	fi
+	print_role_line
+	if [ "$lead_mode" = inside ]; then
+		if [ "$hook_source" = clear ]; then
+			GJCH_FROM_HOOK=1 nohup "$0" >/dev/null 2>&1 &
+		else
+			if [ "$lead_rc" != 3 ]; then
+				hook_check_existing_argv
+			fi
+			GJCH_FROM_HOOK=1 nohup "$0" --spawn >/dev/null 2>&1 &
+		fi
+	elif [ "$lead_rc" = 0 ] && [ "$hook_source" != clear ]; then
+		hook_check_existing_argv
+		GJCH_FROM_HOOK=1 nohup "$0" --spawn >/dev/null 2>&1 &
+	fi
+	exit 0
+fi
+
 TEAM_WS=""
 NEW_WS_ROOT_PANE=""
 EXT_MATE_PANE=""
 EXT_MATE_STATE=""
 EXT_CRITIC_PANE=""
+EXT_CRITIC_STATE=""
+argv_status=0
 
 if [ "$lead_mode" = inside ]; then
 	# --- 팀장/부팀장(이 pane) ---
@@ -391,6 +593,7 @@ else
 			critic_ws="${critic_info%%|*}"
 			ext_rest="${critic_info#*|}"
 			EXT_CRITIC_PANE="${ext_rest%%|*}"
+			EXT_CRITIC_STATE="${ext_rest#*|}"
 		fi
 		if [ -n "$mate_ws" ] && [ -n "$critic_ws" ] && [ "$mate_ws" != "$critic_ws" ]; then
 			echo "agents '$MATE_NAME' ($mate_ws) and '$CRITIC_NAME' ($critic_ws) are in different workspaces" >&2
@@ -559,8 +762,6 @@ if not p.get("tab_id") or not cwd: sys.exit(1)
 print(p["tab_id"], "in" if (os.path.realpath(cwd).rstrip("/")+"/").startswith(root.rstrip("/")+"/") else "out")' "$ROOT"
 }
 
-codex_enabled() { [ "${GJCH_TEAM_CODEX:-1}" != 0 ] && command -v codex >/dev/null; }
-
 # 확인된 조건 불일치: 수동 --layout은 오류(1), 팀 구성(team)은 건너뜀(0). 어느 쪽이든 아무것도 옮기지 않는다.
 layout_refuse() { # how reason
 	if [ "$1" = team ]; then
@@ -585,6 +786,12 @@ layout_error() { # how reason
 apply_layout_external() { # manual|team
 	local how="$1" mate="$EXT_MATE_PANE" critic="$EXT_CRITIC_PANE" mate_place mate_tab critic_place state
 	[ -n "$mate" ] || { layout_refuse "$how" "agent '$MATE_NAME' not found"; return; }
+	if [ "$how" = manual ]; then
+		check_member_argv "$MATE_NAME" "$mate" agy "${EXT_MATE_STATE##*|}" || argv_status=1
+		if [ -n "$critic" ] && codex_enabled; then
+			check_member_argv "$CRITIC_NAME" "$critic" codex "${EXT_CRITIC_STATE##*|}" || argv_status=1
+		fi
+	fi
 	mate_place="$(pane_place "$mate")" || { layout_error "$how" "could not read pane $mate"; return; }
 	mate_tab="${mate_place% *}"
 	[ "${mate_place#* }" = in ] || { layout_refuse "$how" "pane $mate cwd is outside $ROOT"; return; }
@@ -619,13 +826,23 @@ apply_layout() { # manual|team
 		apply_layout_external "$1"
 		return $?
 	fi
-	local how="$1" lead="$HERDR_PANE_ID" owner lead_tab mate critic place p state
+	local how="$1" lead="$HERDR_PANE_ID" owner lead_tab mate_ps mate mate_st critic_ps critic critic_st place p state
 	owner="$(agent_pane "$LEAD_NAME")" || { layout_error "$how" "could not look up agent '$LEAD_NAME'"; return; }
 	[ "$owner" = "$lead" ] || { layout_refuse "$how" "agent '$LEAD_NAME' is not this pane ($lead)"; return; }
-	mate="$(agent_pane "$MATE_NAME")" || { layout_error "$how" "could not look up agent '$MATE_NAME'"; return; }
+	mate_ps="$(agent_pane_status "$MATE_NAME")" || { layout_error "$how" "could not look up agent '$MATE_NAME'"; return; }
+	mate="${mate_ps%%|*}"
+	mate_st="${mate_ps#*|}"
 	[ -n "$mate" ] || { layout_refuse "$how" "agent '$MATE_NAME' not found"; return; }
 	# 검토는 있으면 함께 배치하고, 없으면 팀장 60% / 팀원 아래만 맞춘다.
-	critic="$(agent_pane "$CRITIC_NAME")" || { layout_error "$how" "could not look up agent '$CRITIC_NAME'"; return; }
+	critic_ps="$(agent_pane_status "$CRITIC_NAME")" || { layout_error "$how" "could not look up agent '$CRITIC_NAME'"; return; }
+	critic="${critic_ps%%|*}"
+	critic_st="${critic_ps#*|}"
+	if [ "$how" = manual ]; then
+		check_member_argv "$MATE_NAME" "$mate" agy "$mate_st" || argv_status=1
+		if [ -n "$critic" ] && codex_enabled; then
+			check_member_argv "$CRITIC_NAME" "$critic" codex "$critic_st" || argv_status=1
+		fi
+	fi
 	lead_tab="$(pane_place "$lead")" || { layout_error "$how" "could not read pane $lead"; return; }
 	lead_tab="${lead_tab% *}"
 	if [ "$how" = team ] && [ -n "$critic" ]; then
@@ -665,8 +882,10 @@ apply_layout() { # manual|team
 }
 
 if [ "$mode" = "--layout" ]; then
-	apply_layout manual
-	exit $?
+	layout_rc=0
+	apply_layout manual || layout_rc=$?
+	[ "$layout_rc" = 0 ] || exit "$layout_rc"
+	exit "$argv_status"
 fi
 [ "$mode" = "--spawn" ] || exit 0
 
@@ -692,8 +911,8 @@ if sys.argv[1]=="0":
     if not p: sys.exit(1)
     s=a.get("agent_status") or ""
     r=a.get("interactive_ready")
-    if s=="blocked": print("blocked|"+p)
-    elif s=="working" or (s in ("idle","done") and r is True): print("ready|"+p)
+    if s=="blocked": print("blocked|"+p+"|blocked")
+    elif s=="working" or (s in ("idle","done") and r is True): print("ready|"+p+"|"+s)
     elif s: print("not_ready|"+p+"|"+s)
     else: sys.exit(1)
 elif ((d.get("error") or {}).get("code"))!="agent_not_found":
@@ -709,12 +928,15 @@ if [ -n "$mate_state" ]; then
 	case "${mate_state%%|*}" in
 		ready)
 			echo "mate already exists at $existing; nothing spawned"
+			check_member_argv "$MATE_NAME" "$existing" agy "${mate_state##*|}" || argv_status=1
 			return 0 ;;
 		blocked)
 			echo "agy가 시작 중 멈췄습니다($existing, status=blocked). 폴더 신뢰 창이나 다른 질문일 수 있으니 그 pane에서 사용자가 확인한 뒤 scripts/team-up.sh --spawn을 다시 실행하세요." >&2
+			check_member_argv "$MATE_NAME" "$existing" agy "${mate_state##*|}" || argv_status=1
 			return 1 ;;
 		*)
 			echo "existing mate '$MATE_NAME' at $existing is not ready (status=${mate_state##*|}); check the pane and re-run scripts/team-up.sh --spawn" >&2
+			check_member_argv "$MATE_NAME" "$existing" agy "${mate_state##*|}" || argv_status=1
 			return 1 ;;
 	esac
 fi
@@ -795,7 +1017,7 @@ if [ -z "$pane" ]; then
 fi
 mate_pane="$pane"
 herdr pane rename "$pane" "$MATE_LABEL" >/dev/null 2>&1
-if ! start_out="$(herdr agent start "$MATE_NAME" --kind agy --pane "$pane" --timeout 60000 -- --model "$MATE_MODEL" --mode accept-edits --sandbox 2>&1)"; then
+if ! start_out="$(herdr agent start "$MATE_NAME" --kind agy --pane "$pane" --timeout 60000 -- "${MATE_START_ARGS[@]}" 2>&1)"; then
 	start_info="$(printf '%s' "$start_out" | python3 -c 'import sys,json
 raw=sys.stdin.read().strip()
 try: d=json.loads(raw)
@@ -830,7 +1052,7 @@ return 0
 
 # --- 독립 검토 Codex (팀원 단계 성공 여부와 무관하게 수행) ---
 spawn_critic() {
-	local existing workdir pane anchor direction ratio lead_tab
+	local existing critic_ps critic_st workdir pane anchor direction ratio lead_tab
 	if [ "${GJCH_TEAM_CODEX:-1}" = 0 ]; then
 		echo "Codex reviewer disabled (GJCH_TEAM_CODEX=0)"
 		return 0
@@ -841,14 +1063,18 @@ spawn_critic() {
 	fi
 	if [ "$lead_mode" = external ]; then
 		existing="$EXT_CRITIC_PANE"
+		critic_st="${EXT_CRITIC_STATE##*|}"
 	else
-		existing="$(agent_pane "$CRITIC_NAME")" || {
+		critic_ps="$(agent_pane_status "$CRITIC_NAME")" || {
 			echo "could not look up agent '$CRITIC_NAME'; critic not spawned" >&2
 			return 1
 		}
+		existing="${critic_ps%%|*}"
+		critic_st="${critic_ps#*|}"
 	fi
 	if [ -n "$existing" ]; then
 		echo "critic already exists at $existing; nothing spawned"
+		check_member_argv "$CRITIC_NAME" "$existing" codex "$critic_st" || argv_status=1
 		return 0
 	fi
 	workdir="$ROOT"
@@ -892,7 +1118,7 @@ for p in panes:
 		fi
 	fi
 	herdr pane rename "$pane" "$CRITIC_LABEL" >/dev/null || return 1
-	if ! herdr agent start "$CRITIC_NAME" --kind codex --pane "$pane" --timeout 60000 -- --no-daemon --yolo -m "$CODEX_MODEL" -C "$workdir" --disable worktrees -c 'tui.status_line=["context-remaining","total-input-tokens","total-output-tokens"]'; then
+	if ! herdr agent start "$CRITIC_NAME" --kind codex --pane "$pane" --timeout 60000 -- "${CRITIC_START_ARGS[@]}"; then
 		echo "Codex start failed for $pane" >&2
 		return 1
 	fi
@@ -919,7 +1145,8 @@ if [ "$layout_status" != 0 ]; then
 		echo "team layout is not in place; run scripts/team-up.sh --layout from the lead pane" >&2
 	fi
 fi
-# 기동 실패 rc를 배치 rc보다 우선한다.
+# 기동 실패 rc를 배치·옵션 점검 rc보다 우선한다.
 [ "$critic_status" = 0 ] || exit "$critic_status"
 [ "$mate_status" = 0 ] || exit "$mate_status"
-exit "$layout_status"
+[ "$layout_status" = 0 ] || exit "$layout_status"
+exit "$argv_status"

@@ -109,4 +109,77 @@ else
 	warn "Herdr sidebar custom token 설정 없음 (token은 발행되지만 sidebar에는 안 보임; README 'Sidebar 설정')"
 fi
 
+# --- 팀원·검토 시작 옵션 점검(#42) ---
+MATE_NAME="${GJCH_MATE_NAME:-gjc-herdr-mate}"
+CRITIC_NAME="${GJCH_CRITIC_NAME:-gjc-herdr-critic}"
+check_env_member_argv() { # name kind
+	local name="$1" kind="$2" recovery out rc parsed tag pane status info_out msg old_ifs
+	local -a expected=()
+	if [ "${GJCH_EXTERNAL_LEAD:-}" = 1 ]; then
+		recovery="idle·빈 입력란 확인 → /quit → GJCH_EXTERNAL_LEAD=1 scripts/team-up.sh --spawn"
+	else
+		recovery="idle·빈 입력란 확인 → /quit → scripts/team-up.sh --spawn"
+	fi
+	out="$(herdr agent get "$name" 2>&1)"; rc=$?
+	parsed="$(printf '%s' "$out" | python3 -c 'import sys,json
+rc=sys.argv[1]
+try: d=json.load(sys.stdin)
+except Exception:
+    print("unavailable")
+    sys.exit(0)
+if rc!="0":
+    code=((d.get("error") or {}).get("code")) if isinstance(d,dict) else None
+    print("absent" if code=="agent_not_found" else "unavailable")
+    sys.exit(0)
+a=((d.get("result") or {}).get("agent")) if isinstance(d,dict) else None
+p=a.get("pane_id") if isinstance(a,dict) else None
+s=(a.get("agent_status") or "idle") if isinstance(a,dict) else "idle"
+if not p:
+    print("unavailable")
+    sys.exit(0)
+print("ok\t%s\t%s" % (p, s))' "$rc")"
+	tag="${parsed%%$'\t'*}"
+	case "$tag" in
+		absent)
+			warn "$name 옵션 점검 생략 (팀원 없음)"
+			return 0
+			;;
+		ok) ;;
+		*)
+			warn "$name 옵션 점검 생략 (herdr 조회 불가)"
+			return 0
+			;;
+	esac
+	pane="${parsed#*$'\t'}"
+	status="${pane#*$'\t'}"
+	pane="${pane%%$'\t'*}"
+	old_ifs="$IFS"
+	IFS=$'\n'
+	set -f
+	# shellcheck disable=SC2206
+	expected=($(/bin/bash "$ROOT/scripts/team-up.sh" --print-expected-units "$kind"))
+	set +f
+	IFS="$old_ifs"
+	if info_out="$(herdr pane process-info --pane "$pane" 2>/dev/null)"; then
+		if msg="$(printf '%s' "$info_out" | python3 "$ROOT/scripts/agent-argv-check.py" --status "$status" "$kind" "$name" "$recovery" -- "${expected[@]}")"; then
+			ok "$name ($pane) 시작 옵션 일치"
+			return 0
+		fi
+	else
+		msg="$(python3 "$ROOT/scripts/agent-argv-check.py" --process-info-failed --status "$status" "$kind" "$name" "$recovery" -- "${expected[@]}")"
+	fi
+	bad "$msg"
+}
+
+if command -v herdr >/dev/null && command -v python3 >/dev/null; then
+	check_env_member_argv "$MATE_NAME" agy
+	if [ "${GJCH_TEAM_CODEX:-1}" = 0 ] || ! command -v codex >/dev/null; then
+		warn "$CRITIC_NAME 옵션 점검 생략 (Codex 비활성 또는 미설치)"
+	else
+		check_env_member_argv "$CRITIC_NAME" codex
+	fi
+else
+	warn "팀원 옵션 점검 생략 (herdr 또는 python3 없음)"
+fi
+
 exit "$fail"
