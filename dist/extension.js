@@ -20456,21 +20456,61 @@ async function recoverResultFile(fsOps, resultFile, signal) {
     } catch {}
   }
 }
-function extractMarkedAnswer(capture, requestId) {
+function hasEndWithoutBegin(capture, requestId) {
+  const id = requestId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const prefix = "[\\s>\u23FA\u25CF\u2022\\-*]*";
+  const begin = new RegExp(`^${prefix}GJC_HERDR_BEGIN_${id}\\s*$`);
+  const end = new RegExp(`^${prefix}GJC_HERDR_END_${id}\\s*$`);
+  let hasEnd = false;
+  for (const line of capture.split(/\r?\n/)) {
+    if (begin.test(line))
+      return false;
+    if (end.test(line))
+      hasEnd = true;
+  }
+  return hasEnd;
+}
+function stripDecorations(line) {
+  return line.replace(/^[\s>\u23FA\u25CF\u2022\-*]+/, "").trim();
+}
+function isWrappedEchoBegin(lines, index) {
+  const prev = lines.slice(Math.max(0, index - 2), index).map(stripDecorations).join(" ");
+  const next = lines.slice(index + 1, index + 3).map(stripDecorations).join(" ");
+  if (/\b(?:the\s+exact\s+|exact\s+)?token$/i.test(prev))
+    return true;
+  if (/^(?:on\s+the\s+first\b|of\s+your\s+final\s+answer\b)/i.test(next))
+    return true;
+  return false;
+}
+function isWrappedEchoEnd(lines, index) {
+  const prev = lines.slice(Math.max(0, index - 2), index).map(stripDecorations).join(" ");
+  const next = lines.slice(index + 1, index + 3).map(stripDecorations).join(" ");
+  if (/\b(?:final\s+)?answer\s+and$/i.test(prev))
+    return true;
+  if (/^on\s+the\s+last\b/i.test(next))
+    return true;
+  return false;
+}
+function extractMarkedAnswer(capture, requestId, options) {
   const id = requestId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const prefix = "[\\s>\u23FA\u25CF\u2022\\-*]*";
   const begin = new RegExp(`^${prefix}GJC_HERDR_BEGIN_${id}\\s*$`);
   const end = new RegExp(`^${prefix}GJC_HERDR_END_${id}\\s*$`);
   const lines = capture.split(/\r?\n/);
+  const rejectEcho = options?.rejectWrappedEcho === true;
   let beginIndex = -1;
   let endIndex = -1;
   for (let index = 0;index < lines.length; index++) {
     const line = lines[index];
     if (begin.test(line)) {
+      if (rejectEcho && isWrappedEchoBegin(lines, index))
+        continue;
       if (beginIndex !== -1)
         return;
       beginIndex = index;
     } else if (end.test(line)) {
+      if (rejectEcho && isWrappedEchoEnd(lines, index))
+        continue;
       if (beginIndex === -1 || endIndex !== -1)
         return;
       endIndex = index;
@@ -20482,10 +20522,39 @@ function extractMarkedAnswer(capture, requestId) {
   const body = lines.slice(beginIndex + 1, endIndex);
   if (!body.some((line) => line.trim()))
     return;
+  if (rejectEcho) {
+    const strippedLines = body.map(stripDecorations);
+    const joinedBody = strippedLines.join(" ");
+    const compactBody = strippedLines.join("");
+    if (/Answer\s+with\s+the\s+exact\s+token/i.test(joinedBody) || /on\s+the\s+first\s+line\s+of\s+your\s+final\s+answer/i.test(joinedBody) || compactBody.includes(`GJC_HERDR_BEGIN_${requestId}`) || compactBody.includes(`GJC_HERDR_END_${requestId}`)) {
+      return;
+    }
+  }
   const indents = body.filter((line) => line.trim()).map((line) => /^[ \t]*/.exec(line)[0]);
   const common = indents.reduce((a, b) => b.length < a.length ? b : a);
   return body.map((line) => line.slice(common.length)).join(`
 `);
+}
+function hasRequestEcho(capture, requestId, hasResultFile) {
+  const compact = capture.split(/\r?\n/).map((line) => line.replace(/^[\s>\u276F\u23FA\u25CF\u2022*]+/, "").trimEnd()).join("");
+  if (compact.includes(`GJC_HERDR_BEGIN_${requestId}`))
+    return true;
+  if (hasResultFile && compact.includes(requestId))
+    return true;
+  return false;
+}
+async function confirmDeliveryAfterTimeout(deps, paneId, requestId, hasResultFile, deadline, signal) {
+  const remaining = Math.min(READ_TIMEOUT_MS2, deadline - (deps.now?.() ?? performance.now()));
+  if (Math.floor(remaining) < 1 || signal?.aborted)
+    return false;
+  try {
+    const read = await runHerdr(deps, ["agent", "read", paneId, "--source", "recent", "--lines", READ_LINES2], remaining, signal, "read");
+    if (signal?.aborted || read.code !== 0 || !read.stdout.trim())
+      return false;
+    return hasRequestEcho(read.stdout, requestId, hasResultFile);
+  } catch {
+    return false;
+  }
 }
 function promptFailure(result, agentLabel) {
   const error = stderrEnvelope(result);
@@ -20905,6 +20974,22 @@ async function callRegisteredAgent(deps, request, senderPane, signal) {
       if (prompt.code === 2)
         throw usageFailure(prompt, "agent prompt");
       if (prompt.code !== 0) {
+        if (prompt.code === 1 && stderrEnvelope(prompt)?.code === "timeout") {
+          const delivered = await confirmDeliveryAfterTimeout(deps, paneId, requestId, rawResultFile !== undefined, deadline, signal);
+          if (delivered) {
+            return finish({
+              status: "answer_pending",
+              delivery: "submitted",
+              pane: paneId,
+              error: {
+                code: "answer_timeout",
+                message: "Prompt was delivered (this request's marker instruction is on the target screen) but no answer arrived within the call budget; the target may still be answering. Do not resend; check the target or ask it to reply again later.",
+                herdrCode: "timeout",
+                exitCode: prompt.code
+              }
+            });
+          }
+        }
         throw promptFailure(prompt, preflight.agentLabel);
       }
       const response = record2(record2(parseJson2(prompt.stdout))?.result);
@@ -21055,7 +21140,25 @@ async function callRegisteredAgent(deps, request, senderPane, signal) {
           }
         });
       }
-      const answer = extractMarkedAnswer(capture, requestId);
+      let answer = extractMarkedAnswer(capture, requestId);
+      if (answer === undefined && hasEndWithoutBegin(capture, requestId)) {
+        const retryRemaining = deadline - now();
+        const retryBudget = Math.min(READ_TIMEOUT_MS2, retryRemaining);
+        if (Math.floor(retryBudget) >= 1 && !signal?.aborted) {
+          try {
+            const retryRead = await runHerdr(deps, ["agent", "read", paneId, "--source", "recent", "--lines", READ_LINES2], retryBudget, signal, "read");
+            if (retryRead.code === 0 && retryRead.stdout.trim()) {
+              answer = extractMarkedAnswer(retryRead.stdout, requestId, {
+                rejectWrappedEcho: true
+              });
+            }
+          } catch (error) {
+            if (signal?.aborted || error instanceof CallFailure && error.partial.error.code === "aborted") {
+              throw error;
+            }
+          }
+        }
+      }
       if (answer === undefined) {
         return finish({
           status: "response_unverified",
@@ -21184,7 +21287,7 @@ function registerCallFeatures(api, herdrBin, senderPane) {
   api.registerTool({
     name: "herdr_agent_call",
     label: "Herdr Agent Call",
-    description: "Call a Herdr-registered agent (Claude Code, Codex, Copilot, Gemini, ...) in another Herdr pane and get its answer text back. " + "`target` must be an explicit Herdr pane ID or a name that resolves to exactly one agent; the target must be observed idle/done, " + "and Herdr's own known-agent/foreground gate decides finally whether the prompt is sent (zero input on rejection). " + "One prompt with a bounded wait (60s total budget) and one bounded screen read (200 lines); the answer is recovered from " + "per-request marker lines, or from `result_file` when a new absolute file path is provided (must not already exist before sending; resilient to long answers and folded/truncated terminal output; the target agent must be able to write to that path, e.g. inside the repository for sandboxed agy). " + "Anything less is returned as an unverified capture instead of a success. " + "No remote approvals, key presses, or retries are ever sent. For GJC targets use the existing herdr_send tool instead.",
+    description: "Call a Herdr-registered agent (Claude Code, Codex, Copilot, Gemini, ...) in another Herdr pane and get its answer text back. " + "`target` must be an explicit Herdr pane ID or a name that resolves to exactly one agent; the target must be observed idle/done, " + "and Herdr's own known-agent/foreground gate decides finally whether the prompt is sent (zero input on rejection). " + "One prompt with a bounded wait (60s total budget) and bounded 200-line screen reads (initial unwrapped read, at most one --source recent retry if only the end marker is visible, or one confirmation read after a prompt timeout); the answer is recovered from " + "per-request marker lines, or from `result_file` when a new absolute file path is provided (must not already exist before sending; resilient to long answers and folded/truncated terminal output; the target agent must be able to write to that path, e.g. inside the repository for sandboxed agy). " + "Anything less is returned as an unverified capture instead of a success. " + "No remote approvals, key presses, or retries are ever sent. For GJC targets use the existing herdr_send tool instead.",
     parameters: z.object({
       target: z.string().describe("Target Herdr pane ID (e.g. wC:p2) or unique agent name"),
       text: z.string().describe("Prompt text to deliver verbatim"),
