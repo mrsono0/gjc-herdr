@@ -3,7 +3,9 @@
 # 사용: scripts/check-env.sh   → 항목별 OK/WARN/FAIL 출력, FAIL이 있으면 종료 코드 1.
 # 해석과 해결 방법은 docs/dev-environment.md 참조.
 set -u
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+# shellcheck source=scripts/worktree-guard.sh
+. "$ROOT/scripts/worktree-guard.sh"
 fail=0
 ok()   { printf 'OK    %s\n' "$*"; }
 warn() { printf 'WARN  %s\n' "$*"; }
@@ -37,6 +39,19 @@ elif [ "${GJCH_EXTERNAL_LEAD:-}" = 1 ]; then
 else
 	warn "Herdr pane 밖 (team-up hook·표시 token은 동작하지 않음 — 정상일 수 있음)"
 fi
+wt_state="$(gjch_worktree_state "$ROOT")"
+case "$wt_state" in
+	linked)
+		wt_reason="$(gjch_worktree_reason "$ROOT")" || wt_reason="연결 worktree($ROOT)에서 실행 중입니다."
+		bad "$wt_reason"
+		;;
+	main)
+		ok "메인 작업 트리: $ROOT"
+		;;
+	*)
+		warn "작업 트리 판정 불가: git 저장소가 아니거나 작업 트리 상태를 확인할 수 없음 ($ROOT)"
+		;;
+esac
 if lead_status="$(/bin/bash "$ROOT/scripts/team-lead.sh" status 2>/dev/null)"; then
 	ok "팀장 잠금: $lead_status"
 else

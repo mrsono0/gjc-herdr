@@ -5,6 +5,8 @@
 set -eu
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+# shellcheck source=scripts/worktree-guard.sh
+. "$ROOT/scripts/worktree-guard.sh"
 CRITIC_NAME="${GJCH_CRITIC_NAME:-gjc-herdr-critic}"
 timeout=1800000 # 기본 30분, 준비 확인은 최대 30초
 no_wait=0
@@ -39,6 +41,9 @@ case "$timeout" in ''|*[!0-9]*) fail '--timeout은 양의 정수(ms)여야 합�
 [ "$timeout" -gt 0 ] && [ "$timeout" -le 86400000 ] || fail '--timeout은 1–86400000ms(24시간) 범위여야 합니다.'
 # bash 3.2의 SECONDS 해상도에 맞춰 ms 인자를 초 단위로 올림한다.
 timeout=$(( (10#$timeout + 999) / 1000 * 1000 ))
+if wt_reason="$(gjch_worktree_reason "$ROOT")"; then
+	fail "$wt_reason"
+fi
 if [ "${HERDR_ENV:-}" = 1 ] && [ -n "${HERDR_WORKSPACE_ID:-}" ] && [ -n "${HERDR_PANE_ID:-}" ]; then
 	lead_mode=inside
 elif [ "${GJCH_EXTERNAL_LEAD:-}" = 1 ]; then

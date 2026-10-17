@@ -11,6 +11,8 @@
 set -eu
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+# shellcheck source=scripts/worktree-guard.sh
+. "$ROOT/scripts/worktree-guard.sh"
 LOCK_FILE="${GJCH_LEAD_LOCK:-$ROOT/.local/team/lead.json}"
 cmd="${1:-}"
 arg="${2:-}"
@@ -25,6 +27,11 @@ case "$cmd" in
 	release) [ "$#" -eq 1 ] || { [ "$#" -eq 2 ] && [ "$arg" = "--force" ]; } || usage ;;
 	*) usage ;;
 esac
+
+if wt_reason="$(gjch_worktree_reason "$ROOT")"; then
+	printf '%s\n' "$wt_reason" >&2
+	exit 1
+fi
 
 command -v python3 >/dev/null || { echo 'python3가 필요합니다.' >&2; exit 1; }
 

@@ -114,7 +114,7 @@
 
 Claude 데스크톱 앱의 Code 탭(로컬 세션)이나 Herdr 밖 터미널의 `claude`를 팀장으로 쓰고, Herdr 작업공간에는 구현 팀원(agy)과 검토 팀원(Codex)만 두는 운영 방식이다.
 
-1. **준비:** 데스크톱 앱 Code 탭에서 이 저장소 폴더로 새 세션을 연다. **worktree 옵션은 선택하지 않는다.** worktree 옵션은 새 세션 입력 화면의 브랜치 이름 옆에 있으며 시작할 때만 정할 수 있다. 선택하면 `<프로젝트>/.claude/worktrees/` 아래 별도 사본에서 실행되므로 쓰지 않는다. 시작 후 `pwd; git rev-parse --show-toplevel`이 저장소 루트인지 확인한다. 데스크톱 Code 탭 로컬 세션에서는 Bash에서 `herdr`가 동작하고 `CLAUDE_CODE_SESSION_ID`와 `CLAUDE_CODE_MESSAGING_SOCKET`이 설정되어 있다.
+1. **준비:** 데스크톱 앱 Code 탭에서 이 저장소 폴더로 새 세션을 연다. **worktree 옵션은 선택하지 않는다.** worktree 옵션은 새 세션 입력 화면의 브랜치 이름 옆에 있으며 시작할 때만 정할 수 있다. 선택하면 `<프로젝트>/.claude/worktrees/` 아래 별도 사본에서 실행되므로 쓰지 않는다(#43 이후 팀 스크립트는 연결 worktree에서 거절한다). 시작 후 `pwd; git rev-parse --show-toplevel`이 저장소 루트인지 확인한다. 데스크톱 Code 탭 로컬 세션에서는 Bash에서 `herdr`가 동작하고 `CLAUDE_CODE_SESSION_ID`와 `CLAUDE_CODE_MESSAGING_SOCKET`이 설정되어 있다.
 2. **환경변수:** macOS 데스크톱 앱은 셸 프로필에서 `PATH`만 가져온다. 다른 환경변수는 데스크톱 앱 프롬프트 입력창의 환경 드롭다운 → `로컬 환경 편집` → `환경 변수`에 `GJCH_EXTERNAL_LEAD=1`을 넣어야 로컬 세션과 Bash에 전달된다(사용자 설정이므로 사용자가 직접 넣거나 승인 후 진행한다). 데스크톱 앱 밖 일반 터미널에서 Herdr 밖 `claude`로 쓸 때는 `GJCH_EXTERNAL_LEAD=1 claude`로 실행한다.
 3. **자동 구성:** SessionStart hook(`scripts/team-up.sh --hook`)이 `scripts/team-lead.sh claim`으로 잠금을 확보하면 stdout에 `GJCH: 이 세션이 외부 팀장입니다(herdr 밖, 팀장 잠금 보유). 팀원 작업공간 'GJCH · gjc-herdr'을 확인·구성합니다.`를 출력하고, `clear`가 아니면 `--spawn`을 백그라운드로 실행한다. 잠금을 얻지 못하면(다른 세션이 보유 중이거나 정체 환경변수 누락) `GJCH: 팀장 잠금이 다른 세션(<kind> <sid8>)에 있어 이 세션은 팀장이 아닙니다. 팀원에게 배정·입력하지 마세요.`(정체 환경변수가 없으면 `GJCH: 세션 정체(CLAUDE_CODE_SESSION_ID·소켓)를 알 수 없어 이 세션은 외부 팀장이 아닙니다.`)를 출력하고 아무것도 하지 않는다.
 4. **수동 명령:**
@@ -259,5 +259,6 @@ GJC는 상시 팀원이 아니며, 플러그인 로드·token 표시·`/herdr-se
 | `multiple workspaces found with label` | 외부 팀장 모드에서 대상 label(`GJCH · gjc-herdr`)을 가진 Herdr 작업공간이 둘 이상이고 기존 팀원 agent로도 작업공간을 하나로 특정할 수 없다. 중복 작업공간 label을 정리하거나 하나만 남긴 뒤 다시 실행한다 |
 | `잠금 파일 읽기 실패` / `잠금 파일 형식 오류` / `잠금 파일 필수 필드 오류` (rc `1`) | 팀장 잠금 파일(`.local/team/lead.json`)이 손상되었거나 필수 필드가 잘못되어 `team-up.sh`와 `critic-send.sh`가 모두 막힌다(fail-closed). 일반 `release`와 세션 재시작으로는 풀리지 않는다. 실제 팀장 세션을 확인한 뒤 **사용자 승인**을 받아 `scripts/team-lead.sh release --force`로 파일을 삭제하고, 팀장 세션에서 `scripts/team-lead.sh claim`과 `scripts/team-lead.sh status`(`mine ...`)를 확인한다 |
 | GJC → agy `/herdr-call`·`--raw`가 막 띄운 agy에서 `target_typing` | `--mode accept-edits`(또는 `auto`·`plan`)로 띄운 빈 agy 입력란의 모드 안내 문구(전경색 `38;2;131;148;150`, 좁은 pane `...` 잘림 포함)가 흐림(SGR 2)이 아니라 입력된 글로 판정된 #47 증상이다. #47 이후는 이 안내 문구를 빈 입력란으로 본다. GJC의 플러그인을 #47 이후 버전으로 다시 설치하고 GJC를 재시작한다 |
+| `GJCH: 이 세션은 연결 worktree(...)에서 실행 중이라 팀장으로 동작하지 않습니다.` / `연결 worktree(...)에서 실행 중입니다.` | 데스크톱 Code 탭의 worktree 옵션 등으로 `<저장소>/.claude/worktrees/<이름>` 사본이나 Git 연결 worktree에서 실행되어 `ROOT`가 원래 저장소와 어긋난 상태다(#43). 네 진입점(`team-lead.sh`·`team-up.sh`·`critic-send.sh`·`check-env.sh`)은 잠금이나 Herdr 작업공간을 건드리지 않고 거절(또는 `check-env.sh`에서 `FAIL` 표시)하며, 경로에 `/.claude/worktrees/`가 있으면 일반 저장소여도 거절한다(우편 스크립트 `mail-*.sh`는 이 검사를 하지 않으며 후속은 별도 이슈다). 데스크톱 세션의 worktree 옵션을 끄고 원래 저장소 루트 폴더에서 새 세션을 연다 |
 
 더 자세한 사용법은 [README](../README.md)를 참조한다.

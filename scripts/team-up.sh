@@ -33,6 +33,8 @@ WS_LABEL="${GJCH_WS_LABEL:-GJCH · gjc-herdr}"
 RETRIES="${GJCH_RETRIES:-30}"   # 2초 간격 → 최대 약 60초
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+# shellcheck source=scripts/worktree-guard.sh
+. "$ROOT/scripts/worktree-guard.sh"
 mode="${1:-}"
 
 # --- 가드: Herdr 안 또는 외부 팀장(GJCH_EXTERNAL_LEAD=1), 이 프로젝트 안, 팀원 역할이 아닐 때만 ---
@@ -46,6 +48,14 @@ fi
 [ -z "${GJCH_TEAM_ROLE:-}" ] || exit 0
 here="$(cd "${CLAUDE_PROJECT_DIR:-$PWD}" 2>/dev/null && pwd -P)" || exit 0
 case "$here/" in "$ROOT"/*) ;; *) exit 0 ;; esac
+if wt_reason="$(gjch_worktree_reason "$ROOT")"; then
+	if [ "$mode" = "--hook" ]; then
+		printf 'GJCH: 이 세션은 연결 worktree(%s)에서 실행 중이라 팀장으로 동작하지 않습니다. 데스크톱 세션의 worktree 옵션을 끄고 저장소 폴더에서 새 세션을 엽니다.\n' "$ROOT"
+		exit 0
+	fi
+	printf '%s\n' "$wt_reason" >&2
+	exit 1
+fi
 command -v herdr >/dev/null || exit 0
 command -v python3 >/dev/null || exit 0
 
