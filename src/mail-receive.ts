@@ -28,7 +28,9 @@ import {
 	type MailStat,
 	type MailWarning,
 } from "./mail.ts";
-import { isMainSession } from "./metadata.ts";
+import { isInteractiveMainSession, isMainSession } from "./metadata.ts";
+
+export { isInteractiveMainSession };
 
 export const MAX_PREVIEW_BYTES = 8 * 1_024;
 export const MAX_SLOTS = 3;
@@ -56,12 +58,6 @@ export const SHUTDOWN_TIMEOUT_MANUAL_ACTION =
 export const HOLD_RETRY_NOTICE = "다시 시작해야 재시도됨";
 
 const SESSION_ID_RE = /^[A-Za-z0-9-]{1,64}$/;
-
-export function isInteractiveMainSession(
-	ctx: Pick<ExtensionContext, "hasUI" | "sessionMetadata">,
-): boolean {
-	return Boolean(ctx) && ctx.hasUI === true && isMainSession(ctx);
-}
 
 export type MailItemState =
 	| "reserved"

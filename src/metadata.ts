@@ -15,6 +15,12 @@ export function isMainSession(
 	);
 }
 
+export function isInteractiveMainSession(
+	ctx?: Pick<ExtensionContext, "hasUI" | "sessionMetadata">,
+): boolean {
+	return Boolean(ctx) && ctx!.hasUI === true && isMainSession(ctx!);
+}
+
 export function displayValue(value: string | undefined): string | undefined {
 	if (value === undefined) return undefined;
 	const text = Array.from(

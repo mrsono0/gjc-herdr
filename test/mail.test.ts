@@ -1029,6 +1029,14 @@ test("§4 herdr_mail_send tool and extension registration work without a Herdr p
 						reply_to?: string;
 					},
 					signal?: AbortSignal,
+					onUpdate?: unknown,
+					ctx?: {
+						hasUI?: boolean;
+						sessionMetadata?: {
+							kind: string;
+							taskDepth: number;
+						};
+					},
 				) => Promise<{
 					content: { type: string; text: string }[];
 					details: Awaited<ReturnType<typeof sendMail>>;
@@ -1049,12 +1057,21 @@ test("§4 herdr_mail_send tool and extension registration work without a Herdr p
 	);
 	assert.equal(registeredTool?.name, "herdr_mail_send");
 
-	const toolOut = await registeredTool!.execute("call-1", {
-		to: "gjc-herdr-lead",
-		subject: "도구 전송 테스트",
-		body: "우편 본문",
-		reply_to: VALID_REPLY_ID,
-	});
+	const toolOut = await registeredTool!.execute(
+		"call-1",
+		{
+			to: "gjc-herdr-lead",
+			subject: "도구 전송 테스트",
+			body: "우편 본문",
+			reply_to: VALID_REPLY_ID,
+		},
+		undefined,
+		undefined,
+		{
+			hasUI: true,
+			sessionMetadata: { kind: "main", taskDepth: 0 },
+		},
+	);
 	assert.equal(toolOut.isError, false);
 	assert.equal(toolOut.details.ok, true);
 	assert(toolOut.details.id && isValidUlid(toolOut.details.id));
@@ -1392,4 +1409,111 @@ test("F3 & P3 write-side non-regular file rejection, missing fs.constants reject
 		assert.equal(res.error?.code, "path_boundary_failed");
 		assert.equal(res.error?.causeCode, "EACCES");
 	}
+});
+
+test("herdr_mail_send rejects non-interactive or subagent sessions with non_interactive_session and zero file operations", async () => {
+	const { deps, nodes, gitCalls, fsOpsLog } = createFakeMailEnv();
+	let registeredTool:
+		| {
+				name: string;
+				execute: (
+					toolCallId: string,
+					params: {
+						to: string;
+						subject: string;
+						body: string;
+						reply_to?: string;
+					},
+					signal?: AbortSignal,
+					onUpdate?: unknown,
+					ctx?: {
+						hasUI?: boolean;
+						sessionMetadata?: {
+							kind: string;
+							taskDepth: number;
+						};
+					},
+				) => Promise<{
+					content: { type: string; text: string }[];
+					details: Awaited<ReturnType<typeof sendMail>>;
+					isError: boolean;
+				}>;
+		  }
+		| undefined;
+
+	registerMailFeatures(
+		{
+			zod,
+			exec: deps.exec,
+			registerTool: (def: typeof registeredTool) => {
+				registeredTool = def;
+			},
+		} as unknown as ExtensionAPI,
+		deps,
+	);
+	assert.equal(registeredTool?.name, "herdr_mail_send");
+
+	const deniedContexts: Array<
+		| {
+				hasUI?: boolean;
+				sessionMetadata?: {
+					kind: string;
+					taskDepth: number;
+				};
+		  }
+		| undefined
+	> = [
+		{ hasUI: false, sessionMetadata: { kind: "main", taskDepth: 0 } },
+		{ hasUI: true, sessionMetadata: { kind: "sub", taskDepth: 0 } },
+		{ hasUI: true, sessionMetadata: { kind: "main", taskDepth: 1 } },
+		undefined,
+		{ hasUI: true },
+	];
+
+	for (const ctx of deniedContexts) {
+		const out = await registeredTool!.execute(
+			"call-denied",
+			{
+				to: "gjc-herdr-lead",
+				subject: "비대화형 거절 검증",
+				body: "본문",
+			},
+			undefined,
+			undefined,
+			ctx,
+		);
+		assert.equal(out.isError, true);
+		assert.equal(out.details.ok, false);
+		assert.equal(out.details.error?.code, "non_interactive_session");
+		assert.match(
+			out.content[0]?.text ?? "",
+			/\[non_interactive_session\]: herdr_mail_send requires an interactive main GJC session because inherited GJC_HERDR_MAILBOX in non-interactive or subagent sessions may misidentify `from`\. Have the parent interactive main GJC session send the mail\.$/,
+		);
+	}
+
+	assert.equal(gitCalls.length, 0);
+	assert.equal(fsOpsLog.length, 0);
+	const filesBeforeAllowed = [
+		...nodes.keys(),
+	].filter((p) => p.startsWith(`${REPO_TOP}/.gjc-herdr/mailbox/`));
+	assert.equal(filesBeforeAllowed.length, 0);
+
+	// Interactive main session succeeds as expected
+	const okOut = await registeredTool!.execute(
+		"call-allowed",
+		{
+			to: "gjc-herdr-lead",
+			subject: "대화형 주 세션 허용 검증",
+			body: "정상 본문",
+		},
+		undefined,
+		undefined,
+		{
+			hasUI: true,
+			sessionMetadata: { kind: "main", taskDepth: 0 },
+		},
+	);
+	assert.equal(okOut.isError, false);
+	assert.equal(okOut.details.ok, true);
+	assert(okOut.details.id && isValidUlid(okOut.details.id));
 });

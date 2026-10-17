@@ -12,6 +12,7 @@ import {
 } from "node:fs/promises";
 import { posix } from "node:path";
 import type { ExtensionAPI, ExecResult } from "@gajae-code/coding-agent";
+import { isInteractiveMainSession } from "./metadata.ts";
 
 type Exec = ExtensionAPI["exec"];
 
@@ -2417,7 +2418,8 @@ export function registerMailFeatures(
 		label: "Herdr Mail Send",
 		description:
 			"Send a durable file mailbox message to `<git-toplevel>/.gjc-herdr/mailbox/<to>/<id>.md` using exclusive hard-link publication. " +
-			"Requires `GJC_HERDR_MAILBOX` in the sender environment for `from`, and requires `/.gjc-herdr/` to be ignored by Git.",
+			"Requires `GJC_HERDR_MAILBOX` in the sender environment for `from`, and requires `/.gjc-herdr/` to be ignored by Git. " +
+			"Only available in an interactive main GJC session.",
 		parameters: z.object({
 			to: z
 				.string()
@@ -2431,7 +2433,22 @@ export function registerMailFeatures(
 				.optional()
 				.describe("Optional ULID of the message being replied to"),
 		}),
-		async execute(_toolCallId: string, params, signal) {
+		async execute(_toolCallId: string, params, signal, _onUpdate, ctx) {
+			if (!isInteractiveMainSession(ctx)) {
+				const result: MailSendResult = {
+					ok: false,
+					error: {
+						code: "non_interactive_session",
+						message:
+							"herdr_mail_send requires an interactive main GJC session because inherited GJC_HERDR_MAILBOX in non-interactive or subagent sessions may misidentify `from`. Have the parent interactive main GJC session send the mail.",
+					},
+				};
+				return {
+					content: [{ type: "text", text: describeMailSendResult(result) }],
+					details: result,
+					isError: true,
+				};
+			}
 			const result = await sendMail(
 				deps,
 				{

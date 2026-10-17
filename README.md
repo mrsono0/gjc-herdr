@@ -218,7 +218,7 @@ GJC 0.18.7은 플러그인이 skill을 등록할 수 없다(파일시스템 기�
 
 ## 파일 우편함 보내기·받기
 
-`herdr_mail_send` 도구(`{ to, subject, body, reply_to? }`)는 `<git 최상위>/.gjc-herdr/mailbox/<to>/<id>.md`에 우편 파일을 배타적 하드 링크(`link`)로 공개하고 `{ ok, id, path, warnings? }`를 반환한다(다른 pane 입력이나 토스트는 없음).
+`herdr_mail_send` 도구(`{ to, subject, body, reply_to? }`)는 `<git 최상위>/.gjc-herdr/mailbox/<to>/<id>.md`에 우편 파일을 배타적 하드 링크(`link`)로 공개하고 `{ ok, id, path, warnings? }`를 반환한다(다른 pane 입력이나 토스트는 없음). 대화형 주 세션(`hasUI && kind === "main" && taskDepth === 0`)에서만 사용할 수 있으며, `gjc -p`·독립 비대화형 SDK 세션·하위 에이전트 세션에서는 물려받은 `GJC_HERDR_MAILBOX`로 `from`이 잘못 찍히는 것을 막기 위해 `non_interactive_session`으로 거절된다(기존 대화형 세션에 SDK로 요청을 보내는 경우는 그 대화형 세션이 기준이라 거절되지 않으며, 팀장 스크립트 `scripts/mail-send.sh`는 GJC 도구가 아니라 `--from`으로 발신 이름을 받으므로 해당 없음).
 
 - 발신자 이름(`from`)과 수신 우편함 이름은 환경변수 `GJC_HERDR_MAILBOX`(`^[a-z][a-z0-9-]{0,31}$`)에서 읽는다. `GJC_HERDR_MAILBOX`가 설정되지 않으면 우편 받기는 비활성 상태(리스너·감시자·타이머 미등록)로 남고, 형식에 어긋나면 에러 안내를 1회 남긴 뒤 우편 받기를 비활성화한다.
 - 플러그인은 `.gitignore`를 수정하지 않는다. 사용하는 저장소의 `.gitignore`에 `/.gjc-herdr/`를 직접 추가해야 하며, 우편함 경로가 Git에서 무시되지 않거나 추적 파일이 있으면 보내기·받기를 거절한다.
