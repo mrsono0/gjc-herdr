@@ -378,6 +378,7 @@ test("stalled, timeout, and unknown prompt failures keep their certainty", async
 		const { deps, count } = fakeExec({
 			"herdr agent get": () => agentGet("idle"),
 			"herdr agent prompt": () => herdrError(envelope, "boom"),
+			"herdr agent read": () => ({ stdout: "" }),
 		});
 		const result = await callRegisteredAgent(
 			deps,
@@ -388,7 +389,7 @@ test("stalled, timeout, and unknown prompt failures keep their certainty", async
 		assert.equal(result.delivery, delivery);
 		assert.equal(result.error?.code, code);
 		assert.equal(result.error?.herdrCode, envelope);
-		assert.equal(count("herdr agent read"), 0);
+		assert.equal(count("herdr agent read"), envelope === "timeout" ? 1 : 0);
 	}
 });
 
@@ -1711,5 +1712,639 @@ test("result_file honors abort during pre-prompt lstat and during file recovery 
 			assert.equal(counts.stat, 1);
 			assert.equal(counts.read, 1);
 		}
+	}
+});
+
+test("r3 (#52): retries with --source recent when recent-unwrapped has only the end marker, recovers Claude bullet answers, and rejects folded prompt echoes", async () => {
+	// 1. recent-unwrapped has only end marker, recent has full pair in Claude format (⏺ bullet + 2-space indent) -> answered
+	{
+		let requestId = "";
+		const readSources: string[] = [];
+		const { deps, count, advance } = fakeExec({
+			"herdr agent get": () => agentGet("idle"),
+			"herdr agent prompt": (args) => {
+				requestId = /GJC_HERDR_BEGIN_([0-9a-f-]{36})/.exec(args[3]!)![1]!;
+				advance(1_000);
+				return agentPrompted("done");
+			},
+			"herdr agent read": (args) => {
+				const sourceIdx = args.indexOf("--source");
+				const source = sourceIdx >= 0 ? args[sourceIdx + 1]! : "";
+				readSources.push(source);
+				if (source === "recent-unwrapped") {
+					return {
+						stdout: `  row-23\n  row-24\n  GJC_HERDR_END_${requestId}\n`,
+					};
+				}
+				return {
+					stdout: `⏺ GJC_HERDR_BEGIN_${requestId}\n  row-01\n  row-02\n  GJC_HERDR_END_${requestId}\n`,
+				};
+			},
+		});
+		const result = await callRegisteredAgent(
+			deps,
+			{ target: TARGET_PANE, text: "list rows" },
+			SENDER_PANE,
+		);
+		assert.equal(result.ok, true);
+		assert.equal(result.status, "answered");
+		assert.equal(result.delivery, "submitted");
+		assert.equal(result.answer, "row-01\nrow-02");
+		assert.equal(count("herdr agent read"), 2);
+		assert.deepEqual(readSources, ["recent-unwrapped", "recent"]);
+	}
+
+	// 2. Both reads lack the begin marker -> response_unverified, read twice, keeps first capture
+	{
+		let requestId = "";
+		const { deps, count } = fakeExec({
+			"herdr agent get": () => agentGet("idle"),
+			"herdr agent prompt": (args) => {
+				requestId = /GJC_HERDR_BEGIN_([0-9a-f-]{36})/.exec(args[3]!)![1]!;
+				return agentPrompted("done");
+			},
+			"herdr agent read": (args) => {
+				const source = args[args.indexOf("--source") + 1];
+				return {
+					stdout:
+						source === "recent-unwrapped"
+							? `first-unwrapped\nGJC_HERDR_END_${requestId}\n`
+							: `second-recent\nGJC_HERDR_END_${requestId}\n`,
+				};
+			},
+		});
+		const result = await callRegisteredAgent(
+			deps,
+			{ target: TARGET_PANE, text: "list rows" },
+			SENDER_PANE,
+		);
+		assert.equal(result.ok, false);
+		assert.equal(result.status, "response_unverified");
+		assert.equal(result.delivery, "submitted");
+		assert.equal(result.capture, `first-unwrapped\nGJC_HERDR_END_${requestId}\n`);
+		assert.equal(count("herdr agent read"), 2);
+	}
+
+	// 3. First read has no end marker either -> no second read (1 read)
+	{
+		const { deps, count } = fakeExec({
+			"herdr agent get": () => agentGet("idle"),
+			"herdr agent prompt": () => agentPrompted("done"),
+			"herdr agent read": () => ({ stdout: "row-23\nrow-24\nno markers at all\n" }),
+		});
+		const result = await callRegisteredAgent(
+			deps,
+			{ target: TARGET_PANE, text: "list rows" },
+			SENDER_PANE,
+		);
+		assert.equal(result.ok, false);
+		assert.equal(result.status, "response_unverified");
+		assert.equal(count("herdr agent read"), 1);
+	}
+
+	// 4. First read succeeds -> only 1 read
+	{
+		let requestId = "";
+		const { deps, count } = fakeExec({
+			"herdr agent get": () => agentGet("idle"),
+			"herdr agent prompt": (args) => {
+				requestId = /GJC_HERDR_BEGIN_([0-9a-f-]{36})/.exec(args[3]!)![1]!;
+				return agentPrompted("done");
+			},
+			"herdr agent read": () => answerScreen(requestId, "single read ok"),
+		});
+		const result = await callRegisteredAgent(
+			deps,
+			{ target: TARGET_PANE, text: "list rows" },
+			SENDER_PANE,
+		);
+		assert.equal(result.ok, true);
+		assert.equal(result.status, "answered");
+		assert.equal(result.answer, "single read ok");
+		assert.equal(count("herdr agent read"), 1);
+	}
+
+	// 5a. Folded prompt echo in recent has a standalone GJC_HERDR_BEGIN_<id> line, no real begin marker below, only end marker -> response_unverified
+	{
+		let requestId = "";
+		const { deps, count } = fakeExec({
+			"herdr agent get": () => agentGet("idle"),
+			"herdr agent prompt": (args) => {
+				requestId = /GJC_HERDR_BEGIN_([0-9a-f-]{36})/.exec(args[3]!)![1]!;
+				return agentPrompted("done");
+			},
+			"herdr agent read": (args) => {
+				const source = args[args.indexOf("--source") + 1];
+				if (source === "recent-unwrapped") {
+					return { stdout: `  row-23\n  GJC_HERDR_END_${requestId}\n` };
+				}
+				return {
+					stdout: [
+						"❯ Please inspect the module.",
+						"  Answer with the exact token",
+						`  GJC_HERDR_BEGIN_${requestId}`,
+						`  on the first line of your final answer and GJC_HERDR_END_${requestId} on the last line.`,
+						"  row-23",
+						`  GJC_HERDR_END_${requestId}`,
+					].join("\n"),
+				};
+			},
+		});
+		const result = await callRegisteredAgent(
+			deps,
+			{ target: TARGET_PANE, text: "Please inspect the module." },
+			SENDER_PANE,
+		);
+		assert.equal(result.ok, false);
+		assert.equal(result.status, "response_unverified");
+		assert.equal(result.answer, undefined);
+		assert.equal(count("herdr agent read"), 2);
+	}
+
+	// 5b. Folded prompt echo in recent has a standalone GJC_HERDR_BEGIN_<id> line AND a real Claude begin marker below -> recovers only real answer without echoed prompt text
+	{
+		let requestId = "";
+		const { deps, count } = fakeExec({
+			"herdr agent get": () => agentGet("idle"),
+			"herdr agent prompt": (args) => {
+				requestId = /GJC_HERDR_BEGIN_([0-9a-f-]{36})/.exec(args[3]!)![1]!;
+				return agentPrompted("done");
+			},
+			"herdr agent read": (args) => {
+				const source = args[args.indexOf("--source") + 1];
+				if (source === "recent-unwrapped") {
+					return { stdout: `  row-23\n  GJC_HERDR_END_${requestId}\n` };
+				}
+				return {
+					stdout: [
+						"❯ Please inspect the module.",
+						"  Answer with the exact token",
+						`  GJC_HERDR_BEGIN_${requestId}`,
+						"  on the first line of your final answer and",
+						`  GJC_HERDR_END_${requestId}`,
+						"  on the last line.",
+						"  extra prompt line after echo",
+						`⏺ GJC_HERDR_BEGIN_${requestId}`,
+						"  row-01",
+						"  row-60",
+						`  GJC_HERDR_END_${requestId}`,
+					].join("\n"),
+				};
+			},
+		});
+		const result = await callRegisteredAgent(
+			deps,
+			{ target: TARGET_PANE, text: "Please inspect the module." },
+			SENDER_PANE,
+		);
+		assert.equal(result.ok, true);
+		assert.equal(result.status, "answered");
+		assert.equal(result.answer, "row-01\nrow-60");
+		assert.ok(!result.answer.includes("on the first line"));
+		assert.ok(!result.answer.includes("extra prompt line"));
+		assert.equal(count("herdr agent read"), 2);
+	}
+
+	// 6. Second read budget is bounded by remaining budget and skipped when < 1ms remains after first read
+	{
+		let requestId = "";
+		let reads = 0;
+		const { deps, calls, count, advance } = fakeExec({
+			"herdr agent get": () => agentGet("idle"),
+			"herdr agent prompt": (args) => {
+				requestId = /GJC_HERDR_BEGIN_([0-9a-f-]{36})/.exec(args[3]!)![1]!;
+				advance(57_000);
+				return agentPrompted("done");
+			},
+			"herdr agent read": () => {
+				reads++;
+				if (reads === 1) {
+					advance(1_800);
+					return { stdout: `  row-23\n  GJC_HERDR_END_${requestId}\n` };
+				}
+				return {
+					stdout: `⏺ GJC_HERDR_BEGIN_${requestId}\n  row-01\n  GJC_HERDR_END_${requestId}\n`,
+				};
+			},
+		});
+		const bounded = await callRegisteredAgent(
+			deps,
+			{ target: TARGET_PANE, text: "list rows" },
+			SENDER_PANE,
+		);
+		assert.equal(bounded.ok, true);
+		assert.equal(bounded.status, "answered");
+		assert.equal(count("herdr agent read"), 2);
+		const readCalls = calls.filter(({ args }) => args[0] === "agent" && args[1] === "read");
+		assert.equal(readCalls[0]?.options?.timeout, 3_000);
+		assert.equal(readCalls[1]?.options?.timeout, 1_200);
+
+		let exhaustedId = "";
+		const exhausted = fakeExec({
+			"herdr agent get": () => agentGet("idle"),
+			"herdr agent prompt": (args) => {
+				exhaustedId = /GJC_HERDR_BEGIN_([0-9a-f-]{36})/.exec(args[3]!)![1]!;
+				exhausted.advance(57_000);
+				return agentPrompted("done");
+			},
+			"herdr agent read": () => {
+				exhausted.advance(3_000);
+				return { stdout: `  row-23\n  GJC_HERDR_END_${exhaustedId}\n` };
+			},
+		});
+		const noBudgetResult = await callRegisteredAgent(
+			exhausted.deps,
+			{ target: TARGET_PANE, text: "list rows" },
+			SENDER_PANE,
+		);
+		assert.equal(noBudgetResult.ok, false);
+		assert.equal(noBudgetResult.status, "response_unverified");
+		assert.equal(exhausted.count("herdr agent read"), 1);
+	}
+
+	// 7. r3 boundary: valid answer whose first body line starts with "on the first line..." is conservatively response_unverified on recent retry
+	{
+		let requestId = "";
+		const { deps, count } = fakeExec({
+			"herdr agent get": () => agentGet("idle"),
+			"herdr agent prompt": (args) => {
+				requestId = /GJC_HERDR_BEGIN_([0-9a-f-]{36})/.exec(args[3]!)![1]!;
+				return agentPrompted("done");
+			},
+			"herdr agent read": (args) => {
+				const source = args[args.indexOf("--source") + 1];
+				if (source === "recent-unwrapped") {
+					return { stdout: `  row-23\n  GJC_HERDR_END_${requestId}\n` };
+				}
+				return {
+					stdout: [
+						`⏺ GJC_HERDR_BEGIN_${requestId}`,
+						"  on the first line of the config, set foo=bar",
+						"  second line",
+						`  GJC_HERDR_END_${requestId}`,
+					].join("\n"),
+				};
+			},
+		});
+		const result = await callRegisteredAgent(
+			deps,
+			{ target: TARGET_PANE, text: "explain config" },
+			SENDER_PANE,
+		);
+		assert.equal(result.ok, false);
+		assert.equal(result.status, "response_unverified");
+		assert.equal(result.capture, `  row-23\n  GJC_HERDR_END_${requestId}\n`);
+		assert.equal(count("herdr agent read"), 2);
+	}
+
+	// 8. r3 boundary: BEGIN marker line itself folded across two lines -> response_unverified
+	{
+		let requestId = "";
+		const { deps, count } = fakeExec({
+			"herdr agent get": () => agentGet("idle"),
+			"herdr agent prompt": (args) => {
+				requestId = /GJC_HERDR_BEGIN_([0-9a-f-]{36})/.exec(args[3]!)![1]!;
+				return agentPrompted("done");
+			},
+			"herdr agent read": (args) => {
+				const source = args[args.indexOf("--source") + 1];
+				if (source === "recent-unwrapped") {
+					return { stdout: `  row-23\n  GJC_HERDR_END_${requestId}\n` };
+				}
+				const half = Math.floor(requestId.length / 2);
+				return {
+					stdout: [
+						`⏺ GJC_HERDR_BEGIN_${requestId.slice(0, half)}`,
+						`  ${requestId.slice(half)}`,
+						"  row-01",
+						`  GJC_HERDR_END_${requestId}`,
+					].join("\n"),
+				};
+			},
+		});
+		const result = await callRegisteredAgent(
+			deps,
+			{ target: TARGET_PANE, text: "narrow pane" },
+			SENDER_PANE,
+		);
+		assert.equal(result.ok, false);
+		assert.equal(result.status, "response_unverified");
+		assert.equal(count("herdr agent read"), 2);
+	}
+
+	// 9. r3 boundary: second read fails (nonzero) or throws -> response_unverified keeping first capture
+	for (const failMode of ["nonzero", "throw"] as const) {
+		let requestId = "";
+		let reads = 0;
+		const { deps, count } = fakeExec({
+			"herdr agent get": () => agentGet("idle"),
+			"herdr agent prompt": (args) => {
+				requestId = /GJC_HERDR_BEGIN_([0-9a-f-]{36})/.exec(args[3]!)![1]!;
+				return agentPrompted("done");
+			},
+			"herdr agent read": () => {
+				reads++;
+				if (reads === 1) {
+					return { stdout: `first-capture-kept\nGJC_HERDR_END_${requestId}\n` };
+				}
+				if (failMode === "throw") return new Error("retry read crashed");
+				return herdrError("agent_read_failed", "retry read failed");
+			},
+		});
+		const result = await callRegisteredAgent(
+			deps,
+			{ target: TARGET_PANE, text: "retry failure" },
+			SENDER_PANE,
+		);
+		assert.equal(result.ok, false);
+		assert.equal(result.status, "response_unverified");
+		assert.equal(result.delivery, "submitted");
+		assert.equal(result.capture, `first-capture-kept\nGJC_HERDR_END_${requestId}\n`);
+		assert.equal(count("herdr agent read"), 2);
+	}
+});
+
+test("u1 (#52): confirms delivery after timeout only when this request's echo is on the target recent screen", async () => {
+	// 1. Another sender's activity or a different request ID echo on screen (even if counters advance) -> uncertain
+	{
+		let gets = 0;
+		const { deps, count, advance } = fakeExec({
+			"herdr agent get": () => {
+				gets++;
+				return gets === 1
+					? agentGet("idle", { revision: 7, state_change_seq: 12 })
+					: agentGet("working", { revision: 8, state_change_seq: 13 });
+			},
+			"herdr agent prompt": () => {
+				advance(57_500);
+				return herdrError("timeout", "timed out waiting for agent status");
+			},
+			"herdr agent read": () => ({
+				stdout: [
+					"❯ Some other sender's prompt",
+					"  Answer with the exact token GJC_HERDR_BEGIN_00000000-0000-0000-0000-000000000000 on the first line",
+					"  of your final answer and GJC_HERDR_END_00000000-0000-0000-0000-000000000000 on the last line.",
+				].join("\n"),
+			}),
+		});
+		const result = await callRegisteredAgent(
+			deps,
+			{ target: TARGET_PANE, text: "deep analysis" },
+			SENDER_PANE,
+		);
+		assert.equal(result.ok, false);
+		assert.equal(result.status, "uncertain");
+		assert.equal(result.delivery, "unknown");
+		assert.equal(result.error?.code, "timeout");
+		assert.equal(count("herdr agent get"), 1);
+		assert.equal(count("herdr agent read"), 1);
+	}
+
+	// 2. Timeout followed by recent screen containing this request's echo (single-line and folded two-line ID) -> answer_pending
+	for (const echoMode of ["single-line", "folded-id", "folded-at-hyphen"] as const) {
+		let requestId = "";
+		const { deps, calls, count, advance } = fakeExec({
+			"herdr agent get": () => agentGet("idle"),
+			"herdr agent prompt": (args) => {
+				requestId = /GJC_HERDR_BEGIN_([0-9a-f-]{36})/.exec(args[3]!)![1]!;
+				advance(57_500);
+				return herdrError("timeout", "timed out waiting for agent status");
+			},
+			"herdr agent read": (args) => {
+				assert.deepEqual(args, [
+					"agent",
+					"read",
+					TARGET_PANE,
+					"--source",
+					"recent",
+					"--lines",
+					"200",
+				]);
+				if (echoMode === "single-line") {
+					return {
+						stdout: `❯ deep analysis\n  Answer with the exact token GJC_HERDR_BEGIN_${requestId} on the first line\n✻ Thinking…\n`,
+					};
+				}
+				if (echoMode === "folded-at-hyphen") {
+					const dash = requestId.indexOf("-");
+					return {
+						stdout: [
+							"❯ deep analysis",
+							`  Answer with the exact token GJC_HERDR_BEGIN_${requestId.slice(0, dash)}`,
+							`  ${requestId.slice(dash)} on the first line of your final answer`,
+						].join("\n"),
+					};
+				}
+				const splitAt = 14;
+				return {
+					stdout: [
+						"• deep analysis",
+						`  Answer with the exact token GJC_HERDR_BEGIN_${requestId.slice(0, splitAt)}`,
+						`  ${requestId.slice(splitAt)} on the first line of your final answer`,
+					].join("\n"),
+				};
+			},
+		});
+		const result = await callRegisteredAgent(
+			deps,
+			{ target: TARGET_PANE, text: "deep analysis" },
+			SENDER_PANE,
+		);
+		assert.equal(result.ok, false, `echoMode=${echoMode}`);
+		assert.equal(result.status, "answer_pending", `echoMode=${echoMode}`);
+		assert.equal(result.delivery, "submitted", `echoMode=${echoMode}`);
+		assert.equal(result.pane, TARGET_PANE, `echoMode=${echoMode}`);
+		assert.equal(result.error?.code, "answer_timeout", `echoMode=${echoMode}`);
+		assert.equal(result.error?.herdrCode, "timeout", `echoMode=${echoMode}`);
+		assert.equal(result.error?.exitCode, 1, `echoMode=${echoMode}`);
+		assert.equal(
+			result.error?.message,
+			"Prompt was delivered (this request's marker instruction is on the target screen) but no answer arrived within the call budget; the target may still be answering. Do not resend; check the target or ask it to reply again later.",
+			`echoMode=${echoMode}`,
+		);
+		assert.equal(count("herdr agent get"), 1, `echoMode=${echoMode}`);
+		assert.equal(count("herdr agent read"), 1, `echoMode=${echoMode}`);
+		const confirmRead = calls.find(({ args }) => args[0] === "agent" && args[1] === "read")!;
+		assert.equal(confirmRead.options?.timeout, 2_500);
+		const formatted = describeCallResult(result);
+		assert.match(formatted, /^herdr-call answer_pending \(delivery submitted, request /);
+		assert.match(
+			formatted,
+			/this request's marker instruction is on the target screen[\s\S]*\(herdr timeout\)$/,
+		);
+	}
+
+	// 3. Confirmation read fails (nonzero, throw, or killed) -> uncertain
+	for (const failKind of ["nonzero", "throw", "killed"] as const) {
+		const { deps, count, advance } = fakeExec({
+			"herdr agent get": () => agentGet("idle"),
+			"herdr agent prompt": () => {
+				advance(57_000);
+				return herdrError("timeout", "timed out waiting for agent status");
+			},
+			"herdr agent read": () => {
+				if (failKind === "throw") return new Error("read failed");
+				if (failKind === "killed") return { killed: true, code: 0, stdout: "", stderr: "" };
+				return herdrError("agent_read_failed", "read failed");
+			},
+		});
+		const result = await callRegisteredAgent(
+			deps,
+			{ target: TARGET_PANE, text: "deep analysis" },
+			SENDER_PANE,
+		);
+		assert.equal(result.status, "uncertain", `failKind=${failKind}`);
+		assert.equal(result.delivery, "unknown", `failKind=${failKind}`);
+		assert.equal(result.error?.code, "timeout", `failKind=${failKind}`);
+		assert.equal(count("herdr agent read"), 1, `failKind=${failKind}`);
+	}
+
+	// 4. Abort during confirmation read -> uncertain
+	{
+		const controller = new AbortController();
+		let requestId = "";
+		const { deps, count, advance } = fakeExec({
+			"herdr agent get": () => agentGet("idle"),
+			"herdr agent prompt": (args) => {
+				requestId = /GJC_HERDR_BEGIN_([0-9a-f-]{36})/.exec(args[3]!)![1]!;
+				advance(57_000);
+				return herdrError("timeout", "timed out waiting for agent status");
+			},
+			"herdr agent read": () => {
+				controller.abort();
+				return {
+					stdout: `❯ Answer with the exact token GJC_HERDR_BEGIN_${requestId} on the first line`,
+				};
+			},
+		});
+		const result = await callRegisteredAgent(
+			deps,
+			{ target: TARGET_PANE, text: "deep analysis" },
+			SENDER_PANE,
+			controller.signal,
+		);
+		assert.equal(result.status, "uncertain");
+		assert.equal(result.delivery, "unknown");
+		assert.equal(result.error?.code, "timeout");
+		assert.equal(count("herdr agent read"), 1);
+	}
+
+	// 5. Remaining budget 0 -> uncertain without calling confirmation read
+	{
+		const { deps, count, advance } = fakeExec({
+			"herdr agent get": () => agentGet("idle"),
+			"herdr agent prompt": () => {
+				advance(60_000);
+				return herdrError("timeout", "timed out waiting for agent status");
+			},
+		});
+		const result = await callRegisteredAgent(
+			deps,
+			{ target: TARGET_PANE, text: "deep analysis" },
+			SENDER_PANE,
+		);
+		assert.equal(result.status, "uncertain");
+		assert.equal(result.delivery, "unknown");
+		assert.equal(result.error?.code, "timeout");
+		assert.equal(count("herdr agent read"), 0);
+	}
+
+	// 6. result_file mode timeout + echo on screen -> answer_pending (with resultFile preserved)
+	{
+		const resultPath = "/tmp/gjc-herdr-u1-result.md";
+		let requestId = "";
+		const { deps, count, advance } = fakeExec({
+			"herdr agent get": () => agentGet("idle"),
+			"herdr agent prompt": (args) => {
+				requestId = /GJC_HERDR_BEGIN_([0-9a-f-]{36})/.exec(args[3]!)![1]!;
+				advance(57_500);
+				return herdrError("timeout", "timed out waiting for agent status");
+			},
+			"herdr agent read": () => ({
+				stdout: [
+					`❯ Write your complete final answer as a new file at ${resultPath},`,
+					`  and reply on screen with only three lines: the exact token GJC_HERDR_BEGIN_${requestId.slice(0, 12)}`,
+					`  ${requestId.slice(12)} on the first line`,
+				].join("\n"),
+			}),
+		});
+		deps.fs = {
+			lstat: async () => {
+				throw enoentError();
+			},
+			open: async () => {
+				throw new Error("should not open result_file after prompt timeout");
+			},
+		};
+		const result = await callRegisteredAgent(
+			deps,
+			{ target: TARGET_PANE, text: "write file", resultFile: resultPath },
+			SENDER_PANE,
+		);
+		assert.equal(result.ok, false);
+		assert.equal(result.status, "answer_pending");
+		assert.equal(result.delivery, "submitted");
+		assert.equal(result.resultFile, resultPath);
+		assert.equal(result.error?.code, "answer_timeout");
+		assert.equal(count("herdr agent read"), 1);
+	}
+
+	// 7. Command and tool surface answer_pending status and details directly
+	{
+		let lastRequestId = "";
+		const messages: { content: string; details: AgentCallResult }[] = [];
+		let cmdHandler: ((args: string) => Promise<void>) | undefined;
+		let toolExecute:
+			| ((
+					toolCallId: string,
+					params: { target: string; text: string },
+			  ) => Promise<{ content: { type: string; text: string }[]; details: AgentCallResult; isError: boolean }>)
+			| undefined;
+		const { deps } = fakeExec({
+			"herdr agent get": () => agentGet("idle"),
+			"herdr agent prompt": (args) => {
+				lastRequestId = /GJC_HERDR_BEGIN_([0-9a-f-]{36})/.exec(args[3]!)![1]!;
+				return herdrError("timeout", "timed out waiting for agent status");
+			},
+			"herdr agent read": () => ({
+				stdout: `❯ Answer with the exact token GJC_HERDR_BEGIN_${lastRequestId} on the first line`,
+			}),
+		});
+		const api = {
+			logger: { info() {}, warn() {} },
+			exec: deps.exec,
+			registerCommand(_name: string, def: { handler: (args: string) => Promise<void> }) {
+				cmdHandler = def.handler;
+			},
+			registerTool(tool: { execute: typeof toolExecute }) {
+				toolExecute = tool.execute;
+			},
+			sendMessage: async (message: { content: string; details: AgentCallResult }) => {
+				messages.push(message);
+			},
+			zod: {
+				z: {
+					object: (shape: unknown) => shape,
+					string: () => {
+						const field = { optional: () => field, describe: () => field };
+						return field;
+					},
+				},
+			},
+		} as unknown as ExtensionAPI;
+		registerCallFeatures(api, "herdr", SENDER_PANE);
+		await cmdHandler!(`${TARGET_PANE} check command`);
+		assert.equal(messages.length, 1);
+		assert.equal(messages[0]?.details.status, "answer_pending");
+		assert.equal(messages[0]?.details.delivery, "submitted");
+		assert.equal(messages[0]?.details.error?.code, "answer_timeout");
+		assert.match(messages[0]?.content ?? "", /^herdr-call answer_pending \(delivery submitted/);
+
+		const toolRes = await toolExecute!("t-u1", { target: TARGET_PANE, text: "check tool" });
+		assert.equal(toolRes.isError, true);
+		assert.equal(toolRes.details.status, "answer_pending");
+		assert.equal(toolRes.details.delivery, "submitted");
+		assert.equal(toolRes.details.error?.code, "answer_timeout");
+		assert.match(toolRes.content[0]?.text ?? "", /^herdr-call answer_pending \(delivery submitted/);
 	}
 });

@@ -94,6 +94,7 @@ export type AgentCallStatus =
 	| "blocked"
 	| "stalled"
 	| "uncertain"
+	| "answer_pending"
 	| "answered"
 	| "response_unverified"
 	| "read_failed";
@@ -625,6 +626,51 @@ async function recoverResultFile(
 	}
 }
 
+function hasEndWithoutBegin(capture: string, requestId: string): boolean {
+	const id = requestId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+	const prefix = "[\\s>⏺●•\\-*]*";
+	const begin = new RegExp(`^${prefix}GJC_HERDR_BEGIN_${id}\\s*$`);
+	const end = new RegExp(`^${prefix}GJC_HERDR_END_${id}\\s*$`);
+	let hasEnd = false;
+	for (const line of capture.split(/\r?\n/)) {
+		if (begin.test(line)) return false;
+		if (end.test(line)) hasEnd = true;
+	}
+	return hasEnd;
+}
+
+function stripDecorations(line: string): string {
+	return line.replace(/^[\s>⏺●•\-*]+/, "").trim();
+}
+
+function isWrappedEchoBegin(lines: string[], index: number): boolean {
+	const prev = lines
+		.slice(Math.max(0, index - 2), index)
+		.map(stripDecorations)
+		.join(" ");
+	const next = lines
+		.slice(index + 1, index + 3)
+		.map(stripDecorations)
+		.join(" ");
+	if (/\b(?:the\s+exact\s+|exact\s+)?token$/i.test(prev)) return true;
+	if (/^(?:on\s+the\s+first\b|of\s+your\s+final\s+answer\b)/i.test(next)) return true;
+	return false;
+}
+
+function isWrappedEchoEnd(lines: string[], index: number): boolean {
+	const prev = lines
+		.slice(Math.max(0, index - 2), index)
+		.map(stripDecorations)
+		.join(" ");
+	const next = lines
+		.slice(index + 1, index + 3)
+		.map(stripDecorations)
+		.join(" ");
+	if (/\b(?:final\s+)?answer\s+and$/i.test(prev)) return true;
+	if (/^on\s+the\s+last\b/i.test(next)) return true;
+	return false;
+}
+
 /**
  * Extracts the answer between the anchored marker lines for this request.
  * Exactly one ordered pair with non-empty body qualifies; anything else is
@@ -633,6 +679,7 @@ async function recoverResultFile(
 export function extractMarkedAnswer(
 	capture: string,
 	requestId: string,
+	options?: { rejectWrappedEcho?: boolean },
 ): string | undefined {
 	const id = requestId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 	// Terminal UIs decorate agent output lines (Claude Code prefixes "⏺ ",
@@ -643,14 +690,17 @@ export function extractMarkedAnswer(
 	const begin = new RegExp(`^${prefix}GJC_HERDR_BEGIN_${id}\\s*$`);
 	const end = new RegExp(`^${prefix}GJC_HERDR_END_${id}\\s*$`);
 	const lines = capture.split(/\r?\n/);
+	const rejectEcho = options?.rejectWrappedEcho === true;
 	let beginIndex = -1;
 	let endIndex = -1;
 	for (let index = 0; index < lines.length; index++) {
 		const line = lines[index];
 		if (begin.test(line)) {
+			if (rejectEcho && isWrappedEchoBegin(lines, index)) continue;
 			if (beginIndex !== -1) return undefined;
 			beginIndex = index;
 		} else if (end.test(line)) {
+			if (rejectEcho && isWrappedEchoEnd(lines, index)) continue;
 			if (beginIndex === -1 || endIndex !== -1) return undefined;
 			endIndex = index;
 		}
@@ -660,6 +710,19 @@ export function extractMarkedAnswer(
 	}
 	const body = lines.slice(beginIndex + 1, endIndex);
 	if (!body.some((line) => line.trim())) return undefined;
+	if (rejectEcho) {
+		const strippedLines = body.map(stripDecorations);
+		const joinedBody = strippedLines.join(" ");
+		const compactBody = strippedLines.join("");
+		if (
+			/Answer\s+with\s+the\s+exact\s+token/i.test(joinedBody) ||
+			/on\s+the\s+first\s+line\s+of\s+your\s+final\s+answer/i.test(joinedBody) ||
+			compactBody.includes(`GJC_HERDR_BEGIN_${requestId}`) ||
+			compactBody.includes(`GJC_HERDR_END_${requestId}`)
+		) {
+			return undefined;
+		}
+	}
 	// Strip the UI's uniform body indentation (Claude Code indents answer
 	// lines under the bullet) while preserving relative formatting.
 	const indents = body
@@ -667,6 +730,53 @@ export function extractMarkedAnswer(
 		.map((line) => /^[ \t]*/.exec(line)![0]!);
 	const common = indents.reduce((a, b) => (b.length < a.length ? b : a));
 	return body.map((line) => line.slice(common.length)).join("\n");
+}
+
+function hasRequestEcho(
+	capture: string,
+	requestId: string,
+	hasResultFile: boolean,
+): boolean {
+	const compact = capture
+		.split(/\r?\n/)
+		.map((line) => line.replace(/^[\s>❯⏺●•*]+/, "").trimEnd())
+		.join("");
+	if (compact.includes(`GJC_HERDR_BEGIN_${requestId}`)) return true;
+	if (hasResultFile && compact.includes(requestId)) return true;
+	return false;
+}
+
+/**
+ * After a Herdr `timeout` envelope on `agent prompt --wait`, performs one bounded
+ * `agent read --source recent` to check whether this request's marker instruction
+ * was echoed on the target screen.
+ */
+async function confirmDeliveryAfterTimeout(
+	deps: AgentCallDeps,
+	paneId: string,
+	requestId: string,
+	hasResultFile: boolean,
+	deadline: number,
+	signal?: AbortSignal,
+): Promise<boolean> {
+	const remaining = Math.min(
+		READ_TIMEOUT_MS,
+		deadline - (deps.now?.() ?? performance.now()),
+	);
+	if (Math.floor(remaining) < 1 || signal?.aborted) return false;
+	try {
+		const read = await runHerdr(
+			deps,
+			["agent", "read", paneId, "--source", "recent", "--lines", READ_LINES],
+			remaining,
+			signal,
+			"read",
+		);
+		if (signal?.aborted || read.code !== 0 || !read.stdout.trim()) return false;
+		return hasRequestEcho(read.stdout, requestId, hasResultFile);
+	} catch {
+		return false;
+	}
 }
 
 /** Maps the prompt exit-1 envelope; only codes verified in Herdr 0.9.3 sources get special handling. */
@@ -1177,6 +1287,30 @@ export async function callRegisteredAgent(
 			);
 			if (prompt.code === 2) throw usageFailure(prompt, "agent prompt");
 			if (prompt.code !== 0) {
+				if (prompt.code === 1 && stderrEnvelope(prompt)?.code === "timeout") {
+					const delivered = await confirmDeliveryAfterTimeout(
+						deps,
+						paneId,
+						requestId,
+						rawResultFile !== undefined,
+						deadline,
+						signal,
+					);
+					if (delivered) {
+						return finish({
+							status: "answer_pending",
+							delivery: "submitted",
+							pane: paneId,
+							error: {
+								code: "answer_timeout",
+								message:
+									"Prompt was delivered (this request's marker instruction is on the target screen) but no answer arrived within the call budget; the target may still be answering. Do not resend; check the target or ask it to reply again later.",
+								herdrCode: "timeout",
+								exitCode: prompt.code,
+							},
+						});
+					}
+				}
 				throw promptFailure(prompt, preflight.agentLabel);
 			}
 			const response = record(record(parseJson(prompt.stdout))?.result);
@@ -1365,7 +1499,34 @@ export async function callRegisteredAgent(
 					},
 				});
 			}
-			const answer = extractMarkedAnswer(capture, requestId);
+			let answer = extractMarkedAnswer(capture, requestId);
+			if (answer === undefined && hasEndWithoutBegin(capture, requestId)) {
+				const retryRemaining = deadline - now();
+				const retryBudget = Math.min(READ_TIMEOUT_MS, retryRemaining);
+				if (Math.floor(retryBudget) >= 1 && !signal?.aborted) {
+					try {
+						const retryRead = await runHerdr(
+							deps,
+							["agent", "read", paneId, "--source", "recent", "--lines", READ_LINES],
+							retryBudget,
+							signal,
+							"read",
+						);
+						if (retryRead.code === 0 && retryRead.stdout.trim()) {
+							answer = extractMarkedAnswer(retryRead.stdout, requestId, {
+								rejectWrappedEcho: true,
+							});
+						}
+					} catch (error) {
+						if (
+							signal?.aborted ||
+							(error instanceof CallFailure && error.partial.error.code === "aborted")
+						) {
+							throw error;
+						}
+					}
+				}
+			}
 			if (answer === undefined) {
 				return finish({
 					status: "response_unverified",
@@ -1511,7 +1672,7 @@ export function registerCallFeatures(
 			"Call a Herdr-registered agent (Claude Code, Codex, Copilot, Gemini, ...) in another Herdr pane and get its answer text back. " +
 			"`target` must be an explicit Herdr pane ID or a name that resolves to exactly one agent; the target must be observed idle/done, " +
 			"and Herdr's own known-agent/foreground gate decides finally whether the prompt is sent (zero input on rejection). " +
-			"One prompt with a bounded wait (60s total budget) and one bounded screen read (200 lines); the answer is recovered from " +
+			"One prompt with a bounded wait (60s total budget) and bounded 200-line screen reads (initial unwrapped read, at most one --source recent retry if only the end marker is visible, or one confirmation read after a prompt timeout); the answer is recovered from " +
 			"per-request marker lines, or from `result_file` when a new absolute file path is provided (must not already exist before sending; resilient to long answers and folded/truncated terminal output; the target agent must be able to write to that path, e.g. inside the repository for sandboxed agy). " +
 			"Anything less is returned as an unverified capture instead of a success. " +
 			"No remote approvals, key presses, or retries are ever sent. For GJC targets use the existing herdr_send tool instead.",
