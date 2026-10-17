@@ -258,5 +258,6 @@ GJC는 상시 팀원이 아니며, 플러그인 로드·token 표시·`/herdr-se
 | `팀장 잠금이 다른 세션에 있습니다. 팀장만 검토를 보낼 수 있습니다.` | 잠금을 가지지 않은 세션에서 `scripts/critic-send.sh`를 실행했다(전송하지 않고 rc `1`로 종료). `scripts/team-lead.sh status`가 `mine`인 팀장 세션에서 실행한다 |
 | `multiple workspaces found with label` | 외부 팀장 모드에서 대상 label(`GJCH · gjc-herdr`)을 가진 Herdr 작업공간이 둘 이상이고 기존 팀원 agent로도 작업공간을 하나로 특정할 수 없다. 중복 작업공간 label을 정리하거나 하나만 남긴 뒤 다시 실행한다 |
 | `잠금 파일 읽기 실패` / `잠금 파일 형식 오류` / `잠금 파일 필수 필드 오류` (rc `1`) | 팀장 잠금 파일(`.local/team/lead.json`)이 손상되었거나 필수 필드가 잘못되어 `team-up.sh`와 `critic-send.sh`가 모두 막힌다(fail-closed). 일반 `release`와 세션 재시작으로는 풀리지 않는다. 실제 팀장 세션을 확인한 뒤 **사용자 승인**을 받아 `scripts/team-lead.sh release --force`로 파일을 삭제하고, 팀장 세션에서 `scripts/team-lead.sh claim`과 `scripts/team-lead.sh status`(`mine ...`)를 확인한다 |
+| GJC → agy `/herdr-call`·`--raw`가 막 띄운 agy에서 `target_typing` | `--mode accept-edits`(또는 `auto`·`plan`)로 띄운 빈 agy 입력란의 모드 안내 문구(전경색 `38;2;131;148;150`, 좁은 pane `...` 잘림 포함)가 흐림(SGR 2)이 아니라 입력된 글로 판정된 #47 증상이다. #47 이후는 이 안내 문구를 빈 입력란으로 본다. GJC의 플러그인을 #47 이후 버전으로 다시 설치하고 GJC를 재시작한다 |
 
 더 자세한 사용법은 [README](../README.md)를 참조한다.

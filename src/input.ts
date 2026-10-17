@@ -32,6 +32,14 @@ const RULE = /^[─━]{10,}$/;
 const ANSI = /\x1b\[([0-9;:]*)m/g;
 
 const GJC_PLACEHOLDER = "Type your message...";
+/** Antigravity CLI mode hints rendered in the empty input box (agy 1.4.0 실측, #47). */
+const AGY_MODE_HINTS = [
+	"Accept-edits mode: file edits auto-approved (shift+tab to cycle)",
+	"Auto mode: edits & safe commands auto-approved (shift+tab to cycle)",
+	"Plan mode: research & plan only (shift+tab to cycle)",
+] as const;
+const AGY_MODE_HINT_ROW =
+	/^(?:\x1b\[0m)?\x1b\[38;2;38;139;210m(?:> \x1b\[0m|>\x1b\[0m (?:\x1b\[0m)?)\x1b\[38;2;131;148;150m([^\x1b]+)\x1b\[0m\r?$/;
 
 /** Reads GJC_HERDR_INPUT_WAIT_SEC (0 disables waiting); invalid values fall back to the default. */
 export function inputWaitMs(env: NodeJS.ProcessEnv = process.env): number {
@@ -100,6 +108,19 @@ function claudeBox(lines: string[]): InputState | undefined {
 	return typed ? "typing" : "empty";
 }
 
+function isAgyModeHintRow(line: string): boolean {
+	const match = AGY_MODE_HINT_ROW.exec(line);
+	if (!match) return false;
+	const text = match[1];
+	if ((AGY_MODE_HINTS as readonly string[]).includes(text)) return true;
+	if (!text.endsWith("...")) return false;
+	const prefix = text.slice(0, -3);
+	return (
+		prefix.length > 0 &&
+		AGY_MODE_HINTS.some((hint) => prefix.length < hint.length && hint.startsWith(prefix))
+	);
+}
+
 /** Antigravity CLI (agy): the column-0 `>` row(s) between the last two horizontal rules. */
 function agyBox(lines: string[]): InputState | undefined {
 	const plain = lines.map((line) => strip(line).trim());
@@ -123,6 +144,7 @@ function agyBox(lines: string[]): InputState | undefined {
 		}
 	}
 	if (top < 0 || bottom - top < 2 || !strip(lines[top + 1]).startsWith(">")) return "typing";
+	if (bottom - top === 2 && isAgyModeHintRow(lines[top + 1])) return "empty";
 	const typed = brightText(lines.slice(top + 1, bottom).join("\n"))
 		.replace(/^>/, "")
 		.trim();

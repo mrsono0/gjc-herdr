@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test, { afterEach } from "node:test";
 import {
+	agyShaped,
 	classifyInput,
 	inputWaitMs,
 	readInputState,
@@ -101,6 +102,127 @@ test("`>` between horizontal rules is typing unless kind is agy", () => {
 	assert.equal(classifyInput(agy(`${E}[0m${E}[38;2;38;139;210m>${E}[0m`)), "typing");
 	assert.equal(classifyInput(agy(`${E}[0m${E}[38;2;38;139;210m>   ${E}[0m`)), "typing");
 	assert.equal(classifyInput(agy(`${E}[0m${E}[38;2;38;139;210m>${E}[0m`), "claude"), "typing");
+});
+
+test("Antigravity CLI (agy) mode hints (#47): three modes, space variants, 38-col truncation, typing rejections, and lazy agentKind", async () => {
+	const hints = [
+		"Accept-edits mode: file edits auto-approved (shift+tab to cycle)",
+		"Auto mode: edits & safe commands auto-approved (shift+tab to cycle)",
+		"Plan mode: research & plan only (shift+tab to cycle)",
+	];
+	assert.deepEqual(
+		hints.map((hint) => [
+			classifyInput(agy(`${E}[0m${E}[38;2;38;139;210m>${E}[0m ${E}[0m${E}[38;2;131;148;150m${hint}${E}[0m`), "agy"),
+			classifyInput(agy(`${E}[0m${E}[38;2;38;139;210m> ${E}[0m${E}[38;2;131;148;150m${hint}${E}[0m`), "agy"),
+		]),
+		[
+			["empty", "empty"],
+			["empty", "empty"],
+			["empty", "empty"],
+		],
+	);
+	for (const hint of hints) {
+		const spaceOutside = agy(`${E}[0m${E}[38;2;38;139;210m>${E}[0m ${E}[0m${E}[38;2;131;148;150m${hint}${E}[0m`);
+		const spaceInside = agy(`${E}[0m${E}[38;2;38;139;210m> ${E}[0m${E}[38;2;131;148;150m${hint}${E}[0m`);
+		assert.equal(classifyInput(spaceOutside), "typing");
+		assert.equal(classifyInput(spaceInside, "claude"), "typing");
+		assert.equal(agyShaped(spaceOutside), true);
+		assert.equal(agyShaped(spaceInside), true);
+	}
+
+	// 38-col truncation from narrow-accept-edits-38col.ansi
+	const narrow38 = agy(`${E}[0m${E}[38;2;38;139;210m>${E}[0m ${E}[0m${E}[38;2;131;148;150mAccept-edits mode: file edits...${E}[0m`);
+	assert.equal(classifyInput(narrow38, "agy"), "empty");
+	assert.equal(agyShaped(narrow38), true);
+
+	// Same text without color (typed-same-text.ansi multi-line & single-line)
+	assert.equal(
+		classifyInput(
+			agy(`${E}[0m${E}[38;2;38;139;210m>${E}[0m Accept-edits mode: file edits\n  auto-approved (shift+tab to\n  cycle)`),
+			"agy",
+		),
+		"typing",
+	);
+	assert.equal(
+		classifyInput(
+			agy(`${E}[0m${E}[38;2;38;139;210m>${E}[0m Accept-edits mode: file edits auto-approved (shift+tab to cycle)`),
+			"agy",
+		),
+		"typing",
+	);
+
+	// Typed "abc" (typed-abc.ansi) and erased input (after-erase.ansi)
+	assert.equal(classifyInput(agy(`${E}[0m${E}[38;2;38;139;210m>${E}[0m abc`), "agy"), "typing");
+	assert.equal(classifyInput(agy(`${E}[0m${E}[38;2;38;139;210m>${E}[0m `), "agy"), "empty");
+
+	// Hint color (38;2;131;148;150) with unknown text
+	assert.equal(
+		classifyInput(agy(`${E}[0m${E}[38;2;38;139;210m> ${E}[0m${E}[38;2;131;148;150mAccept-edits mode: hacked${E}[0m`), "agy"),
+		"typing",
+	);
+
+	// Hint followed by extra uncolored text or second line
+	assert.equal(
+		classifyInput(
+			agy(
+				`${E}[0m${E}[38;2;38;139;210m> ${E}[0m${E}[38;2;131;148;150mAccept-edits mode: file edits auto-approved (shift+tab to cycle)${E}[0m extra`,
+			),
+			"agy",
+		),
+		"typing",
+	);
+	assert.equal(
+		classifyInput(
+			agy(
+				`${E}[0m${E}[38;2;38;139;210m> ${E}[0m${E}[38;2;131;148;150mAccept-edits mode: file edits auto-approved (shift+tab to cycle)${E}[0m\n  second line`,
+			),
+			"agy",
+		),
+		"typing",
+	);
+
+	// Truncation with non-matching or empty prefix
+	assert.equal(
+		classifyInput(agy(`${E}[0m${E}[38;2;38;139;210m>${E}[0m ${E}[0m${E}[38;2;131;148;150mAccept-everything...${E}[0m`), "agy"),
+		"typing",
+	);
+	assert.equal(
+		classifyInput(agy(`${E}[0m${E}[38;2;38;139;210m>${E}[0m ${E}[0m${E}[38;2;131;148;150m...${E}[0m`), "agy"),
+		"typing",
+	);
+
+	// Other SGR attributes (e.g. bold ESC[1m) mixed on the hint
+	assert.equal(
+		classifyInput(
+			agy(
+				`${E}[0m${E}[38;2;38;139;210m> ${E}[0m${E}[1m${E}[38;2;131;148;150mAccept-edits mode: file edits auto-approved (shift+tab to cycle)${E}[0m`,
+			),
+			"agy",
+		),
+		"typing",
+	);
+	assert.equal(
+		classifyInput(
+			agy(
+				`${E}[0m${E}[38;2;38;139;210m> ${E}[0m${E}[38;2;131;148;150;1mAccept-edits mode: file edits auto-approved (shift+tab to cycle)${E}[0m`,
+			),
+			"agy",
+		),
+		"typing",
+	);
+
+	// readInputState without kind resolves via lazy agentKind
+	const modeScreen = agy(
+		`${E}[0m${E}[38;2;38;139;210m>${E}[0m ${E}[0m${E}[38;2;131;148;150mAccept-edits mode: file edits auto-approved (shift+tab to cycle)${E}[0m`,
+	);
+	let kindLookups = 0;
+	const r = reader([modeScreen]);
+	r.deps.agentKind = async () => {
+		kindLookups++;
+		return "agy";
+	};
+	assert.equal(await readInputState(r.deps, "w1:p1"), "empty");
+	assert.equal(kindLookups, 1);
 });
 
 test("GJC input box: placeholder, empty, and real text", () => {
