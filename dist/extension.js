@@ -19276,6 +19276,9 @@ var REFRESH_MS = 20000;
 function isMainSession(ctx) {
   return ctx.sessionMetadata?.kind === "main" && ctx.sessionMetadata.taskDepth === 0;
 }
+function isInteractiveMainSession(ctx) {
+  return Boolean(ctx) && ctx.hasUI === true && isMainSession(ctx);
+}
 function displayValue(value) {
   if (value === undefined)
     return;
@@ -19329,6 +19332,12 @@ var MAX_LINES_BELOW_BOX = 3;
 var RULE = /^[\u2500\u2501]{10,}$/;
 var ANSI = /\x1b\[([0-9;:]*)m/g;
 var GJC_PLACEHOLDER = "Type your message...";
+var AGY_MODE_HINTS = [
+  "Accept-edits mode: file edits auto-approved (shift+tab to cycle)",
+  "Auto mode: edits & safe commands auto-approved (shift+tab to cycle)",
+  "Plan mode: research & plan only (shift+tab to cycle)"
+];
+var AGY_MODE_HINT_ROW = /^(?:\x1b\[0m)?\x1b\[38;2;38;139;210m(?:> \x1b\[0m|>\x1b\[0m (?:\x1b\[0m)?)\x1b\[38;2;131;148;150m([^\x1b]+)\x1b\[0m\r?$/;
 function inputWaitMs(env = process.env) {
   const raw = env.GJC_HERDR_INPUT_WAIT_SEC;
   if (raw === undefined || raw.trim() === "")
@@ -19396,6 +19405,18 @@ function claudeBox(lines) {
 `)).replace(/^\s*\u276F/, "").trim();
   return typed ? "typing" : "empty";
 }
+function isAgyModeHintRow(line) {
+  const match = AGY_MODE_HINT_ROW.exec(line);
+  if (!match)
+    return false;
+  const text = match[1];
+  if (AGY_MODE_HINTS.includes(text))
+    return true;
+  if (!text.endsWith("..."))
+    return false;
+  const prefix = text.slice(0, -3);
+  return prefix.length > 0 && AGY_MODE_HINTS.some((hint) => prefix.length < hint.length && hint.startsWith(prefix));
+}
 function agyBox(lines) {
   const plain = lines.map((line) => strip(line).trim());
   const rules = lines.map((line) => RULE.test(strip(line).trimEnd()));
@@ -19420,6 +19441,8 @@ function agyBox(lines) {
   }
   if (top < 0 || bottom - top < 2 || !strip(lines[top + 1]).startsWith(">"))
     return "typing";
+  if (bottom - top === 2 && isAgyModeHintRow(lines[top + 1]))
+    return "empty";
   const typed = brightText(lines.slice(top + 1, bottom).join(`
 `)).replace(/^>/, "").trim();
   return typed ? "typing" : "empty";
@@ -22779,14 +22802,28 @@ function registerMailFeatures(api, overrides) {
   api.registerTool({
     name: "herdr_mail_send",
     label: "Herdr Mail Send",
-    description: "Send a durable file mailbox message to `<git-toplevel>/.gjc-herdr/mailbox/<to>/<id>.md` using exclusive hard-link publication. " + "Requires `GJC_HERDR_MAILBOX` in the sender environment for `from`, and requires `/.gjc-herdr/` to be ignored by Git.",
+    description: "Send a durable file mailbox message to `<git-toplevel>/.gjc-herdr/mailbox/<to>/<id>.md` using exclusive hard-link publication. " + "Requires `GJC_HERDR_MAILBOX` in the sender environment for `from`, and requires `/.gjc-herdr/` to be ignored by Git. " + "Only available in an interactive main GJC session.",
     parameters: z.object({
       to: z.string().describe("Recipient mailbox name (^[a-z][a-z0-9-]{0,31}$)"),
       subject: z.string().describe("Single-line message subject (1\u2013200 UTF-8 bytes)"),
       body: z.string().describe("UTF-8 Markdown message body"),
       reply_to: z.string().optional().describe("Optional ULID of the message being replied to")
     }),
-    async execute(_toolCallId, params, signal) {
+    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+      if (!isInteractiveMainSession(ctx)) {
+        const result = {
+          ok: false,
+          error: {
+            code: "non_interactive_session",
+            message: "herdr_mail_send requires an interactive main GJC session because inherited GJC_HERDR_MAILBOX in non-interactive or subagent sessions may misidentify `from`. Have the parent interactive main GJC session send the mail."
+          }
+        };
+        return {
+          content: [{ type: "text", text: describeMailSendResult(result) }],
+          details: result,
+          isError: true
+        };
+      }
       const result = await sendMail(deps, {
         to: params.to,
         subject: params.subject,
@@ -22825,9 +22862,6 @@ var LOCK_CONFLICT_MANUAL_ACTION = "\uADF8 GJC\uAC00 \uB05D\uB0AC\uB294\uC9C0 \uD
 var SHUTDOWN_TIMEOUT_MANUAL_ACTION = "\uC774\uC804 GJC\uAC00 \uB05D\uB0AC\uB294\uC9C0 \uD655\uC778\uD55C \uB4A4 \uC7A0\uAE08\uB9CC \uC9C0\uC6B0\uACE0 \uB2E4\uC2DC \uC2DC\uC791. \uBA54\uC2DC\uC9C0\xB7attempt\uB294 \uC9C0\uC6B0\uC9C0 \uC54A\uC74C";
 var HOLD_RETRY_NOTICE = "\uB2E4\uC2DC \uC2DC\uC791\uD574\uC57C \uC7AC\uC2DC\uB3C4\uB428";
 var SESSION_ID_RE = /^[A-Za-z0-9-]{1,64}$/;
-function isInteractiveMainSession(ctx) {
-  return Boolean(ctx) && ctx.hasUI === true && isMainSession(ctx);
-}
 function errorMessage4(error) {
   return error instanceof Error ? error.message : String(error);
 }
