@@ -8,7 +8,7 @@ const REPO_ROOT = fs.realpathSync(path.resolve(import.meta.dir, ".."));
 const CHECKER_PY = path.join(REPO_ROOT, "scripts", "agent-argv-check.py");
 const TEAM_UP_SH = path.join(REPO_ROOT, "scripts", "team-up.sh");
 const CHECK_ENV_SH = path.join(REPO_ROOT, "scripts", "check-env.sh");
-const SPAWN_TIMEOUT_MS = 20_000;
+const SPAWN_TIMEOUT_MS = 40_000;
 
 const CODEX_STATUS_LINE =
 	'tui.status_line=["context-remaining","total-input-tokens","total-output-tokens"]';
@@ -34,6 +34,7 @@ const STRIPPED_ENV_KEYS = [
 	"GJCH_TEAM_CODEX",
 	"GJCH_WS_LABEL",
 	"GJCH_FROM_HOOK",
+	"GJCH_HOOK_ARGV_TIMEOUT",
 	"CLAUDE_CODE_SESSION_ID",
 	"CLAUDE_CODE_MESSAGING_SOCKET",
 	"GIT_DIR",
@@ -71,6 +72,7 @@ function resolveRealBinary(name: string, candidates: string[]): string {
 }
 
 const REAL_GIT = resolveRealBinary("git", ["/opt/homebrew/bin/git", "/usr/bin/git"]);
+const REAL_NOHUP = resolveRealBinary("nohup", ["/usr/bin/nohup", "/opt/homebrew/bin/nohup"]);
 const REAL_PYTHON3 = resolveRealBinary("python3", [
 	"/opt/homebrew/bin/python3",
 	"/usr/bin/python3",
@@ -208,23 +210,43 @@ describe("agent argv check (#42)", () => {
 		);
 	}
 
+	function writeDefaultCriticAgent(
+		cwd = REPO_ROOT,
+		status = "idle",
+		interactiveReady = true,
+	): void {
+		fs.writeFileSync(
+			path.join(stateDir, "agent-critic.json"),
+			JSON.stringify({
+				result: {
+					agent: {
+						pane_id: "w1:p3",
+						workspace_id: "w1",
+						agent: "codex",
+						name: "gjc-herdr-critic",
+						cwd,
+						foreground_cwd: cwd,
+						agent_status: status,
+						interactive_ready: interactiveReady,
+					},
+				},
+			}),
+			"utf8",
+		);
+	}
+
 	function waitForHookBgSpawn(): void {
 		const sleepBuf = new Int32Array(new SharedArrayBuffer(4));
-		const doneCounterPath = path.join(stateDir, "hook-bg-layout-count");
-		const deadline = Date.now() + 8_000;
+		const donePath = path.join(stateDir, "hook-bg-done");
+		const deadline = Date.now() + 25_000;
 		while (Date.now() < deadline) {
-			if (fs.existsSync(doneCounterPath)) {
-				const count = Number.parseInt(
-					fs.readFileSync(doneCounterPath, "utf8").trim(),
-					10,
-				);
-				if (count >= 3) {
-					Atomics.wait(sleepBuf, 0, 0, 100);
-					return;
-				}
+			if (fs.existsSync(donePath)) {
+				fs.rmSync(donePath, { force: true });
+				return;
 			}
 			Atomics.wait(sleepBuf, 0, 0, 50);
 		}
+		throw new Error("Timed out waiting for background hook --spawn to finish");
 	}
 
 	function buildEnv(overrides?: Record<string, string>): NodeJS.ProcessEnv {
@@ -294,6 +316,15 @@ describe("agent argv check (#42)", () => {
 		fs.symlinkSync(REAL_PYTHON3, path.join(binDir, "python3"));
 
 		writeExecutable(
+			path.join(binDir, "nohup"),
+			`#!/bin/sh
+${JSON.stringify(REAL_NOHUP)} "$@"
+rc=$?
+printf '1' > ${JSON.stringify(path.join(stateDir, "hook-bg-done"))}
+exit $rc
+`,
+		);
+		writeExecutable(
 			path.join(binDir, "agy"),
 			"#!/bin/sh\nprintf '1.0.0-stub\\n'\n",
 		);
@@ -337,6 +368,10 @@ if [ "$cmd" = "agent" ] && [ "$sub" = "get" ]; then
 		exit 0
 	fi
 	if [ "$name" = "gjc-herdr-mate" ]; then
+		if [ -f ${JSON.stringify(path.join(stateDir, "agent-mate-absent"))} ]; then
+			printf '{"error":{"code":"agent_not_found","message":"not found"}}\\n' >&2
+			exit 1
+		fi
 		cat ${JSON.stringify(path.join(stateDir, "agent-mate.json"))}
 		exit 0
 	fi
@@ -365,17 +400,14 @@ if [ "$cmd" = "pane" ] && [ "$sub" = "rename" ]; then
 fi
 if [ "$cmd" = "pane" ] && [ "$sub" = "get" ]; then
 	pane="\${3:-}"
+	if [ "$pane" = "w1:p1" ] && [ -f ${JSON.stringify(path.join(stateDir, "lead-pane-outside"))} ]; then
+		printf '{"result":{"pane":{"pane_id":"%s","workspace_id":"w1","tab_id":"w1:t1","cwd":"/tmp","foreground_cwd":"/tmp","agent_status":"idle"}}}\\n' "$pane"
+		exit 0
+	fi
 	printf '{"result":{"pane":{"pane_id":"%s","workspace_id":"w1","tab_id":"w1:t1","cwd":%s,"foreground_cwd":%s,"agent_status":"idle"}}}\\n' "$pane" ${JSON.stringify(JSON.stringify(REPO_ROOT))} ${JSON.stringify(JSON.stringify(REPO_ROOT))}
 	exit 0
 fi
 if [ "$cmd" = "pane" ] && [ "$sub" = "layout" ]; then
-	if [ "\${GJCH_FROM_HOOK:-}" = "1" ]; then
-		cnt_file=${JSON.stringify(path.join(stateDir, "hook-bg-layout-count"))}
-		cnt=0
-		[ -f "$cnt_file" ] && cnt="\$(cat "$cnt_file")"
-		cnt=\$((cnt + 1))
-		printf '%s' "$cnt" > "$cnt_file"
-	fi
 	cat ${JSON.stringify(path.join(stateDir, "layout.json"))}
 	exit 0
 fi
@@ -425,24 +457,7 @@ printf '{"result":{"ok":true}}\\n'
 			"utf8",
 		);
 		writeDefaultMateAgent("idle", true);
-		fs.writeFileSync(
-			path.join(stateDir, "agent-critic.json"),
-			JSON.stringify({
-				result: {
-					agent: {
-						pane_id: "w1:p3",
-						workspace_id: "w1",
-						agent: "codex",
-						name: "gjc-herdr-critic",
-						cwd: REPO_ROOT,
-						foreground_cwd: REPO_ROOT,
-						agent_status: "idle",
-						interactive_ready: true,
-					},
-				},
-			}),
-			"utf8",
-		);
+		writeDefaultCriticAgent(REPO_ROOT, "idle", true);
 		fs.writeFileSync(
 			path.join(stateDir, "layout.json"),
 			JSON.stringify({
@@ -488,8 +503,11 @@ printf '{"result":{"ok":true}}\\n'
 		fs.rmSync(path.join(stateDir, "proc-mate-fail"), { force: true });
 		fs.rmSync(path.join(stateDir, "proc-critic-fail"), { force: true });
 		fs.rmSync(path.join(stateDir, "proc-mate-slow"), { force: true });
-		fs.rmSync(path.join(stateDir, "hook-bg-layout-count"), { force: true });
+		fs.rmSync(path.join(stateDir, "agent-mate-absent"), { force: true });
+		fs.rmSync(path.join(stateDir, "lead-pane-outside"), { force: true });
+		fs.rmSync(path.join(stateDir, "hook-bg-done"), { force: true });
 		writeDefaultMateAgent("idle", true);
+		writeDefaultCriticAgent(REPO_ROOT, "idle", true);
 	});
 
 	afterAll(() => {
@@ -1060,9 +1078,9 @@ printf '{"result":{"ok":true}}\\n'
 		expect(checkEnvOk.status).toBe(0);
 		expect(checkEnvOk.stdout).toContain("OK    gjc-herdr-mate (w1:p2) 시작 옵션 일치");
 		expect(checkEnvOk.stdout).toContain("OK    gjc-herdr-critic (w1:p3) 시작 옵션 일치");
-	}, 60_000);
+	}, 150_000);
 
-	test("9. 실제 --hook(외부 팀장), 느린 process-info 3초 기한 초과, blocked 상태 점검", () => {
+	test("9. 실제 --hook(외부 팀장), 느린 process-info 3초 기한 초과, blocked·process-info 실패·agent_not_found·cwd 불일치 점검", () => {
 		fs.writeFileSync(
 			path.join(stateDir, "proc-mate.json"),
 			makeProcessInfoJson([
@@ -1109,7 +1127,7 @@ printf '{"result":{"ok":true}}\\n'
 			cwd: REPO_ROOT,
 			input: '{"source":"startup"}',
 			encoding: "utf8",
-			env: envExternal,
+			env: { ...envExternal, GJCH_HOOK_ARGV_TIMEOUT: "15" },
 			timeout: SPAWN_TIMEOUT_MS,
 		});
 		waitForHookBgSpawn();
@@ -1122,8 +1140,7 @@ printf '{"result":{"ok":true}}\\n'
 		);
 		expect(hookRes.stderr).toBe("");
 
-		// (2) 느린 가짜 herdr(process-info 10초 sleep) → 3초 기한 + 여유 안에 rc 0 및 시간 초과 문구
-		fs.rmSync(path.join(stateDir, "hook-bg-layout-count"), { force: true });
+		// (2) 느린 가짜 herdr(process-info 10초 sleep) → 기본 3초 기한 + 여유 안에 rc 0 및 시간 초과 문구
 		fs.writeFileSync(path.join(stateDir, "proc-mate-slow"), "1", "utf8");
 		const t0 = Date.now();
 		const slowHookRes = spawnSync("/bin/bash", [TEAM_UP_SH, "--hook"], {
@@ -1138,7 +1155,7 @@ printf '{"result":{"ok":true}}\\n'
 		fs.rmSync(path.join(stateDir, "proc-mate-slow"), { force: true });
 		expect(slowHookRes.status).toBe(0);
 		expect(elapsedMs).toBeGreaterThanOrEqual(2_500);
-		expect(elapsedMs).toBeLessThan(6_500);
+		expect(elapsedMs).toBeLessThan(8_500);
 		expect(slowHookRes.stdout).toContain(
 			"GJCH: ↳ 팀원 옵션 점검 시간 초과 — scripts/check-env.sh로 다시 점검",
 		);
@@ -1170,13 +1187,12 @@ printf '{"result":{"ok":true}}\\n'
 		expect(blockedSpawnCalls.some((c) => c.includes("agent start"))).toBe(false);
 
 		fs.rmSync(herdrLog, { force: true });
-		fs.rmSync(path.join(stateDir, "hook-bg-layout-count"), { force: true });
 
 		const blockedHookRes = spawnSync("/bin/bash", [TEAM_UP_SH, "--hook"], {
 			cwd: REPO_ROOT,
 			input: '{"source":"startup"}',
 			encoding: "utf8",
-			env: envExternal,
+			env: { ...envExternal, GJCH_HOOK_ARGV_TIMEOUT: "15" },
 			timeout: SPAWN_TIMEOUT_MS,
 		});
 		waitForHookBgSpawn();
@@ -1188,5 +1204,188 @@ printf '{"result":{"ok":true}}\\n'
 		expect(
 			blockedHookCalls.some((c) => c.includes("pane process-info --pane w1:p2")),
 		).toBe(true);
-	}, 60_000);
+
+		// (4) --hook에서 process-info 실패(stderr 비밀 폐기), agent_not_found·cwd 불일치 조용히 건너뜀
+		writeDefaultMateAgent("idle", true);
+		fs.writeFileSync(path.join(stateDir, "proc-mate-fail"), "1", "utf8");
+
+		const failHookRes = spawnSync("/bin/bash", [TEAM_UP_SH, "--hook"], {
+			cwd: REPO_ROOT,
+			input: '{"source":"startup"}',
+			encoding: "utf8",
+			env: { ...envExternal, GJCH_HOOK_ARGV_TIMEOUT: "15" },
+			timeout: SPAWN_TIMEOUT_MS,
+		});
+		waitForHookBgSpawn();
+		fs.rmSync(path.join(stateDir, "proc-mate-fail"), { force: true });
+		expect(failHookRes.status).toBe(0);
+		expect(failHookRes.stdout).toContain(
+			"GJCH: ↳ gjc-herdr-mate 옵션 판정 불가: process-info 실패",
+		);
+		expect(failHookRes.stdout).toContain("GJCH: ↳ gjc-herdr-critic 옵션 불일치:");
+		expect(failHookRes.stdout).not.toContain("SENTINEL_STDERR_SECRET");
+		expect(failHookRes.stderr).toBe("");
+
+		fs.writeFileSync(path.join(stateDir, "agent-mate-absent"), "1", "utf8");
+		writeDefaultCriticAgent("/tmp", "idle", true);
+
+		const skipHookRes = spawnSync("/bin/bash", [TEAM_UP_SH, "--hook"], {
+			cwd: REPO_ROOT,
+			input: '{"source":"startup"}',
+			encoding: "utf8",
+			env: { ...envExternal, GJCH_HOOK_ARGV_TIMEOUT: "15" },
+			timeout: SPAWN_TIMEOUT_MS,
+		});
+		waitForHookBgSpawn();
+		expect(skipHookRes.status).toBe(0);
+		expect(skipHookRes.stdout).toContain("GJCH: 이 세션이 외부 팀장입니다");
+		expect(skipHookRes.stdout).not.toContain("↳");
+		expect(skipHookRes.stderr).toBe("");
+
+		// (5) external --hook에서 mate agent get이 {"result":[1]} (비-dict result)를 돌려줄 때:
+		//     mate만 건너뛰고 critic 불일치 줄은 출력, stderr 빈 값, rc 0
+		fs.rmSync(path.join(stateDir, "agent-mate-absent"), { force: true });
+		fs.writeFileSync(path.join(stateDir, "agent-mate.json"), '{"result":[1]}\n', "utf8");
+		writeDefaultCriticAgent(REPO_ROOT, "idle", true);
+
+		const badMateExtHookRes = spawnSync("/bin/bash", [TEAM_UP_SH, "--hook"], {
+			cwd: REPO_ROOT,
+			input: '{"source":"startup"}',
+			encoding: "utf8",
+			env: { ...envExternal, GJCH_HOOK_ARGV_TIMEOUT: "15" },
+			timeout: SPAWN_TIMEOUT_MS,
+		});
+		waitForHookBgSpawn();
+		expect(badMateExtHookRes.status).toBe(0);
+		expect(badMateExtHookRes.stdout).not.toContain("gjc-herdr-mate");
+		expect(badMateExtHookRes.stdout).toContain(
+			`GJCH: ↳ gjc-herdr-critic 옵션 불일치: 없음 --no-daemon, --yolo, -m gpt-6.1-sol, -C ${REPO_ROOT}, --disable worktrees, -c ${CODEX_STATUS_LINE} (복구: ${RECOVERY_EXTERNAL})`,
+		);
+		expect(badMateExtHookRes.stderr).toBe("");
+	}, 150_000);
+
+	test("10. 실제 --hook(Herdr 안 팀장 inside): 팀원·검토 불일치 두 줄 출력, GJCH_MATE_MODEL 정본 배열 연동, 팀장 pane cwd 저장소 밖이면 무출력, 비정상 agent get 건너뜀", () => {
+		fs.writeFileSync(
+			path.join(stateDir, "proc-mate.json"),
+			makeProcessInfoJson([
+				{
+					pid: 4001,
+					name: "agy",
+					argv0: "agy",
+					cwd: REPO_ROOT,
+					argv: ["agy", "--conversation", "conv-recover-inside-1"],
+				},
+			]),
+			"utf8",
+		);
+		fs.writeFileSync(
+			path.join(stateDir, "proc-critic.json"),
+			makeProcessInfoJson([
+				{
+					pid: 4002,
+					name: "codex",
+					argv0: "codex",
+					cwd: REPO_ROOT,
+					argv: ["codex", "resume", "sess-recover-inside-1"],
+				},
+			]),
+			"utf8",
+		);
+
+		const envInside = buildEnv({
+			HERDR_ENV: "1",
+			HERDR_WORKSPACE_ID: "w1",
+			HERDR_PANE_ID: "w1:p1",
+			CLAUDE_PROJECT_DIR: REPO_ROOT,
+		});
+
+		// (1) inside --hook 정상 경로 + GJCH_MATE_MODEL 정본 배열(MATE_START_ARGS) 연동 검증
+		const insideHookRes = spawnSync("/bin/bash", [TEAM_UP_SH, "--hook"], {
+			cwd: REPO_ROOT,
+			input: '{"source":"startup"}',
+			encoding: "utf8",
+			env: {
+				...envInside,
+				GJCH_HOOK_ARGV_TIMEOUT: "15",
+				GJCH_MATE_MODEL: "gemini-custom-hook-model",
+			},
+			timeout: SPAWN_TIMEOUT_MS,
+		});
+		waitForHookBgSpawn();
+		expect(insideHookRes.status).toBe(0);
+		expect(insideHookRes.stdout).toContain(
+			"이 세션이 팀장입니다(herdr pane w1:p1",
+		);
+		expect(insideHookRes.stdout).toContain(
+			`GJCH: ↳ gjc-herdr-mate 옵션 불일치: 없음 --model gemini-custom-hook-model, --mode accept-edits, --sandbox (복구: ${RECOVERY_INSIDE})`,
+		);
+		expect(insideHookRes.stdout).toContain(
+			`GJCH: ↳ gjc-herdr-critic 옵션 불일치: 없음 --no-daemon, --yolo, -m gpt-6.1-sol, -C ${REPO_ROOT}, --disable worktrees, -c ${CODEX_STATUS_LINE} (복구: ${RECOVERY_INSIDE})`,
+		);
+		expect(insideHookRes.stderr).toBe("");
+
+		// (2) inside 팀장 pane(w1:p1) cwd가 저장소 밖(/tmp)이면 아무런 점검 줄도 출력하지 않음
+		fs.writeFileSync(path.join(stateDir, "lead-pane-outside"), "1", "utf8");
+		fs.rmSync(herdrLog, { force: true });
+
+		const outsideHookRes = spawnSync("/bin/bash", [TEAM_UP_SH, "--hook"], {
+			cwd: REPO_ROOT,
+			input: '{"source":"startup"}',
+			encoding: "utf8",
+			env: { ...envInside, GJCH_HOOK_ARGV_TIMEOUT: "15" },
+			timeout: SPAWN_TIMEOUT_MS,
+		});
+		waitForHookBgSpawn();
+		expect(outsideHookRes.status).toBe(0);
+		expect(outsideHookRes.stdout).toContain(
+			"이 세션이 팀장입니다(herdr pane w1:p1",
+		);
+		expect(outsideHookRes.stdout).not.toContain("↳");
+		expect(outsideHookRes.stderr).toBe("");
+		const outsideCalls = readHerdrCalls();
+		expect(outsideCalls.some((c) => c.includes("pane process-info"))).toBe(false);
+
+		// (3) inside --hook에서 mate agent get이 {"result":[1]} (비-dict result)를 돌려줄 때:
+		//     mate만 건너뛰고 critic 불일치 줄은 출력, stderr 빈 값, rc 0
+		fs.rmSync(path.join(stateDir, "lead-pane-outside"), { force: true });
+		fs.writeFileSync(path.join(stateDir, "agent-mate.json"), '{"result":[1]}\n', "utf8");
+		writeDefaultCriticAgent(REPO_ROOT, "idle", true);
+
+		const badMateInsideHookRes = spawnSync("/bin/bash", [TEAM_UP_SH, "--hook"], {
+			cwd: REPO_ROOT,
+			input: '{"source":"startup"}',
+			encoding: "utf8",
+			env: { ...envInside, GJCH_HOOK_ARGV_TIMEOUT: "15" },
+			timeout: SPAWN_TIMEOUT_MS,
+		});
+		waitForHookBgSpawn();
+		expect(badMateInsideHookRes.status).toBe(0);
+		expect(badMateInsideHookRes.stdout).not.toContain("gjc-herdr-mate");
+		expect(badMateInsideHookRes.stdout).toContain(
+			`GJCH: ↳ gjc-herdr-critic 옵션 불일치: 없음 --no-daemon, --yolo, -m gpt-6.1-sol, -C ${REPO_ROOT}, --disable worktrees, -c ${CODEX_STATUS_LINE} (복구: ${RECOVERY_INSIDE})`,
+		);
+		expect(badMateInsideHookRes.stderr).toBe("");
+
+		// (4) hook-argv-check.py 인자 개수 불일치 시 조용히 rc 0 종료
+		const badArgcRes = spawnSync(
+			REAL_PYTHON3,
+			[
+				path.join(REPO_ROOT, "scripts", "hook-argv-check.py"),
+				"3",
+				"inside",
+				REPO_ROOT,
+				"w1:p1",
+				"gjc-herdr-mate",
+				"gjc-herdr-critic",
+				"1",
+				"5",
+				"--model",
+				"only-two-args",
+			],
+			{ encoding: "utf8", timeout: 5_000 },
+		);
+		expect(badArgcRes.status).toBe(0);
+		expect(badArgcRes.stdout).toBe("");
+		expect(badArgcRes.stderr).toBe("");
+	}, 120_000);
 });

@@ -126,56 +126,51 @@ def basename_of(raw_name: str) -> str:
 	return stripped
 
 
-def main() -> int:
-	process_info_failed, status, kind, name, recovery, expected_units = parse_cli(
-		sys.argv[1:]
-	)
-
+def evaluate_process_info(
+	raw_stdin: str,
+	*,
+	process_info_failed: bool,
+	status: str,
+	kind: str,
+	name: str,
+	recovery: str,
+	expected_units: List[Unit],
+) -> Optional[str]:
 	if process_info_failed:
-		print(format_unknown(name, "process-info 실패", status))
-		return 1
+		return format_unknown(name, "process-info 실패", status)
 
-	raw_stdin = sys.stdin.read()
 	try:
 		doc = json.loads(raw_stdin)
 	except Exception:
-		print(format_unknown(name, "JSON 오류", status))
-		return 1
+		return format_unknown(name, "JSON 오류", status)
 
 	if not isinstance(doc, dict):
-		print(format_unknown(name, "JSON 오류", status))
-		return 1
+		return format_unknown(name, "JSON 오류", status)
 
 	result_obj = doc.get("result")
 	if not isinstance(result_obj, dict):
-		print(format_unknown(name, "JSON 오류", status))
-		return 1
+		return format_unknown(name, "JSON 오류", status)
 
 	proc_info = result_obj.get("process_info")
 	if not isinstance(proc_info, dict):
-		print(format_unknown(name, "JSON 오류", status))
-		return 1
+		return format_unknown(name, "JSON 오류", status)
 
 	fg_procs = proc_info.get("foreground_processes")
 	if not isinstance(fg_procs, list):
-		print(format_unknown(name, "JSON 오류", status))
-		return 1
+		return format_unknown(name, "JSON 오류", status)
 
 	matched_procs = []
 	for entry in fg_procs:
 		if not isinstance(entry, dict):
-			print(format_unknown(name, "JSON 오류", status))
-			return 1
+			return format_unknown(name, "JSON 오류", status)
 		proc_name = entry.get("name")
 		if isinstance(proc_name, str) and proc_name and basename_of(proc_name) == kind:
 			matched_procs.append(entry)
 
 	if len(matched_procs) == 0:
-		print(format_unknown(name, "agent 프로세스 0개", status))
-		return 1
+		return format_unknown(name, "agent 프로세스 0개", status)
 	if len(matched_procs) >= 2:
-		print(format_unknown(name, "agent 프로세스 2개 이상", status))
-		return 1
+		return format_unknown(name, "agent 프로세스 2개 이상", status)
 
 	target_proc = matched_procs[0]
 	raw_argv = target_proc.get("argv")
@@ -184,8 +179,7 @@ def main() -> int:
 		or len(raw_argv) == 0
 		or any(not isinstance(tok, str) for tok in raw_argv)
 	):
-		print(format_unknown(name, "argv 없음", status))
-		return 1
+		return format_unknown(name, "argv 없음", status)
 
 	actual_units = group_argv_units(raw_argv[1:])
 
@@ -203,7 +197,7 @@ def main() -> int:
 			different.append(f"{exp_flag}(기대 {exp_val})")
 
 	if not missing and not different:
-		return 0
+		return None
 
 	parts: List[str] = []
 	if missing:
@@ -212,9 +206,29 @@ def main() -> int:
 		parts.append("다름 " + ", ".join(different))
 
 	detail = "; ".join(parts)
-	print(f"↳ {name} 옵션 불일치: {detail} (복구: {recovery})")
+	return f"↳ {name} 옵션 불일치: {detail} (복구: {recovery})"
+
+
+def main() -> int:
+	process_info_failed, status, kind, name, recovery, expected_units = parse_cli(
+		sys.argv[1:]
+	)
+	raw_stdin = "" if process_info_failed else sys.stdin.read()
+	msg = evaluate_process_info(
+		raw_stdin,
+		process_info_failed=process_info_failed,
+		status=status,
+		kind=kind,
+		name=name,
+		recovery=recovery,
+		expected_units=expected_units,
+	)
+	if msg is None:
+		return 0
+	print(msg)
 	return 1
 
 
 if __name__ == "__main__":
 	sys.exit(main())
+

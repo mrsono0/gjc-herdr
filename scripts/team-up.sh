@@ -127,45 +127,11 @@ realpath() { python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$
 
 codex_enabled() { [ "${GJCH_TEAM_CODEX:-1}" != 0 ] && command -v codex >/dev/null; }
 
-HOOK_ARGV_TIMEOUT=3
-hook_deadline=""
-
-# hook 전용: 공통 기한(hook_deadline) 안에서 herdr를 실행한다.
-# 첫 인자가 --combined이면 stderr도 stdout으로 합치고(agent get용), 아니면 stdout만 돌려준다.
-# 기한 초과 시 124를 반환한다.
-hook_herdr() {
-	local mode=stdout
-	if [ "${1:-}" = "--combined" ]; then
-		mode=combined
-		shift
-	fi
-	python3 -c 'import os,signal,subprocess,sys,time
-mode,deadline=sys.argv[1],float(sys.argv[2])
-rem=deadline-time.monotonic()
-if rem<=0: sys.exit(124)
-err=subprocess.STDOUT if mode=="combined" else subprocess.DEVNULL
-try:
-    p=subprocess.Popen(["herdr"]+sys.argv[3:],stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=err,text=True,start_new_session=True)
-except Exception:
-    sys.exit(1)
-try:
-    out,_=p.communicate(timeout=rem)
-except subprocess.TimeoutExpired:
-    try: os.killpg(p.pid,signal.SIGKILL)
-    except Exception: p.kill()
-    try: p.communicate(timeout=0.2)
-    except Exception: pass
-    sys.exit(124)
-if out: sys.stdout.write(out)
-sys.exit(p.returncode)' "$mode" "$hook_deadline" "$@"
-}
-
-hook_timeout_msg() {
-	echo "GJCH: ↳ 팀원 옵션 점검 시간 초과 — scripts/check-env.sh로 다시 점검"
-}
+# 시험용: GJCH_HOOK_ARGV_TIMEOUT(hook-argv-check.py에서 양의 유한 숫자·상한 30초 검증, 아니면 기본 3초)
+HOOK_ARGV_TIMEOUT="${GJCH_HOOK_ARGV_TIMEOUT:-3}"
 
 # 기존 팀원·검토 pane의 foreground argv를 기대 시작 옵션과 비교한다(#42).
-# 일치하면 무출력·rc 0, 불일치·판정 불가는 한 줄 출력 후 rc 1(hook 문맥은 stdout에 GJCH: 접두사를 쓰고 rc 0, 시간 초과는 rc 124).
+# 일치하면 무출력·rc 0, 불일치·판정 불가는 한 줄 출력 후 rc 1(GJCH_FROM_HOOK=1 문맥은 stdout에 GJCH: 접두사를 쓰고 rc 0).
 check_member_argv() { # name pane kind [status]
 	local name="$1" pane="$2" kind="$3" status="${4:-idle}" recovery info_out info_rc=0 msg
 	[ -n "$status" ] || status=idle
@@ -180,12 +146,7 @@ check_member_argv() { # name pane kind [status]
 		codex) expected=("${CRITIC_START_ARGS[@]}") ;;
 		*) return 1 ;;
 	esac
-	if [ "${in_hook_check:-0}" = 1 ]; then
-		info_out="$(hook_herdr pane process-info --pane "$pane")" || info_rc=$?
-		[ "$info_rc" = 124 ] && return 124
-	else
-		info_out="$(herdr pane process-info --pane "$pane" 2>/dev/null)" || info_rc=$?
-	fi
+	info_out="$(herdr pane process-info --pane "$pane" 2>/dev/null)" || info_rc=$?
 	if [ "$info_rc" = 0 ]; then
 		msg="$(printf '%s' "$info_out" | python3 "$ROOT/scripts/agent-argv-check.py" --status "$status" "$kind" "$name" "$recovery" -- "${expected[@]}")" && return 0
 	else
@@ -215,15 +176,10 @@ if sys.argv[1]=="0":
 elif ((d.get("error") or {}).get("code"))!="agent_not_found": sys.exit(1)' "$rc"
 }
 
-# agent 이름 → "<pane_id>|<agent_status>". agent_not_found면 빈 값(rc 0), 조회·파싱 실패면 rc 1(hook 시간 초과는 124).
+# agent 이름 → "<pane_id>|<agent_status>". agent_not_found면 빈 값(rc 0), 조회·파싱 실패면 rc 1.
 agent_pane_status() { # name
 	local out rc=0
-	if [ "${in_hook_check:-0}" = 1 ]; then
-		out="$(hook_herdr --combined agent get "$1")" || rc=$?
-		[ "$rc" = 124 ] && return 124
-	else
-		out="$(herdr agent get "$1" 2>&1)" || rc=$?
-	fi
+	out="$(herdr agent get "$1" 2>&1)" || rc=$?
 	printf '%s' "$out" | python3 -c 'import sys,json
 try: d=json.load(sys.stdin)
 except Exception: sys.exit(1)
@@ -343,15 +299,10 @@ move_via_temp_tab() { # pane tab target split ratio
 }
 
 # 외부 팀장용 기존 agent 검증(이름 → "<workspace_id>|<pane_id>|<state>").
-# agent_not_found로 확인되면 빈 값(rc 0), 조회·파싱 실패나 agent 종류·cwd 불일치면 stderr에 이유를 쓰고 rc 1(hook 시간 초과는 124).
+# agent_not_found로 확인되면 빈 값(rc 0), 조회·파싱 실패나 agent 종류·cwd 불일치면 stderr에 이유를 쓰고 rc 1.
 ext_agent_info() { # name expected_kind cwd_mode(inside|exact)
-	local name="$1" expected_kind="$2" cwd_mode="$3" out rc=0 parsed tag rest pane_out pane_rc=0
-	if [ "${in_hook_check:-0}" = 1 ]; then
-		out="$(hook_herdr --combined agent get "$name")" || rc=$?
-		[ "$rc" = 124 ] && return 124
-	else
-		out="$(herdr agent get "$name" 2>&1)" || rc=$?
-	fi
+	local name="$1" expected_kind="$2" cwd_mode="$3" out rc=0 parsed tag rest pane_out
+	out="$(herdr agent get "$name" 2>&1)" || rc=$?
 	parsed="$(printf '%s' "$out" | python3 -c 'import sys,json
 rc=sys.argv[1]
 try: d=json.load(sys.stdin)
@@ -386,13 +337,7 @@ p,w,k,c=parts[1],parts[2],parts[3],parts[4]
 print("need" if (not w or not k or not c) else "ok")')"
 	if [ "$tag" = need ]; then
 		rest="${parsed#*$'\t'}"
-		if [ "${in_hook_check:-0}" = 1 ]; then
-			pane_out="$(hook_herdr pane get "${rest%%$'\t'*}")" || pane_rc=$?
-			[ "$pane_rc" = 124 ] && return 124
-			[ "$pane_rc" = 0 ] || pane_out=""
-		else
-			pane_out="$(herdr pane get "${rest%%$'\t'*}" 2>/dev/null)" || pane_out=""
-		fi
+		pane_out="$(herdr pane get "${rest%%$'\t'*}" 2>/dev/null)" || pane_out=""
 	fi
 	printf '%s' "$parsed" | python3 -c 'import os,sys,json
 name,expected_kind,cwd_mode,root,pane_raw=sys.argv[1:6]
@@ -427,63 +372,22 @@ else:
 print("%s|%s|%s" % (w, p, st))' "$name" "$expected_kind" "$cwd_mode" "$ROOT" "$pane_out"
 }
 
-# SessionStart(startup) hook에서 기존 팀원·검토가 이미 떠 있으면 상태와 상관없이 argv를 동기로 점검해 stdout(GJCH: 접두사)에 알린다(#42).
+# SessionStart(startup) hook에서 기존 팀원·검토가 이미 떠 있으면 상태와 상관없이 argv를 동기로 점검해 stdout(GJCH: 접두사)에 알린다(#42, #58).
 hook_check_existing_argv() {
-	local in_hook_check=1 pane_out pane_rc=0 pane_cwd mate_ps mate_rc=0 critic_ps critic_rc=0 mate_info ext_rest mate_pane mate_state critic_info critic_pane critic_state chk_rc=0
-	hook_deadline="$(python3 -c 'import sys,time; print("%.6f" % (time.monotonic()+float(sys.argv[1])))' "$HOOK_ARGV_TIMEOUT")" || return 0
-	if [ "$lead_mode" = inside ]; then
-		pane_out="$(hook_herdr pane get "$HERDR_PANE_ID")" || pane_rc=$?
-		if [ "$pane_rc" = 124 ]; then hook_timeout_msg; return 0; fi
-		[ "$pane_rc" = 0 ] || return 0
-		pane_cwd="$(printf '%s' "$pane_out" | jget result.pane.cwd)" || pane_cwd=""
-		if [ -n "$pane_cwd" ]; then
-			pane_cwd="$(realpath "$pane_cwd")" || return 0
-		fi
-		case "$pane_cwd/" in "$ROOT"/*) ;; *) return 0 ;; esac
-		mate_ps="$(agent_pane_status "$MATE_NAME" 2>/dev/null)" || mate_rc=$?
-		if [ "$mate_rc" = 124 ]; then hook_timeout_msg; return 0; fi
-		if [ "$mate_rc" = 0 ] && [ -n "$mate_ps" ]; then
-			chk_rc=0
-			check_member_argv "$MATE_NAME" "${mate_ps%%|*}" agy "${mate_ps#*|}" || chk_rc=$?
-			if [ "$chk_rc" = 124 ]; then hook_timeout_msg; return 0; fi
-		fi
-		if codex_enabled; then
-			critic_ps="$(agent_pane_status "$CRITIC_NAME" 2>/dev/null)" || critic_rc=$?
-			if [ "$critic_rc" = 124 ]; then hook_timeout_msg; return 0; fi
-			if [ "$critic_rc" = 0 ] && [ -n "$critic_ps" ]; then
-				chk_rc=0
-				check_member_argv "$CRITIC_NAME" "${critic_ps%%|*}" codex "${critic_ps#*|}" || chk_rc=$?
-				if [ "$chk_rc" = 124 ]; then hook_timeout_msg; return 0; fi
-			fi
-		fi
-	else
-		mate_info="$(ext_agent_info "$MATE_NAME" agy inside 2>/dev/null)" || mate_rc=$?
-		if [ "$mate_rc" = 124 ]; then hook_timeout_msg; return 0; fi
-		if [ "$mate_rc" = 0 ] && [ -n "$mate_info" ]; then
-			ext_rest="${mate_info#*|}"
-			mate_pane="${ext_rest%%|*}"
-			mate_state="${ext_rest#*|}"
-			if [ -n "$mate_pane" ]; then
-				chk_rc=0
-				check_member_argv "$MATE_NAME" "$mate_pane" agy "${mate_state##*|}" || chk_rc=$?
-				if [ "$chk_rc" = 124 ]; then hook_timeout_msg; return 0; fi
-			fi
-		fi
-		if codex_enabled; then
-			critic_info="$(ext_agent_info "$CRITIC_NAME" codex exact 2>/dev/null)" || critic_rc=$?
-			if [ "$critic_rc" = 124 ]; then hook_timeout_msg; return 0; fi
-			if [ "$critic_rc" = 0 ] && [ -n "$critic_info" ]; then
-				ext_rest="${critic_info#*|}"
-				critic_pane="${ext_rest%%|*}"
-				critic_state="${ext_rest#*|}"
-				if [ -n "$critic_pane" ]; then
-					chk_rc=0
-					check_member_argv "$CRITIC_NAME" "$critic_pane" codex "${critic_state##*|}" || chk_rc=$?
-					if [ "$chk_rc" = 124 ]; then hook_timeout_msg; return 0; fi
-				fi
-			fi
-		fi
-	fi
+	local codex_on=0
+	codex_enabled && codex_on=1
+	python3 "$ROOT/scripts/hook-argv-check.py" \
+		"$HOOK_ARGV_TIMEOUT" \
+		"$lead_mode" \
+		"$ROOT" \
+		"${HERDR_PANE_ID:-}" \
+		"$MATE_NAME" \
+		"$CRITIC_NAME" \
+		"$codex_on" \
+		"${#MATE_START_ARGS[@]}" \
+		"${MATE_START_ARGS[@]}" \
+		"${#CRITIC_START_ARGS[@]}" \
+		"${CRITIC_START_ARGS[@]}" || true
 }
 
 if [ "$mode" = "--hook" ]; then
