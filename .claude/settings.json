@@ -11,5 +11,31 @@
         ]
       }
     ]
+  },
+  "permissions": {
+    "ask": [
+      "Bash(git push *)",
+      "Bash(git tag *)",
+      "Bash(npm publish *)",
+      "Bash(npm install -g *)",
+      "Bash(bun add -g *)",
+      "Bash(npm i -g *)",
+      "Bash(npm install --global *)",
+      "Bash(npm i --global *)",
+      "Bash(npm install * -g)",
+      "Bash(npm i * -g)",
+      "Bash(npm install * --global)",
+      "Bash(bun install -g *)",
+      "Bash(bun i -g *)",
+      "Bash(bun add --global *)",
+      "Bash(bun add * -g)",
+      "Bash(bun install --global *)",
+      "Bash(gjc plugin install *)",
+      "Edit(~/.config/herdr/**)",
+      "Edit(~/.gjc/**)",
+      "Edit(~/.claude/settings.json)",
+      "Edit(~/.codex/**)",
+      "Edit(~/.gemini/**)"
+    ]
   }
 }

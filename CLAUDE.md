@@ -1,4 +1,6 @@
 # gjc-herdr — Claude Code 시작 안내
+@AGENTS.md
+위 가져오기로 공동 규칙(AGENTS.md)이 매 세션·압축 뒤에 함께 실린다. agy·Codex도 같은 AGENTS.md를 읽는다.
 
 GJC용 Herdr 연동 플러그인 저장소이며, Herdr 안에서 Claude Code(팀장)와 agy(구현 팀원), 선택 Codex(검토 팀원)가 함께 개발하는 환경이 `.claude/settings.json` hook으로 자동 구성된다.
 
