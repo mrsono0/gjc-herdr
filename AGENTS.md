@@ -57,7 +57,7 @@
 
 | 역할 | 에이전트 | 이름·label | 책임 |
 |---|---|---|---|
-| 팀장 | Claude Code | 팀장 잠금 보유자(herdr 안 `gjc-herdr-lead`, pane label `GJCH 팀장 · Claude` 또는 herdr 밖 외부 팀장) | 사용자와 직접 대화, 목표·승인 경계 유지, 작업 분해·배정, 결과 검증과 통합, 문서·이 파일, 승인이 필요한 commit/push/설치의 요청 |
+| 팀장 | Claude Code | 팀장 잠금 보유자(herdr 안 `gjc-herdr-lead`, pane label `GJCH 팀장` 또는 herdr 밖 외부 팀장) | 사용자와 직접 대화, 목표·승인 경계 유지, 작업 분해·배정, 결과 검증과 통합, 문서·이 파일, 승인이 필요한 commit/push/설치의 요청 |
 | 부팀장(선택, 이관 때만) | Claude Code | agent `gjc-herdr-deputy`, pane label `GJCH 부팀장 · Claude` | 관찰, 조회, 팀장 지원(세션 간 메시지). 팀원 배정과 입력, 팀 구성과 배치는 하지 않는다 |
 | 구현 팀원 | agy (Antigravity CLI) | agent `gjc-herdr-mate`, pane label `GJCH 팀원 · agy` | 배정된 파일의 조사·구현·집중 검증, 결과 파일과 근거 보고 |
 | 검토·조사 팀원(선택) | Codex | agent `gjc-herdr-critic`, pane label `GJCH 검토·조사 · Codex` | 독립 검토·조사·근거 확인, 지시서가 지정한 결과 파일 작성(위 제1원칙) |
