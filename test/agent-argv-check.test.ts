@@ -31,6 +31,7 @@ const STRIPPED_ENV_KEYS = [
 	"GJCH_CRITIC_NAME",
 	"GJCH_MATE_MODEL",
 	"GJCH_CODEX_MODEL",
+	"GJCH_CODEX_DOC_MAX_BYTES",
 	"GJCH_TEAM_CODEX",
 	"GJCH_WS_LABEL",
 	"GJCH_FROM_HOOK",
@@ -96,6 +97,7 @@ const CODEX_EXPECTED_UNITS = [
 	`-C ${REPO_ROOT}`,
 	"--disable worktrees",
 	`-c ${CODEX_STATUS_LINE}`,
+	"-c project_doc_max_bytes=65536",
 ];
 
 function makeProcessInfoJson(
@@ -566,6 +568,8 @@ printf '{"result":{"ok":true}}\\n'
 							"worktrees",
 							"-c",
 							CODEX_STATUS_LINE,
+							"-c",
+							"project_doc_max_bytes=65536",
 						],
 					},
 				],
@@ -601,7 +605,7 @@ printf '{"result":{"ok":true}}\\n'
 		expect(res.stderr).toBe("");
 	});
 
-	test("3. 복구 형태 codex resume <id> → 없음 여섯 단위, 실제 id·자식 프로세스 비밀 미노출", () => {
+	test("3. 복구 형태 codex resume <id> → 없음 일곱 단위, 실제 id·자식 프로세스 비밀 미노출", () => {
 		const res = runChecker({
 			kind: "codex",
 			name: "gjc-herdr-critic",
@@ -618,7 +622,7 @@ printf '{"result":{"ok":true}}\\n'
 		});
 		expect(res.status).toBe(1);
 		expect(res.stdout.trim()).toBe(
-			`↳ gjc-herdr-critic 옵션 불일치: 없음 --no-daemon, --yolo, -m gpt-6.1-sol, -C ${REPO_ROOT}, --disable worktrees, -c ${CODEX_STATUS_LINE} (복구: ${RECOVERY_EXTERNAL})`,
+			`↳ gjc-herdr-critic 옵션 불일치: 없음 --no-daemon, --yolo, -m gpt-6.1-sol, -C ${REPO_ROOT}, --disable worktrees, -c ${CODEX_STATUS_LINE}, -c project_doc_max_bytes=65536 (복구: ${RECOVERY_EXTERNAL})`,
 		);
 		expect(res.stdout).not.toContain("019a0000-secret-session-id");
 		expect(res.stdout).not.toContain("SENTINEL_API_KEY_123");
@@ -704,7 +708,7 @@ printf '{"result":{"ok":true}}\\n'
 		);
 	});
 
-	test("5. -c 반복·순서 바뀜·추가 옵션은 일치로 판정", () => {
+	test("5. -c 반복·순서 바뀜·추가 옵션은 일치로 판정, 옛 Codex argv(새 -c 누락)는 불일치 판정", () => {
 		const res = runChecker({
 			kind: "codex",
 			name: "gjc-herdr-critic",
@@ -725,6 +729,8 @@ printf '{"result":{"ok":true}}\\n'
 						"-C",
 						REPO_ROOT,
 						"-c",
+						"project_doc_max_bytes=65536",
+						"-c",
 						CODEX_STATUS_LINE,
 						"-c",
 						'another_key="SECRET_CFG"',
@@ -739,6 +745,37 @@ printf '{"result":{"ok":true}}\\n'
 		});
 		expect(res.status).toBe(0);
 		expect(res.stdout).toBe("");
+
+		// 같은 플래그가 여러 개면 키가 빠져도 '다름'으로 나온다(비교기 한계)
+		const legacyCodex = runChecker({
+			kind: "codex",
+			name: "gjc-herdr-critic",
+			stdin: makeProcessInfoJson([
+				{
+					pid: 3041,
+					name: "codex",
+					argv0: "codex",
+					cwd: REPO_ROOT,
+					argv: [
+						"codex",
+						"--no-daemon",
+						"--yolo",
+						"-m",
+						"gpt-6.1-sol",
+						"-C",
+						REPO_ROOT,
+						"--disable",
+						"worktrees",
+						"-c",
+						CODEX_STATUS_LINE,
+					],
+				},
+			]),
+		});
+		expect(legacyCodex.status).toBe(1);
+		expect(legacyCodex.stdout.trim()).toBe(
+			`↳ gjc-herdr-critic 옵션 불일치: 다름 -c(기대 project_doc_max_bytes=65536) (복구: ${RECOVERY_INSIDE})`,
+		);
 	});
 
 	test("6. 판정 불가(대상 0개, 2개 이상, argv 없음, JSON 오류, process-info 실패) 및 작업 중 접미사·비밀 보호", () => {
@@ -874,6 +911,39 @@ printf '{"result":{"ok":true}}\\n'
 		);
 		expect(codexSnap.status).toBe(0);
 		expect(codexSnap.stdout.trim().split("\n")).toEqual(CODEX_EXPECTED_UNITS);
+
+		const codexCustomDocMax = spawnSync(
+			"/bin/bash",
+			[TEAM_UP_SH, "--print-expected-units", "codex"],
+			{
+				cwd: REPO_ROOT,
+				encoding: "utf8",
+				env: buildEnv({ GJCH_CODEX_DOC_MAX_BYTES: "131072" }),
+				timeout: SPAWN_TIMEOUT_MS,
+			},
+		);
+		expect(codexCustomDocMax.status).toBe(0);
+		expect(codexCustomDocMax.stdout.trim().split("\n")).toEqual([
+			...CODEX_EXPECTED_UNITS.slice(0, -1),
+			"-c project_doc_max_bytes=131072",
+		]);
+
+		for (const invalidVal of ["", "0", "065536", "-1", "abc", "65536.5"]) {
+			const codexInvalidDocMax = spawnSync(
+				"/bin/bash",
+				[TEAM_UP_SH, "--print-expected-units", "codex"],
+				{
+					cwd: REPO_ROOT,
+					encoding: "utf8",
+					env: buildEnv({ GJCH_CODEX_DOC_MAX_BYTES: invalidVal }),
+					timeout: SPAWN_TIMEOUT_MS,
+				},
+			);
+			expect(codexInvalidDocMax.status).toBe(0);
+			expect(codexInvalidDocMax.stdout.trim().split("\n")).toEqual(
+				CODEX_EXPECTED_UNITS,
+			);
+		}
 	});
 
 	test("8. team-up.sh 통합(--spawn, --layout) 및 check-env.sh: 복구 형태 argv·process-info 실패 stderr 비밀 폐기·자동 재시작 0회", () => {
@@ -925,7 +995,7 @@ printf '{"result":{"ok":true}}\\n'
 			`↳ gjc-herdr-mate 옵션 불일치: 없음 --model gemini-4-argon-high, --mode accept-edits, --sandbox (복구: ${RECOVERY_INSIDE})`,
 		);
 		expect(spawnRes.stderr).toContain(
-			`↳ gjc-herdr-critic 옵션 불일치: 없음 --no-daemon, --yolo, -m gpt-6.1-sol, -C ${REPO_ROOT}, --disable worktrees, -c ${CODEX_STATUS_LINE} (복구: ${RECOVERY_INSIDE})`,
+			`↳ gjc-herdr-critic 옵션 불일치: 없음 --no-daemon, --yolo, -m gpt-6.1-sol, -C ${REPO_ROOT}, --disable worktrees, -c ${CODEX_STATUS_LINE}, -c project_doc_max_bytes=65536 (복구: ${RECOVERY_INSIDE})`,
 		);
 		expect(spawnRes.stderr).not.toContain("SENTINEL_API_KEY_123");
 
@@ -955,7 +1025,7 @@ printf '{"result":{"ok":true}}\\n'
 			`GJCH: ↳ gjc-herdr-mate 옵션 불일치: 없음 --model gemini-4-argon-high, --mode accept-edits, --sandbox (복구: ${RECOVERY_INSIDE})`,
 		);
 		expect(hookSpawnRes.stdout).toContain(
-			`GJCH: ↳ gjc-herdr-critic 옵션 불일치: 없음 --no-daemon, --yolo, -m gpt-6.1-sol, -C ${REPO_ROOT}, --disable worktrees, -c ${CODEX_STATUS_LINE} (복구: ${RECOVERY_INSIDE})`,
+			`GJCH: ↳ gjc-herdr-critic 옵션 불일치: 없음 --no-daemon, --yolo, -m gpt-6.1-sol, -C ${REPO_ROOT}, --disable worktrees, -c ${CODEX_STATUS_LINE}, -c project_doc_max_bytes=65536 (복구: ${RECOVERY_INSIDE})`,
 		);
 		expect(hookSpawnRes.stderr).toBe("");
 
@@ -1054,6 +1124,8 @@ printf '{"result":{"ok":true}}\\n'
 						"worktrees",
 						"-c",
 						CODEX_STATUS_LINE,
+						"-c",
+						"project_doc_max_bytes=65536",
 					],
 				},
 			]),
@@ -1136,7 +1208,7 @@ printf '{"result":{"ok":true}}\\n'
 			`GJCH: ↳ gjc-herdr-mate 옵션 불일치: 없음 --model gemini-4-argon-high, --mode accept-edits, --sandbox (복구: ${RECOVERY_EXTERNAL})`,
 		);
 		expect(hookRes.stdout).toContain(
-			`GJCH: ↳ gjc-herdr-critic 옵션 불일치: 없음 --no-daemon, --yolo, -m gpt-6.1-sol, -C ${REPO_ROOT}, --disable worktrees, -c ${CODEX_STATUS_LINE} (복구: ${RECOVERY_EXTERNAL})`,
+			`GJCH: ↳ gjc-herdr-critic 옵션 불일치: 없음 --no-daemon, --yolo, -m gpt-6.1-sol, -C ${REPO_ROOT}, --disable worktrees, -c ${CODEX_STATUS_LINE}, -c project_doc_max_bytes=65536 (복구: ${RECOVERY_EXTERNAL})`,
 		);
 		expect(hookRes.stderr).toBe("");
 
@@ -1259,7 +1331,7 @@ printf '{"result":{"ok":true}}\\n'
 		expect(badMateExtHookRes.status).toBe(0);
 		expect(badMateExtHookRes.stdout).not.toContain("gjc-herdr-mate");
 		expect(badMateExtHookRes.stdout).toContain(
-			`GJCH: ↳ gjc-herdr-critic 옵션 불일치: 없음 --no-daemon, --yolo, -m gpt-6.1-sol, -C ${REPO_ROOT}, --disable worktrees, -c ${CODEX_STATUS_LINE} (복구: ${RECOVERY_EXTERNAL})`,
+			`GJCH: ↳ gjc-herdr-critic 옵션 불일치: 없음 --no-daemon, --yolo, -m gpt-6.1-sol, -C ${REPO_ROOT}, --disable worktrees, -c ${CODEX_STATUS_LINE}, -c project_doc_max_bytes=65536 (복구: ${RECOVERY_EXTERNAL})`,
 		);
 		expect(badMateExtHookRes.stderr).toBe("");
 	}, 150_000);
@@ -1320,7 +1392,7 @@ printf '{"result":{"ok":true}}\\n'
 			`GJCH: ↳ gjc-herdr-mate 옵션 불일치: 없음 --model gemini-custom-hook-model, --mode accept-edits, --sandbox (복구: ${RECOVERY_INSIDE})`,
 		);
 		expect(insideHookRes.stdout).toContain(
-			`GJCH: ↳ gjc-herdr-critic 옵션 불일치: 없음 --no-daemon, --yolo, -m gpt-6.1-sol, -C ${REPO_ROOT}, --disable worktrees, -c ${CODEX_STATUS_LINE} (복구: ${RECOVERY_INSIDE})`,
+			`GJCH: ↳ gjc-herdr-critic 옵션 불일치: 없음 --no-daemon, --yolo, -m gpt-6.1-sol, -C ${REPO_ROOT}, --disable worktrees, -c ${CODEX_STATUS_LINE}, -c project_doc_max_bytes=65536 (복구: ${RECOVERY_INSIDE})`,
 		);
 		expect(insideHookRes.stderr).toBe("");
 
@@ -1362,7 +1434,7 @@ printf '{"result":{"ok":true}}\\n'
 		expect(badMateInsideHookRes.status).toBe(0);
 		expect(badMateInsideHookRes.stdout).not.toContain("gjc-herdr-mate");
 		expect(badMateInsideHookRes.stdout).toContain(
-			`GJCH: ↳ gjc-herdr-critic 옵션 불일치: 없음 --no-daemon, --yolo, -m gpt-6.1-sol, -C ${REPO_ROOT}, --disable worktrees, -c ${CODEX_STATUS_LINE} (복구: ${RECOVERY_INSIDE})`,
+			`GJCH: ↳ gjc-herdr-critic 옵션 불일치: 없음 --no-daemon, --yolo, -m gpt-6.1-sol, -C ${REPO_ROOT}, --disable worktrees, -c ${CODEX_STATUS_LINE}, -c project_doc_max_bytes=65536 (복구: ${RECOVERY_INSIDE})`,
 		);
 		expect(badMateInsideHookRes.stderr).toBe("");
 

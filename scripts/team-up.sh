@@ -15,6 +15,7 @@
 #   GJCH_TEAM_CODEX=0은 Codex 생성을 끈다. Codex는 사용자 지시로 --yolo(샌드박스 없음)를 사용한다.
 #   --no-daemon은 공유 daemon 환경의 훅이 세션 ID를 다른 pane으로 보고하는 것을 막는다.
 #   -c 'tui.status_line=[...]'은 56칸 검토 pane에서 상태 줄이 잘리지 않게 사용자 설정을 바꾸지 않고 이 프로세스만 덮어쓴다.
+#   -c project_doc_max_bytes=65536(GJCH_CODEX_DOC_MAX_BYTES, 양의 정수가 아니면 65536)은 AGENTS.md를 끝까지 읽게 하며 사용자 설정은 바꾸지 않는다.
 #   Codex는 저장소 루트에서 실행하며, 파일 수정은 먼저 팀장 허락을 받는다는 규칙(AGENTS.md·지시서)으로 지킨다.
 # 아무것도 덮어쓰지 않는다: 이미 다른 pane이 쓰는 이름은 건드리지 않고, 작업공간 label은 비었거나 폴더명(Herdr 기본값)일 때만 설정한다.
 set -u
@@ -28,6 +29,10 @@ DEPUTY_LABEL="GJCH 부팀장 · Claude"
 MATE_LABEL="GJCH 팀원 · agy"
 CRITIC_LABEL="GJCH 검토·조사 · Codex"
 CODEX_MODEL="${GJCH_CODEX_MODEL:-gpt-6.1-sol}"
+CODEX_DOC_MAX_BYTES="${GJCH_CODEX_DOC_MAX_BYTES:-65536}"
+case "$CODEX_DOC_MAX_BYTES" in
+	""|0*|*[!0-9]*) CODEX_DOC_MAX_BYTES=65536 ;;
+esac
 MATE_MODEL="${GJCH_MATE_MODEL:-gemini-4-argon-high}"
 WS_LABEL="${GJCH_WS_LABEL:-GJCH · gjc-herdr}"
 RETRIES="${GJCH_RETRIES:-30}"   # 2초 간격 → 최대 약 60초
@@ -39,7 +44,7 @@ mode="${1:-}"
 
 CODEX_STATUS_LINE='tui.status_line=["context-remaining","total-input-tokens","total-output-tokens"]'
 MATE_START_ARGS=(--model "$MATE_MODEL" --mode accept-edits --sandbox)
-CRITIC_START_ARGS=(--no-daemon --yolo -m "$CODEX_MODEL" -C "$ROOT" --disable worktrees -c "$CODEX_STATUS_LINE")
+CRITIC_START_ARGS=(--no-daemon --yolo -m "$CODEX_MODEL" -C "$ROOT" --disable worktrees -c "$CODEX_STATUS_LINE" -c "project_doc_max_bytes=$CODEX_DOC_MAX_BYTES")
 
 # 시작 인자 배열(argv 조각)을 기대 단위("<깃발> <값>" 또는 "<깃발>") 줄 목록으로 바꾼다(#42).
 # 전제: 기대 옵션에는 위치 인자가 없고 옵션 값은 '-'로 시작하지 않는다.
