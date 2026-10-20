@@ -114,6 +114,16 @@
 
 수동 실행: `scripts/team-up.sh`(이름·label만), `scripts/team-up.sh --spawn`(구현·선택 검토 팀원 포함, 끝에 배치 보정). `GJCH_TEAM_CODEX=0 scripts/team-up.sh --spawn`이면 agy 팀원만 구성한다. `scripts/team-up.sh --layout`(팀장 pane에서 실행)은 기본 동작 뒤 팀장·팀원·검토 pane을 위 배치 공식 기준으로 재배치한다. `--spawn` 끝의 배치 보정과 같은 로직이며, 조건이 안 맞으면 건너뛰지 않고 아무것도 옮기지 않은 채 오류(비0)로 끝난다. resize 실패·비율 미도달이면 성공 메시지 없이 비0이다. `herdr agent start`는 pane이 빈 셸 프롬프트 상태여야 하며, 성공은 예상 agent가 감지되고 입력 준비가 됐다는 뜻이다.
 
+이 다섯 하위 명령(`--check`·`--up`·`--status`·`--lock`·`--hook`) 이름은 네 팀 공통 가이드(프로젝트 조정 역할)에 맞춘 것이다(#68). `--up`은 `--spawn`과 같은 구성을 하고, 끝 요약과 그 종료 판정을 더한다.
+
+| 하위 명령 | 뜻 | 바꾸는 것 | 종료 코드 |
+|---|---|---|---|
+| `--check` | 팀원(agy·선택 Codex) 시작 옵션·cwd와 팀장 잠금 상태를 한 줄씩 점검 | 없음(읽기 전용) | `0` 모두 ok, `1` 불일치·팀원 없음, `2` 판정 불가·가드 실패 |
+| `--up` | `--spawn`과 같이 팀장·팀원 구성과 배치 보정을 한 뒤 끝에 `--check` 요약 출력 | 팀장 잠금 claim, 이름·label, 없는 팀원 pane 생성·기동, 같은 탭 배치 보정(기존 팀원 자동 재시작 없음) | `--spawn` 단계가 비0이면 그 값(다른 세션 잠금 보유 시 `3`), `0`이면 끝 요약의 `0`/`1`/`2` |
+| `--status` | 네 팀 공통 보고 꼴의 필드를 사람이 그대로 옮겨 적을 수 있게 출력 | 없음(읽기 전용) | `--check`와 같음(`0`/`1`/`2`, 팀원·잠금 판정 기준) |
+| `--lock <status\|claim\|release>` | 팀장 잠금 조회·확보·해제(`--force`는 받지 않으며 `scripts/team-lead.sh release --force` 안내) | `status`는 없음, `claim`·`release`는 잠금 파일(`.local/team/lead.json`)과 그 디렉터리·mutex 파일(`<잠금 파일>.mutex`) | `0` 성공, `3` 다른 살아 있는 세션의 잠금(`claim`·`release`), `4` 정체 미확인(환경변수·소켓)이고 다른 살아 있는 잠금이 없을 때의 `claim`, `2` `--force`·인자 오류, `1` 잠금 실패 |
+| `--hook` | SessionStart hook용. 잠금 확인 후 역할과 팀원 옵션 불일치를 안내하고 백그라운드로 기본/`--spawn` 실행 | 팀장 잠금 claim, 백그라운드 이름·label·팀원 구성 | `0`(잠금 확인 자체 실패 시 `1`) |
+
 ### 2.1 외부 팀장(herdr 밖, 데스크톱 Code 탭)
 
 Claude 데스크톱 앱의 Code 탭(로컬 세션)이나 Herdr 밖 터미널의 `claude`를 팀장으로 쓰고, Herdr 작업공간에는 구현 팀원(agy)과 검토 팀원(Codex)만 두는 운영 방식이다.
@@ -122,7 +132,8 @@ Claude 데스크톱 앱의 Code 탭(로컬 세션)이나 Herdr 밖 터미널의 
 2. **환경변수:** macOS 데스크톱 앱은 셸 프로필에서 `PATH`만 가져온다. 다른 환경변수는 데스크톱 앱 프롬프트 입력창의 환경 드롭다운 → `로컬 환경 편집` → `환경 변수`에 `GJCH_EXTERNAL_LEAD=1`을 넣어야 로컬 세션과 Bash에 전달된다(사용자 설정이므로 사용자가 직접 넣거나 승인 후 진행한다). 데스크톱 앱 밖 일반 터미널에서 Herdr 밖 `claude`로 쓸 때는 `GJCH_EXTERNAL_LEAD=1 claude`로 실행한다.
 3. **자동 구성:** SessionStart hook(`scripts/team-up.sh --hook`)이 `scripts/team-lead.sh claim`으로 잠금을 확보하면 stdout에 `GJCH: 이 세션이 외부 팀장입니다(herdr 밖, 팀장 잠금 보유). 팀원 작업공간 'GJCH · gjc-herdr'을 확인·구성합니다.`를 출력하고, `clear`가 아니면 `--spawn`을 백그라운드로 실행한다. 잠금을 얻지 못하면(다른 세션이 보유 중이거나 정체 환경변수 누락) `GJCH: 팀장 잠금이 다른 세션(<kind> <sid8>)에 있어 이 세션은 팀장이 아닙니다. 팀원에게 배정·입력하지 마세요.`(정체 환경변수가 없으면 `GJCH: 세션 정체(CLAUDE_CODE_SESSION_ID·소켓)를 알 수 없어 이 세션은 외부 팀장이 아닙니다.`)를 출력하고 아무것도 하지 않는다.
 4. **수동 명령:**
-   - 팀원 기동·배치: `GJCH_EXTERNAL_LEAD=1 scripts/team-up.sh --spawn` 또는 `GJCH_EXTERNAL_LEAD=1 scripts/team-up.sh --layout`
+   - 팀원 기동·배치: `GJCH_EXTERNAL_LEAD=1 scripts/team-up.sh --spawn`(`--up`은 끝에 점검 요약 출력) 또는 `GJCH_EXTERNAL_LEAD=1 scripts/team-up.sh --layout`
+   - 읽기 전용 점검·보고: `GJCH_EXTERNAL_LEAD=1 scripts/team-up.sh --check` 또는 `GJCH_EXTERNAL_LEAD=1 scripts/team-up.sh --status`
    - 검토 전송: `GJCH_EXTERNAL_LEAD=1 scripts/critic-send.sh [--timeout <ms>] [--no-wait | --result <파일>] <지시서 파일>`(`critic-send.sh`는 외부 모드일 때 잠금이 `mine`인지 먼저 확인하고, label 조회 대신 검토 agent(`gjc-herdr-critic`)의 작업공간을 쓰며 팀원(`gjc-herdr-mate`)이 다른 작업공간에 있으면 전송하지 않고 rc `1`로 끝난다)
    - agy 배정: Herdr 안과 같이 `herdr agent prompt gjc-herdr-mate "<짧은 지시>"`를 쓴다. 세션 환경에 `GJCH_EXTERNAL_LEAD=1`이 이미 들어 있으면 앞의 환경변수 접두는 필요 없다.
 5. **작업공간과 배치:**
@@ -262,7 +273,7 @@ GJC는 상시 팀원이 아니며, 플러그인 로드·token 표시·`/herdr-se
 
 | 증상 | 원인·조치 |
 |---|---|
-| 팀원 pane이 안 생김 | hook이 가드에서 종료됨(Herdr 밖, cwd가 프로젝트 밖, `GJCH_TEAM_ROLE` 설정, `herdr`/`python3` 없음) 또는 `agy` 없음. `scripts/check-env.sh`와 `scripts/team-up.sh --spawn` 출력 확인 |
+| 팀원 pane이 안 생김 | hook이 가드에서 종료됨(Herdr 밖, cwd가 프로젝트 밖, `GJCH_TEAM_ROLE` 설정, `herdr`/`python3` 없음) 또는 `agy` 없음. `scripts/check-env.sh`, `scripts/team-up.sh --check`, `scripts/team-up.sh --spawn` 출력 확인 |
 | `agy not found` / `check-env.sh`에서 `agy 없음` FAIL | 상시 구현 팀원(`gjc-herdr-mate`)용 Antigravity CLI(`agy`)가 PATH에 없다. 사용자에게 `agy` 설치를 안내한 뒤 `scripts/team-up.sh --spawn`을 다시 실행한다 |
 | `agy`가 시작 중 멈춤 (`agent start`가 `agent_not_ready`이고 pane 상태가 `blocked`, 또는 기존 `gjc-herdr-mate`가 여전히 `blocked`) | 처음 저장소를 열 때의 폴더 신뢰 창이나 다른 질문 UI에서 멈춘 상태일 수 있다. 스크립트는 자동 응답하지 않으며(사용자 결정) 비0으로 끝난다. 첫 기동(`agent start`) 실패는 불확실성 안내와 원래 오류(`code`·`message`)를 함께 출력하고, 이미 이름이 붙은 기존 팀원이 `blocked`이면 현재 상태와 확인 안내만 출력한다. 그 pane에서 사용자가 직접 확인·응답한 뒤 `scripts/team-up.sh --spawn`을 다시 실행한다. 응답 뒤 `idle`/`done`·`interactive_ready=true`이거나 `working`이면 새 pane을 만들거나 재시작하지 않고 유지·통과한다. 첫 기동에서 pane 상태가 `working`이거나 상태 조회 실패·기타 기동 오류이면 신뢰 창 안내 없이 원래 오류와 함께 일반 실패로 끝난다 |
 | `agy`가 작업 중 `blocked` | sandbox 밖 실행이나 편집 확인창일 수 있다. 화면을 보고 §5 "agy 운용 조건"의 응답 규칙을 따르며, 명령이 잘려 보이면 §5의 전문 확인 절차를 따른다 |

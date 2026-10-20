@@ -6,6 +6,10 @@
 #                                (팀원이 팀장 탭에 없는 등 조건이 안 맞으면 옮기지 않고 건너뜀, 조회 실패는 비0,
 #                                 검토는 선택 Codex가 켜져 있고 같은 탭일 때만 포함)
 #   scripts/team-up.sh --layout  기본 동작 + 기존 팀장·팀원·검토 pane을 목표 배치로 재배치(조건이 안 맞으면 오류)
+#   scripts/team-up.sh --check   읽기 전용. 팀원(agy·선택 Codex) 시작 옵션·cwd와 팀장 잠금 상태를 한 줄씩 출력(0=ok, 1=mismatch, 2=unknown)
+#   scripts/team-up.sh --status  읽기 전용. 네 팀 공통 보고 꼴의 필드를 출력(0=ok, 1=mismatch, 2=unknown)
+#   scripts/team-up.sh --lock <status|claim|release>  팀장 잠금 조회·확보·해제(--force는 받지 않음)
+#   scripts/team-up.sh --up      --spawn과 같은 동작을 수행한 뒤 끝에 --check 요약을 출력
 #   목표 배치(공식 기준): Herdr 안은 팀장 위(높이 60%), 그 아래 왼쪽 팀원 agy | 오른쪽 검토 Codex(반반). 검토가 없으면 팀장 60% / 팀원 아래.
 #                         외부 팀장(GJCH_EXTERNAL_LEAD=1, Herdr 밖)은 팀 작업공간 한 탭 안에서 팀원 agy | 검토 Codex(반반).
 #   팀장 잠금(scripts/team-lead.sh, GJCH_LEAD_LOCK): 잠금이 다른 세션에 있으면 Herdr 안 Claude는 부팀장(GJCH_DEPUTY_NAME, 기본 gjc-herdr-deputy)이 되고,
@@ -73,27 +77,145 @@ if [ "$mode" = "--print-expected-units" ]; then
 	exit $?
 fi
 
+if [ "$mode" = "--lock" ]; then
+	shift
+	for lock_arg in "$@"; do
+		if [ "$lock_arg" = "--force" ]; then
+			printf '강제 해제는 지원하지 않습니다: scripts/team-lead.sh release --force(사용자 승인)\n' >&2
+			exit 2
+		fi
+	done
+	if [ "$#" -ne 1 ]; then
+		printf '사용법: %s --lock <status|claim|release>\n' "$0" >&2
+		exit 2
+	fi
+	case "$1" in
+		status)
+			lock_raw="$(/bin/bash "$ROOT/scripts/team-lead.sh" status)" || exit $?
+			case "${lock_raw%% *}" in
+				none) printf 'none\n' ;;
+				mine) printf 'mine\n' ;;
+				other) printf 'other live\n' ;;
+				stale) printf 'stale\n' ;;
+				*) exit 1 ;;
+			esac
+			exit 0
+			;;
+		claim|release)
+			exec /bin/bash "$ROOT/scripts/team-lead.sh" "$1"
+			;;
+		*)
+			printf '사용법: %s --lock <status|claim|release>\n' "$0" >&2
+			exit 2
+			;;
+	esac
+fi
+
 # --- 가드: Herdr 안 또는 외부 팀장(GJCH_EXTERNAL_LEAD=1), 이 프로젝트 안, 팀원 역할이 아닐 때만 ---
 if [ "${HERDR_ENV:-}" = 1 ] && [ -n "${HERDR_PANE_ID:-}" ]; then
 	lead_mode=inside
 elif [ "${GJCH_EXTERNAL_LEAD:-}" = 1 ]; then
 	lead_mode=external
 else
+	if [ "$mode" = "--check" ] || [ "$mode" = "--status" ]; then
+		echo "Herdr 안(HERDR_ENV=1, HERDR_PANE_ID) 또는 외부 팀장(GJCH_EXTERNAL_LEAD=1)에서 실행하세요." >&2
+		exit 2
+	fi
 	exit 0
 fi
-[ -z "${GJCH_TEAM_ROLE:-}" ] || exit 0
-here="$(cd "${CLAUDE_PROJECT_DIR:-$PWD}" 2>/dev/null && pwd -P)" || exit 0
-case "$here/" in "$ROOT"/*) ;; *) exit 0 ;; esac
+if [ -n "${GJCH_TEAM_ROLE:-}" ]; then
+	if [ "$mode" = "--check" ] || [ "$mode" = "--status" ]; then
+		echo "팀원 역할(GJCH_TEAM_ROLE=$GJCH_TEAM_ROLE)에서는 ${mode}를 실행할 수 없습니다." >&2
+		exit 2
+	fi
+	exit 0
+fi
+if ! here="$(cd "${CLAUDE_PROJECT_DIR:-$PWD}" 2>/dev/null && pwd -P)"; then
+	if [ "$mode" = "--check" ] || [ "$mode" = "--status" ]; then
+		echo "작업 경로(${CLAUDE_PROJECT_DIR:-$PWD})를 확인할 수 없습니다." >&2
+		exit 2
+	fi
+	exit 0
+fi
+case "$here/" in
+	"$ROOT"/*) ;;
+	*)
+		if [ "$mode" = "--check" ] || [ "$mode" = "--status" ]; then
+			echo "현재 경로($here)가 저장소($ROOT) 밖입니다." >&2
+			exit 2
+		fi
+		exit 0
+		;;
+esac
 if wt_reason="$(gjch_worktree_reason "$ROOT")"; then
 	if [ "$mode" = "--hook" ]; then
 		printf 'GJCH: 이 세션은 연결 worktree(%s)에서 실행 중이라 팀장으로 동작하지 않습니다. 데스크톱 세션의 worktree 옵션을 끄고 저장소 폴더에서 새 세션을 엽니다.\n' "$ROOT"
 		exit 0
 	fi
 	printf '%s\n' "$wt_reason" >&2
+	if [ "$mode" = "--check" ] || [ "$mode" = "--status" ]; then
+		exit 2
+	fi
 	exit 1
 fi
-command -v herdr >/dev/null || exit 0
-command -v python3 >/dev/null || exit 0
+if ! command -v herdr >/dev/null; then
+	if [ "$mode" = "--check" ] || [ "$mode" = "--status" ]; then
+		echo "herdr를 찾을 수 없습니다." >&2
+		exit 2
+	fi
+	exit 0
+fi
+if ! command -v python3 >/dev/null; then
+	if [ "$mode" = "--check" ] || [ "$mode" = "--status" ]; then
+		echo "python3를 찾을 수 없습니다." >&2
+		exit 2
+	fi
+	exit 0
+fi
+
+codex_enabled() { [ "${GJCH_TEAM_CODEX:-1}" != 0 ] && command -v codex >/dev/null; }
+
+CHECK_TIMEOUT="${GJCH_CHECK_TIMEOUT:-10}"
+
+run_format_summary() {
+	local fmt="$1" codex_on=0
+	codex_enabled && codex_on=1
+	python3 "$ROOT/scripts/hook-argv-check.py" \
+		--format "$fmt" \
+		"$CHECK_TIMEOUT" \
+		"$lead_mode" \
+		"$ROOT" \
+		"${HERDR_PANE_ID:-}" \
+		"$MATE_NAME" \
+		"$CRITIC_NAME" \
+		"$codex_on" \
+		"${#MATE_START_ARGS[@]}" \
+		"${MATE_START_ARGS[@]}" \
+		"${#CRITIC_START_ARGS[@]}" \
+		"${CRITIC_START_ARGS[@]}"
+}
+
+run_check_summary() {
+	run_format_summary check
+}
+
+exit_with_up_summary() {
+	local rc="$1"
+	if [ "$mode" = "--up" ]; then
+		run_check_summary || true
+	fi
+	exit "$rc"
+}
+
+if [ "$mode" = "--check" ]; then
+	run_check_summary
+	exit $?
+fi
+
+if [ "$mode" = "--status" ]; then
+	run_format_summary status
+	exit $?
+fi
 
 lead_out="$(/bin/bash "$ROOT/scripts/team-lead.sh" claim 2>&1)"
 lead_rc=$?
@@ -101,7 +223,7 @@ case "$lead_rc" in
 	0|3|4) ;;
 	*)
 		echo "${lead_out:-팀장 잠금 확인에 실패했습니다.}" >&2
-		exit 1 ;;
+		exit_with_up_summary 1 ;;
 esac
 held_info="${lead_out#held }"
 held_info="${held_info%…}"
@@ -129,8 +251,6 @@ for k in sys.argv[1].split("."): d=d.get(k) if isinstance(d,dict) else None
 print("" if d is None else d)' "$1"; }
 
 realpath() { python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$1"; }
-
-codex_enabled() { [ "${GJCH_TEAM_CODEX:-1}" != 0 ] && command -v codex >/dev/null; }
 
 # 시험용: GJCH_HOOK_ARGV_TIMEOUT(hook-argv-check.py에서 양의 유한 숫자·상한 30초 검증, 아니면 기본 3초)
 HOOK_ARGV_TIMEOUT="${GJCH_HOOK_ARGV_TIMEOUT:-3}"
@@ -439,9 +559,9 @@ if [ "$lead_mode" = inside ]; then
 	# (다른 프로젝트 pane에서 실행되거나 이름이 다른 pane 소유면 이름·pane label·작업공간 label 모두 건드리지 않는다)
 	pane_cwd="$(herdr pane get "$HERDR_PANE_ID" 2>/dev/null | jget result.pane.cwd)"
 	if [ -n "$pane_cwd" ]; then
-		pane_cwd="$(realpath "$pane_cwd")" || exit 0
+		pane_cwd="$(realpath "$pane_cwd")" || exit_with_up_summary 0
 	fi
-	case "$pane_cwd/" in "$ROOT"/*) ;; *) echo "pane $HERDR_PANE_ID is not in $ROOT; nothing changed" >&2; exit 0 ;; esac
+	case "$pane_cwd/" in "$ROOT"/*) ;; *) echo "pane $HERDR_PANE_ID is not in $ROOT; nothing changed" >&2; exit_with_up_summary 0 ;; esac
 
 	if [ "$lead_rc" = 3 ]; then
 		if retry claim_name "$HERDR_PANE_ID" "$DEPUTY_NAME"; then
@@ -451,7 +571,7 @@ if [ "$lead_mode" = inside ]; then
 		fi
 		if [ -n "$mode" ] && [ "${GJCH_FROM_HOOK:-}" != 1 ]; then
 			echo "팀장 잠금이 다른 세션에 있어 팀원 구성·배치를 하지 않습니다" >&2
-			exit 3
+			exit_with_up_summary 3
 		fi
 		exit 0
 	fi
@@ -477,15 +597,15 @@ else
 			exit 0
 		fi
 		print_role_line >&2
-		exit "$lead_rc"
+		exit_with_up_summary "$lead_rc"
 	fi
 	if [ -z "$mode" ]; then
 		print_role_line
 		exit 0
 	fi
-	if [ "$mode" = "--spawn" ] || [ "$mode" = "--layout" ]; then
-		mate_info="$(ext_agent_info "$MATE_NAME" agy inside)" || exit 1
-		critic_info="$(ext_agent_info "$CRITIC_NAME" codex exact)" || exit 1
+	if [ "$mode" = "--spawn" ] || [ "$mode" = "--up" ] || [ "$mode" = "--layout" ]; then
+		mate_info="$(ext_agent_info "$MATE_NAME" agy inside)" || exit_with_up_summary 1
+		critic_info="$(ext_agent_info "$CRITIC_NAME" codex exact)" || exit_with_up_summary 1
 		mate_ws=""
 		if [ -n "$mate_info" ]; then
 			mate_ws="${mate_info%%|*}"
@@ -502,11 +622,11 @@ else
 		fi
 		if [ -n "$mate_ws" ] && [ -n "$critic_ws" ] && [ "$mate_ws" != "$critic_ws" ]; then
 			echo "agents '$MATE_NAME' ($mate_ws) and '$CRITIC_NAME' ($critic_ws) are in different workspaces" >&2
-			exit 1
+			exit_with_up_summary 1
 		fi
 		TEAM_WS="${mate_ws:-$critic_ws}"
 		if [ -z "$TEAM_WS" ]; then
-			ws_out="$(herdr workspace list 2>/dev/null)" || { echo "could not list workspaces" >&2; exit 1; }
+			ws_out="$(herdr workspace list 2>/dev/null)" || { echo "could not list workspaces" >&2; exit_with_up_summary 1; }
 			ws_match="$(printf '%s' "$ws_out" | python3 -c 'import json,sys
 label=sys.argv[1]
 try: ws=json.load(sys.stdin)["result"]["workspaces"]
@@ -517,22 +637,22 @@ print(hits[0] if hits else "")' "$WS_LABEL")"
 			ws_rc=$?
 			if [ "$ws_rc" = 3 ]; then
 				echo "multiple workspaces found with label '$WS_LABEL'" >&2
-				exit 1
+				exit_with_up_summary 1
 			elif [ "$ws_rc" != 0 ]; then
 				echo "could not list workspaces" >&2
-				exit 1
+				exit_with_up_summary 1
 			fi
 			TEAM_WS="$ws_match"
 		fi
 		if [ -z "$TEAM_WS" ]; then
-			if [ "$mode" = "--spawn" ]; then
+			if [ "$mode" = "--spawn" ] || [ "$mode" = "--up" ]; then
 				ws_create="$(herdr workspace create --cwd "$ROOT" --label "$WS_LABEL" --no-focus 2>/dev/null)" || {
 					echo "workspace create failed" >&2
-					exit 1
+					exit_with_up_summary 1
 				}
 				TEAM_WS="$(printf '%s' "$ws_create" | jget result.workspace.workspace_id)"
 				NEW_WS_ROOT_PANE="$(printf '%s' "$ws_create" | jget result.root_pane.pane_id)"
-				[ -n "$TEAM_WS" ] || { echo "workspace create did not return workspace_id" >&2; exit 1; }
+				[ -n "$TEAM_WS" ] || { echo "workspace create did not return workspace_id" >&2; exit_with_up_summary 1; }
 			else
 				echo "--layout: workspace '$WS_LABEL' not found; nothing moved" >&2
 				exit 1
@@ -822,7 +942,7 @@ if [ "$mode" = "--layout" ]; then
 	[ "$layout_rc" = 0 ] || exit "$layout_rc"
 	exit "$argv_status"
 fi
-[ "$mode" = "--spawn" ] || exit 0
+[ "$mode" = "--spawn" ] || [ "$mode" = "--up" ] || exit 0
 
 # --- 팀원 agy pane (이미 있으면 생성하지 않음) ---
 mate_pane=""
@@ -1081,7 +1201,19 @@ if [ "$layout_status" != 0 ]; then
 	fi
 fi
 # 기동 실패 rc를 배치·옵션 점검 rc보다 우선한다.
-[ "$critic_status" = 0 ] || exit "$critic_status"
-[ "$mate_status" = 0 ] || exit "$mate_status"
-[ "$layout_status" = 0 ] || exit "$layout_status"
+spawn_rc=0
+if [ "$critic_status" != 0 ]; then
+	spawn_rc="$critic_status"
+elif [ "$mate_status" != 0 ]; then
+	spawn_rc="$mate_status"
+elif [ "$layout_status" != 0 ]; then
+	spawn_rc="$layout_status"
+fi
+if [ "$mode" = "--up" ]; then
+	check_rc=0
+	run_check_summary || check_rc=$?
+	[ "$spawn_rc" = 0 ] || exit "$spawn_rc"
+	exit "$check_rc"
+fi
+[ "$spawn_rc" = 0 ] || exit "$spawn_rc"
 exit "$argv_status"
