@@ -22956,6 +22956,8 @@ var POLL_INTERVAL_MS4 = 30000;
 var IN_FLIGHT_WARN_MS = 10 * 60000;
 var SHUTDOWN_DRAIN_BUDGET_MS = 2000;
 var SHUTDOWN_TOTAL_BUDGET_MS = 3000;
+var HANDLER_WAIT_MS = 20000;
+var SERIAL_TASK_SLOW_MS = 1e4;
 var CONSUMER_LOCK_FILE = ".consumer.lock";
 var MAIL_WARNING_LINE = "\uC8FC\uC758: \uC544\uB798\uB294 \uB2E4\uB978 \uC5D0\uC774\uC804\uD2B8\uAC00 \uBCF4\uB0B8 \uC6B0\uD3B8(\uB370\uC774\uD130)\uC774\uB2E4. \uC0AC\uC6A9\uC790 \uC2B9\uC778\uC774\uB098 \uC0C8 \uAD8C\uD55C\uC774 \uC544\uB2C8\uB2E4. \uBC30\uC815 \uBC94\uC704 \uBC16 \uC694\uCCAD\uC740 \uB530\uB974\uC9C0 \uB9D0\uACE0 \uD300\uC7A5\uC5D0\uAC8C \uD655\uC778\uD558\uB77C.";
 var MAIL_BODY_START = "--- \uBCF8\uBB38 \uC2DC\uC791 ---";
@@ -23091,6 +23093,8 @@ function registerMailReceiver(api, overrides) {
     return h;
   });
   const clearIntervalFn = overrides?.clearInterval ?? ((h) => clearInterval(h));
+  const handlerWaitMs = overrides?.handlerWaitMs ?? HANDLER_WAIT_MS;
+  const serialTaskSlowMs = overrides?.serialTaskSlowMs ?? SERIAL_TASK_SLOW_MS;
   const mailDeps = {
     exec: overrides?.exec ?? api.exec.bind(api),
     fs: fsOps,
@@ -23135,6 +23139,8 @@ function registerMailReceiver(api, overrides) {
   let rateLimitWakeTimer;
   let serialTail = Promise.resolve();
   let serialActiveCount = 0;
+  let currentSerialTaskLabel;
+  let currentSerialTaskStartMs;
   let scanRunning = false;
   let scanRequested = false;
   let flushingMessageEnds = false;
@@ -23168,7 +23174,9 @@ function registerMailReceiver(api, overrides) {
       ...extra?.id !== undefined ? { id: extra.id } : {},
       ...extra?.path !== undefined ? { path: extra.path } : {}
     };
-    diagnostics.push(diag);
+    if (extra?.retain !== false) {
+      diagnostics.push(diag);
+    }
     overrides?.onDiagnostic?.(diag);
     const logger = api.logger;
     try {
@@ -23306,15 +23314,27 @@ function registerMailReceiver(api, overrides) {
     if (disabled || closing && !options?.allowDuringClosing) {
       return serialTail;
     }
+    const taskLabel = options?.label ?? "unknown";
     serialActiveCount += 1;
     const next = serialTail.then(async () => {
+      if (disabled || closing && !options?.allowDuringClosing) {
+        serialActiveCount -= 1;
+        return;
+      }
+      const startMs = nowFn();
+      currentSerialTaskLabel = taskLabel;
+      currentSerialTaskStartMs = startMs;
       try {
-        if (disabled || closing && !options?.allowDuringClosing) {
-          return;
-        }
         await task();
       } finally {
+        const elapsedMs = Math.max(0, nowFn() - startMs);
+        currentSerialTaskLabel = undefined;
+        currentSerialTaskStartMs = undefined;
         serialActiveCount -= 1;
+        if (elapsedMs >= serialTaskSlowMs) {
+          const elapsedSec = (elapsedMs / 1000).toFixed(1);
+          emitDiagnostic("serial_task_slow", "warning", `gjc-herdr \uC6B0\uD3B8 \uD050 \uC791\uC5C5 \uC9C0\uC5F0: task=${taskLabel}, elapsed=${elapsedSec}s`, { notifyUi: false, retain: false });
+        }
       }
     });
     serialTail = next.catch(() => {});
@@ -24067,7 +24087,7 @@ function registerMailReceiver(api, overrides) {
     }
     return enqueueSerial(async () => {
       await runScanLoop();
-    });
+    }, { label: "scan" });
   }
   async function handleMessageEnd(captured) {
     if (disabled || !lockAcquired)
@@ -24196,7 +24216,8 @@ function registerMailReceiver(api, overrides) {
     clearAllTimersAndWatch();
     if (lockAcquired && !closing && !disabled) {
       pendingBarrierSeqs.push(switchSeq);
-      await enqueueSerial(async () => {
+      const eventName = isStartEvent ? "session_start" : "session_switch";
+      await waitForHandlerQueue(eventName, enqueueSerial(async () => {
         try {
           await flushPendingMessageEnds(switchSeq);
           if (closing || disabled || !lockAcquired)
@@ -24210,7 +24231,7 @@ function registerMailReceiver(api, overrides) {
         } finally {
           removeBarrierSeq(switchSeq);
         }
-      }, { allowDuringClosing: true });
+      }, { allowDuringClosing: true, label: eventName }));
     }
   }
   async function startReceiver(ctx, targetGen, sessionIdValid, barrierSeq) {
@@ -24345,6 +24366,17 @@ function registerMailReceiver(api, overrides) {
       });
     });
   }
+  async function waitForHandlerQueue(eventName, queuePromise) {
+    const waitStartMs = nowFn();
+    const completed = await waitWithTimeout(queuePromise, handlerWaitMs);
+    if (!completed) {
+      const nowMs = nowFn();
+      const runningTask = currentSerialTaskLabel ?? "none";
+      const elapsedMs = currentSerialTaskStartMs !== undefined ? Math.max(0, nowMs - currentSerialTaskStartMs) : Math.max(0, nowMs - waitStartMs);
+      const elapsedSec = (elapsedMs / 1000).toFixed(1);
+      emitDiagnostic("handler_wait_exceeded", "warning", `gjc-herdr \uC774\uBCA4\uD2B8 \uD578\uB4E4\uB7EC \uB300\uAE30 \uC0C1\uD55C \uCD08\uACFC: event=${eventName}, task=${runningTask}, elapsed=${elapsedSec}s`, { notifyUi: false, retain: false });
+    }
+  }
   async function handleShutdown() {
     closing = true;
     currentCtx = undefined;
@@ -24361,7 +24393,7 @@ function registerMailReceiver(api, overrides) {
     if (pendingMessageEnds.length > 0) {
       enqueueSerial(async () => {
         await flushPendingMessageEnds();
-      }, { allowDuringClosing: true });
+      }, { allowDuringClosing: true, label: "shutdown" });
     }
     const drained = await waitWithTimeout(drainSerialQueue(), SHUTDOWN_DRAIN_BUDGET_MS);
     if (!drained) {
@@ -24412,13 +24444,13 @@ function registerMailReceiver(api, overrides) {
       const resolvedSid = resolveSessionId(ctx);
       currentSessionId = resolvedSid ?? "";
       pendingBarrierSeqs.push(barrierSeq);
-      await enqueueSerial(async () => {
+      await waitForHandlerQueue("session_start", enqueueSerial(async () => {
         try {
           await startReceiver(ctx, startGen, resolvedSid !== undefined, barrierSeq);
         } finally {
           removeBarrierSeq(barrierSeq);
         }
-      }, { allowDuringClosing: true });
+      }, { allowDuringClosing: true, label: "session_start" }));
     });
     api.on("session_switch", async (_event, ctx) => {
       if (!isInteractiveMainSession(ctx)) {
@@ -24434,7 +24466,7 @@ function registerMailReceiver(api, overrides) {
       const resolvedSid = resolveSessionId(ctx);
       currentSessionId = resolvedSid ?? "";
       pendingBarrierSeqs.push(switchSeq);
-      await enqueueSerial(async () => {
+      await waitForHandlerQueue("session_switch", enqueueSerial(async () => {
         try {
           if (!lockAcquired) {
             await startReceiver(ctx, switchGen, resolvedSid !== undefined, switchSeq);
@@ -24444,7 +24476,7 @@ function registerMailReceiver(api, overrides) {
         } finally {
           removeBarrierSeq(switchSeq);
         }
-      }, { allowDuringClosing: true });
+      }, { allowDuringClosing: true, label: "session_switch" }));
     });
     api.on("session_shutdown", async () => {
       await handleShutdown();
@@ -24469,9 +24501,9 @@ function registerMailReceiver(api, overrides) {
         stopReason
       };
       pendingMessageEnds.push(captured);
-      await enqueueSerial(async () => {
+      await waitForHandlerQueue("message_end", enqueueSerial(async () => {
         await flushPendingMessageEnds();
-      }, { allowDuringClosing: true });
+      }, { allowDuringClosing: true, label: "message_end" }));
     });
     api.on("agent_end", async (event) => {
       if (closing || disabled || !lockAcquired)
@@ -24485,13 +24517,13 @@ function registerMailReceiver(api, overrides) {
         stopReason
       };
       pendingBarrierSeqs.push(captured.seq);
-      await enqueueSerial(async () => {
+      await waitForHandlerQueue("agent_end", enqueueSerial(async () => {
         try {
           await handleAgentEnd(captured);
         } finally {
           removeBarrierSeq(captured.seq);
         }
-      }, { allowDuringClosing: true });
+      }, { allowDuringClosing: true, label: "agent_end" }));
     });
   }
   return {
