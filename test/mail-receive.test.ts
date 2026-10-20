@@ -26,6 +26,7 @@ import {
 import {
 	CONSUMER_LOCK_FILE,
 	formatInjectedMailContent,
+	HANDLER_WAIT_MS,
 	HOLD_RETRY_NOTICE,
 	IN_FLIGHT_WARN_MS,
 	isInteractiveMainSession,
@@ -39,6 +40,7 @@ import {
 	probePidStatus,
 	RATE_LIMIT_WINDOW_MS,
 	registerMailReceiver,
+	SERIAL_TASK_SLOW_MS,
 	SHUTDOWN_DRAIN_BUDGET_MS,
 	SHUTDOWN_TIMEOUT_MANUAL_ACTION,
 	truncateUtf8Boundary,
@@ -3464,5 +3466,437 @@ describe("#33 Phase 2 Round 3: Codex N1 & Pre-Publication Slot Tests", () => {
 		expect(h.clock.timers.size).toBeGreaterThanOrEqual(1);
 		expect(h.sentMessages.length).toBe(1);
 		expect(h.sentMessages[0]?.message.details?.id).toBe(idPending);
+	});
+});
+
+describe("#65: handler wait cap and slow serial task diagnostics", () => {
+	test("#65 fast queue operations emit 0 handler_wait_exceeded or serial_task_slow diagnostics and clear handler wait timers on completion", async () => {
+		expect(HANDLER_WAIT_MS).toBe(20_000);
+		expect(SERIAL_TASK_SLOW_MS).toBe(10_000);
+
+		const idFast = makeUlid(8000);
+		const h = createTestHarness({ idle: true });
+		const mFast = writeValidMailToFs(h.fs, { id: idFast });
+
+		await h.emit("session_start");
+		await h.controller.waitForIdleQueue();
+		expect(h.sentMessages.length).toBe(1);
+		const notificationsAfterStart = h.notifications.length;
+
+		await h.emit("message_end", {
+			message: {
+				role: "custom",
+				customType: "herdr-mail",
+				details: { id: idFast },
+			},
+		});
+		await h.emit("message_end", {
+			message: { role: "assistant", stopReason: "stop" },
+		});
+		await h.emit("agent_end", { stopReason: "completed" });
+		h.setSessionId("sess-fast-2");
+		await h.emit(
+			"session_switch",
+			{},
+			h.makeCtx({ sessionId: "sess-fast-2" }),
+		);
+		await h.controller.waitForIdleQueue();
+
+		const ackFast = parseMailAck(
+			h.fs.getFileText(
+				`/repo/.gjc-herdr/mailbox/gjc-worker/${idFast}.ack`,
+			)!,
+			{
+				expectedId: idFast,
+				expectedBy: "gjc-worker",
+				expectedBodySha256: mFast.bodySha256,
+			},
+		);
+		expect(ackFast.ok && ackFast.value.state).toBe("received");
+		expect(
+			h.diagnostics.filter(
+				(d) =>
+					d.code === "handler_wait_exceeded" ||
+					d.code === "serial_task_slow",
+			),
+		).toEqual([]);
+		expect(h.notifications.length).toBe(notificationsAfterStart);
+
+		await h.emit("session_shutdown");
+		expect(h.clock.timers.size).toBe(0);
+	});
+
+	test("#65 blocked queue task: message_end handler returns at handlerWaitMs with handler_wait_exceeded, unblocked queue processes events in arrival order, and slow task emits serial_task_slow without sensitive fields", async () => {
+		const id1 = makeUlid(8001);
+		const id2 = makeUlid(8002);
+		const secretBody1 = "TOP_SECRET_MAIL_BODY_8001";
+		const secretBody2 = "TOP_SECRET_MAIL_BODY_8002";
+		const sessionId = "sess-secret-8001";
+
+		const h = createTestHarness({
+			idle: true,
+			sessionId,
+			deps: {
+				handlerWaitMs: 4_000,
+				serialTaskSlowMs: 2_500,
+			},
+		});
+
+		const m1 = writeValidMailToFs(h.fs, { id: id1, body: `${secretBody1}\n` });
+		writeValidMailToFs(h.fs, { id: id2, body: `${secretBody2}\n` });
+
+		await h.emit("session_start");
+		await h.controller.waitForIdleQueue();
+		expect(h.sentMessages.length).toBe(2);
+		const notificationsAfterStart = h.notifications.length;
+
+		// Block the next "scan" serial task inside fs.readdir
+		let enteredSlowScan!: () => void;
+		const enteredSlowScanGate = new Promise<void>((resolve) => {
+			enteredSlowScan = resolve;
+		});
+		let releaseSlowScan!: () => void;
+		const slowScanGate = new Promise<void>((resolve) => {
+			releaseSlowScan = resolve;
+		});
+		let blockNextReaddir = true;
+		const origReaddir = h.fs.readdir.bind(h.fs);
+		h.fs.readdir = async (path: string) => {
+			if (blockNextReaddir && path.endsWith("/gjc-worker")) {
+				blockNextReaddir = false;
+				enteredSlowScan();
+				await slowScanGate;
+			}
+			return origReaddir(path);
+		};
+
+		const bgScanPromise = h.controller.triggerScan();
+		await enteredSlowScanGate;
+
+		// Scan task has been running for 1,000ms before message_end arrives
+		h.clock.advanceBy(1_000);
+
+		let stage1Returned = false;
+		const pStage1 = h
+			.emit("message_end", {
+				message: {
+					role: "custom",
+					customType: "herdr-mail",
+					details: { id: id1 },
+				},
+			})
+			.then(() => {
+				stage1Returned = true;
+			});
+
+		await Promise.resolve();
+		for (const t of h.clock.timers.values()) {
+			expect(t.unreffed).toBe(true);
+		}
+
+		// Before handlerWaitMs (4,000ms): at +3,900ms handler is still waiting
+		h.clock.advanceBy(3_900);
+		await Promise.resolve();
+		expect(stage1Returned).toBe(false);
+		expect(
+			h.diagnostics.filter((d) => d.code === "handler_wait_exceeded").length,
+		).toBe(0);
+
+		// Reach handlerWaitMs (+100ms -> 4,000ms handler wait, 5,000ms scan elapsed):
+		// 1st message_end handler returns while scan is still blocked!
+		h.clock.advanceBy(100);
+		await pStage1;
+		expect(stage1Returned).toBe(true);
+
+		// R1: Wait up to handlerWaitMs for a 2nd and 3rd message_end while the queue remains blocked
+		let stage1DupReturned = false;
+		const pStage1Dup = h
+			.emit("message_end", {
+				message: {
+					role: "custom",
+					customType: "herdr-mail",
+					details: { id: id1 },
+				},
+			})
+			.then(() => {
+				stage1DupReturned = true;
+			});
+		await Promise.resolve();
+		h.clock.advanceBy(4_000);
+		await pStage1Dup;
+		expect(stage1DupReturned).toBe(true);
+
+		let stage2Returned = false;
+		const pStage2 = h
+			.emit("message_end", {
+				message: { role: "assistant", stopReason: "stop" },
+			})
+			.then(() => {
+				stage2Returned = true;
+			});
+		await Promise.resolve();
+		h.clock.advanceBy(4_000);
+		await pStage2;
+		expect(stage2Returned).toBe(true);
+
+		const waitDiags = h.diagnostics.filter(
+			(d) => d.code === "handler_wait_exceeded",
+		);
+		expect(waitDiags.length).toBe(3);
+		expect(waitDiags[0]?.level).toBe("warning");
+		expect(waitDiags[0]?.message).toContain("event=message_end");
+		expect(waitDiags[0]?.message).toContain("task=scan");
+		expect(waitDiags[0]?.message).toContain("5.0s");
+		expect(waitDiags[1]?.message).toContain("9.0s");
+		expect(waitDiags[2]?.message).toContain("13.0s");
+		for (const d of waitDiags) {
+			expect(d.message).not.toContain(secretBody1);
+			expect(d.message).not.toContain("/repo/.gjc-herdr");
+			expect(d.message).not.toContain(sessionId);
+		}
+		expect(h.notifications.length).toBe(notificationsAfterStart);
+
+		// Queue cancelled agent_end barrier while "scan" is still blocked (transitions still-unobserved id2 to waiting_reinject -> reinjects id2 for 2nd call)
+		const queuedAfter = [
+			...h.emitNoWait("agent_end", { stopReason: "cancelled" }),
+		];
+
+		// Unblock the slow scan task (elapsed = 13,000ms >= serialTaskSlowMs 2,500ms)
+		releaseSlowScan();
+		await bgScanPromise;
+		await Promise.all(queuedAfter);
+		await h.controller.waitForIdleQueue();
+
+		// Slow task diagnostic emitted once via onDiagnostic when the blocked scan finished
+		const slowDiags = h.diagnostics.filter(
+			(d) => d.code === "serial_task_slow",
+		);
+		expect(slowDiags.length).toBe(1);
+		expect(slowDiags[0]?.level).toBe("warning");
+		expect(slowDiags[0]?.message).toContain("task=scan");
+		expect(slowDiags[0]?.message).toContain("13.0s");
+		expect(slowDiags[0]?.message).not.toContain(secretBody1);
+		expect(slowDiags[0]?.message).not.toContain(secretBody2);
+		expect(slowDiags[0]?.message).not.toContain("/repo/.gjc-herdr");
+		expect(slowDiags[0]?.message).not.toContain(sessionId);
+		expect(h.notifications.length).toBe(notificationsAfterStart);
+
+		// R1: controller.getStateSnapshot().diagnostics retains 0 handler_wait_exceeded or serial_task_slow entries
+		const retainedDiags = h.controller.getStateSnapshot().diagnostics;
+		expect(
+			retainedDiags.filter(
+				(d) =>
+					d.code === "handler_wait_exceeded" ||
+					d.code === "serial_task_slow",
+			),
+		).toEqual([]);
+		expect(retainedDiags.some((d) => d.code === "mailbox_ready")).toBe(true);
+
+		// Verify queued work ran in exact arrival order:
+		// id1 settled as received on 1st call; id2 was reinjected by the subsequent agent_end (2 calls total)
+		expect(
+			h.sentMessages.filter((m) => m.message.details?.id === id1).length,
+		).toBe(1);
+		expect(
+			h.sentMessages.filter((m) => m.message.details?.id === id2).length,
+		).toBe(2);
+
+		const ack1 = parseMailAck(
+			h.fs.getFileText(`/repo/.gjc-herdr/mailbox/gjc-worker/${id1}.ack`)!,
+			{
+				expectedId: id1,
+				expectedBy: "gjc-worker",
+				expectedBodySha256: m1.bodySha256,
+			},
+		);
+		expect(ack1.ok && ack1.value.state).toBe("received");
+		expect(
+			h.controller.getStateSnapshot().activeRecords.get(id2)?.state,
+		).toBe("in_flight");
+		expect(
+			h.controller.getStateSnapshot().activeRecords.get(id2)?.callCount,
+		).toBe(2);
+	});
+
+	test("#65 N1: after message_end returns at handlerWaitMs on a blocked queue, (a) session_switch also returns at handlerWaitMs and settles prior generation as uncertain(session_changed) once unblocked, and (b) session_shutdown finishes cleanly with 0 remaining timers", async () => {
+		// (a) message_end returns at cap -> session_switch returns at cap -> gate released -> ordered completion & foreign generation uncertain(session_changed)
+		const idSwitch = makeUlid(8010);
+		const hA = createTestHarness({
+			idle: true,
+			deps: {
+				handlerWaitMs: 4_000,
+				serialTaskSlowMs: 2_500,
+			},
+		});
+		writeValidMailToFs(hA.fs, { id: idSwitch });
+
+		await hA.emit("session_start");
+		await hA.controller.waitForIdleQueue();
+		expect(hA.sentMessages.length).toBe(1);
+		expect(
+			hA.controller.getStateSnapshot().activeRecords.get(idSwitch)?.state,
+		).toBe("in_flight");
+
+		let enteredGateA!: () => void;
+		const enteredGateAPromise = new Promise<void>((resolve) => {
+			enteredGateA = resolve;
+		});
+		let releaseGateA!: () => void;
+		const gateAPromise = new Promise<void>((resolve) => {
+			releaseGateA = resolve;
+		});
+		let blockReaddirA = true;
+		const origReaddirA = hA.fs.readdir.bind(hA.fs);
+		hA.fs.readdir = async (path: string) => {
+			if (blockReaddirA && path.endsWith("/gjc-worker")) {
+				blockReaddirA = false;
+				enteredGateA();
+				await gateAPromise;
+			}
+			return origReaddirA(path);
+		};
+
+		const bgScanA = hA.controller.triggerScan();
+		await enteredGateAPromise;
+
+		// Stage 1 and Stage 2 message_end from generation 1 return at handlerWaitMs while scan is blocked
+		const pMsg1A = hA.emit("message_end", {
+			message: {
+				role: "custom",
+				customType: "herdr-mail",
+				details: { id: idSwitch },
+			},
+		});
+		await Promise.resolve();
+		hA.clock.advanceBy(4_000);
+		await pMsg1A;
+
+		const pMsg2A = hA.emit("message_end", {
+			message: { role: "assistant", stopReason: "stop" },
+		});
+		await Promise.resolve();
+		hA.clock.advanceBy(4_000);
+		await pMsg2A;
+
+		// Now session_switch arrives after message_end returned at cap, and also returns at handlerWaitMs
+		hA.setSessionId("sess-switched-8010");
+		let switchReturned = false;
+		const pSwitchA = hA
+			.emit(
+				"session_switch",
+				{},
+				hA.makeCtx({ sessionId: "sess-switched-8010" }),
+			)
+			.then(() => {
+				switchReturned = true;
+			});
+		await Promise.resolve();
+		hA.clock.advanceBy(3_900);
+		await Promise.resolve();
+		expect(switchReturned).toBe(false);
+		hA.clock.advanceBy(100);
+		await pSwitchA;
+		expect(switchReturned).toBe(true);
+
+		const waitDiagsA = hA.diagnostics.filter(
+			(d) => d.code === "handler_wait_exceeded",
+		);
+		expect(waitDiagsA.length).toBe(3);
+		expect(waitDiagsA[2]?.message).toContain("event=session_switch");
+		expect(waitDiagsA[2]?.message).toContain("task=scan");
+
+		// Release gate -> queue drains in order; generation 1 observations are ignored after synchronous generation bump, and idSwitch settles as uncertain(session_changed)
+		releaseGateA();
+		await bgScanA;
+		await hA.controller.waitForIdleQueue();
+
+		const ackSwitch = parseMailAck(
+			hA.fs.getFileText(
+				`/repo/.gjc-herdr/mailbox/gjc-worker/${idSwitch}.ack`,
+			)!,
+			{ expectedId: idSwitch, expectedBy: "gjc-worker" },
+		);
+		expect(ackSwitch.ok).toBe(true);
+		if (ackSwitch.ok) {
+			expect(ackSwitch.value.state).toBe("uncertain");
+			expect(ackSwitch.value.reason).toBe("session_changed");
+		}
+		expect(
+			hA.controller
+				.getStateSnapshot()
+				.diagnostics.filter(
+					(d) =>
+						d.code === "handler_wait_exceeded" ||
+						d.code === "serial_task_slow",
+				),
+		).toEqual([]);
+		await hA.emit("session_shutdown");
+		expect(hA.clock.timers.size).toBe(0);
+
+		// (b) message_end returns at cap -> session_shutdown completes without error and leaves 0 timers
+		const idShutdown = makeUlid(8011);
+		const hB = createTestHarness({
+			idle: true,
+			deps: {
+				handlerWaitMs: 4_000,
+				serialTaskSlowMs: 2_500,
+			},
+		});
+		writeValidMailToFs(hB.fs, { id: idShutdown });
+
+		await hB.emit("session_start");
+		await hB.controller.waitForIdleQueue();
+
+		let enteredGateB!: () => void;
+		const enteredGateBPromise = new Promise<void>((resolve) => {
+			enteredGateB = resolve;
+		});
+		let releaseGateB!: () => void;
+		const gateBPromise = new Promise<void>((resolve) => {
+			releaseGateB = resolve;
+		});
+		let blockReaddirB = true;
+		const origReaddirB = hB.fs.readdir.bind(hB.fs);
+		hB.fs.readdir = async (path: string) => {
+			if (blockReaddirB && path.endsWith("/gjc-worker")) {
+				blockReaddirB = false;
+				enteredGateB();
+				await gateBPromise;
+			}
+			return origReaddirB(path);
+		};
+
+		const bgScanB = hB.controller.triggerScan();
+		await enteredGateBPromise;
+
+		const pMsgB = hB.emit("message_end", {
+			message: {
+				role: "custom",
+				customType: "herdr-mail",
+				details: { id: idShutdown },
+			},
+		});
+		await Promise.resolve();
+		hB.clock.advanceBy(4_000);
+		await pMsgB;
+
+		const shutdownPromisesB = hB.emitNoWait("session_shutdown");
+		await Promise.resolve();
+		releaseGateB();
+		await bgScanB;
+		await Promise.all(shutdownPromisesB);
+		await hB.controller.waitForIdleQueue();
+
+		expect(hB.clock.timers.size).toBe(0);
+		expect(hB.controller.getStateSnapshot().lockAcquired).toBe(false);
+		expect(
+			hB.controller
+				.getStateSnapshot()
+				.diagnostics.filter(
+					(d) =>
+						d.code === "handler_wait_exceeded" ||
+						d.code === "serial_task_slow",
+				),
+		).toEqual([]);
 	});
 });

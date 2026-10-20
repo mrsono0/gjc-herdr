@@ -43,6 +43,8 @@ export const POLL_INTERVAL_MS = 30_000;
 export const IN_FLIGHT_WARN_MS = 10 * 60_000;
 export const SHUTDOWN_DRAIN_BUDGET_MS = 2_000;
 export const SHUTDOWN_TOTAL_BUDGET_MS = 3_000;
+export const HANDLER_WAIT_MS = 20_000;
+export const SERIAL_TASK_SLOW_MS = 10_000;
 export const CONSUMER_LOCK_FILE = ".consumer.lock";
 
 export const MAIL_WARNING_LINE =
@@ -129,6 +131,8 @@ export interface MailReceiverDeps {
 	beforeAttemptPublish?: (id: string) => Promise<void> | void;
 	afterAttemptPublish?: (id: string) => Promise<void> | void;
 	beforeSendMessage?: (id: string, callNumber: number) => Promise<void> | void;
+	handlerWaitMs?: number;
+	serialTaskSlowMs?: number;
 }
 
 export interface MailReceiverStateSnapshot {
@@ -365,6 +369,8 @@ export function registerMailReceiver(
 	const clearIntervalFn =
 		overrides?.clearInterval ??
 		((h) => clearInterval(h as ReturnType<typeof setInterval>));
+	const handlerWaitMs = overrides?.handlerWaitMs ?? HANDLER_WAIT_MS;
+	const serialTaskSlowMs = overrides?.serialTaskSlowMs ?? SERIAL_TASK_SLOW_MS;
 
 	const mailDeps: MailDeps = {
 		exec: overrides?.exec ?? api.exec.bind(api),
@@ -416,6 +422,8 @@ export function registerMailReceiver(
 
 	let serialTail: Promise<void> = Promise.resolve();
 	let serialActiveCount = 0;
+	let currentSerialTaskLabel: string | undefined;
+	let currentSerialTaskStartMs: number | undefined;
 	let scanRunning = false;
 	let scanRequested = false;
 	let flushingMessageEnds = false;
@@ -449,7 +457,12 @@ export function registerMailReceiver(
 		code: string,
 		level: "info" | "warning" | "error",
 		message: string,
-		extra?: { id?: string; path?: string; notifyUi?: boolean },
+		extra?: {
+			id?: string;
+			path?: string;
+			notifyUi?: boolean;
+			retain?: boolean;
+		},
 	): void {
 		const diag: MailReceiverDiagnostic = {
 			code,
@@ -458,7 +471,9 @@ export function registerMailReceiver(
 			...(extra?.id !== undefined ? { id: extra.id } : {}),
 			...(extra?.path !== undefined ? { path: extra.path } : {}),
 		};
-		diagnostics.push(diag);
+		if (extra?.retain !== false) {
+			diagnostics.push(diag);
+		}
 		overrides?.onDiagnostic?.(diag);
 
 		const logger = (
@@ -642,20 +657,37 @@ export function registerMailReceiver(
 
 	function enqueueSerial(
 		task: () => Promise<void>,
-		options?: { allowDuringClosing?: boolean },
+		options?: { allowDuringClosing?: boolean; label?: string },
 	): Promise<void> {
 		if (disabled || (closing && !options?.allowDuringClosing)) {
 			return serialTail;
 		}
+		const taskLabel = options?.label ?? "unknown";
 		serialActiveCount += 1;
 		const next = serialTail.then(async () => {
+			if (disabled || (closing && !options?.allowDuringClosing)) {
+				serialActiveCount -= 1;
+				return;
+			}
+			const startMs = nowFn();
+			currentSerialTaskLabel = taskLabel;
+			currentSerialTaskStartMs = startMs;
 			try {
-				if (disabled || (closing && !options?.allowDuringClosing)) {
-					return;
-				}
 				await task();
 			} finally {
+				const elapsedMs = Math.max(0, nowFn() - startMs);
+				currentSerialTaskLabel = undefined;
+				currentSerialTaskStartMs = undefined;
 				serialActiveCount -= 1;
+				if (elapsedMs >= serialTaskSlowMs) {
+					const elapsedSec = (elapsedMs / 1_000).toFixed(1);
+					emitDiagnostic(
+						"serial_task_slow",
+						"warning",
+						`gjc-herdr 우편 큐 작업 지연: task=${taskLabel}, elapsed=${elapsedSec}s`,
+						{ notifyUi: false, retain: false },
+					);
+				}
 			}
 		});
 		serialTail = next.catch(() => {
@@ -1685,9 +1717,12 @@ export function registerMailReceiver(
 		if (scanRunning) {
 			return serialTail;
 		}
-		return enqueueSerial(async () => {
-			await runScanLoop();
-		});
+		return enqueueSerial(
+			async () => {
+				await runScanLoop();
+			},
+			{ label: "scan" },
+		);
 	}
 
 	async function handleMessageEnd(captured: CapturedMessageEnd): Promise<void> {
@@ -1887,23 +1922,27 @@ export function registerMailReceiver(
 		clearAllTimersAndWatch();
 		if (lockAcquired && !closing && !disabled) {
 			pendingBarrierSeqs.push(switchSeq);
-			await enqueueSerial(
-				async () => {
-					try {
-						await flushPendingMessageEnds(switchSeq);
-						if (closing || disabled || !lockAcquired) return;
-						const staleRecords = Array.from(activeRecords.values())
-							.filter((r) => r.generation !== switchGen)
-							.sort((a, b) => a.id.localeCompare(b.id));
-						for (const record of staleRecords) {
-							if (closing || disabled) return;
-							await transitionToUncertain(record, "session_changed");
+			const eventName = isStartEvent ? "session_start" : "session_switch";
+			await waitForHandlerQueue(
+				eventName,
+				enqueueSerial(
+					async () => {
+						try {
+							await flushPendingMessageEnds(switchSeq);
+							if (closing || disabled || !lockAcquired) return;
+							const staleRecords = Array.from(activeRecords.values())
+								.filter((r) => r.generation !== switchGen)
+								.sort((a, b) => a.id.localeCompare(b.id));
+							for (const record of staleRecords) {
+								if (closing || disabled) return;
+								await transitionToUncertain(record, "session_changed");
+							}
+						} finally {
+							removeBarrierSeq(switchSeq);
 						}
-					} finally {
-						removeBarrierSeq(switchSeq);
-					}
-				},
-				{ allowDuringClosing: true },
+					},
+					{ allowDuringClosing: true, label: eventName },
+				),
 			);
 		}
 	}
@@ -2110,6 +2149,29 @@ export function registerMailReceiver(
 		});
 	}
 
+	async function waitForHandlerQueue(
+		eventName: string,
+		queuePromise: Promise<void>,
+	): Promise<void> {
+		const waitStartMs = nowFn();
+		const completed = await waitWithTimeout(queuePromise, handlerWaitMs);
+		if (!completed) {
+			const nowMs = nowFn();
+			const runningTask = currentSerialTaskLabel ?? "none";
+			const elapsedMs =
+				currentSerialTaskStartMs !== undefined
+					? Math.max(0, nowMs - currentSerialTaskStartMs)
+					: Math.max(0, nowMs - waitStartMs);
+			const elapsedSec = (elapsedMs / 1_000).toFixed(1);
+			emitDiagnostic(
+				"handler_wait_exceeded",
+				"warning",
+				`gjc-herdr 이벤트 핸들러 대기 상한 초과: event=${eventName}, task=${runningTask}, elapsed=${elapsedSec}s`,
+				{ notifyUi: false, retain: false },
+			);
+		}
+	}
+
 	async function handleShutdown(): Promise<void> {
 		// §5.1 Step 1: Synchronously raise closing fence, abort in-flight attempt publication, and invalidate ctx.
 		closing = true;
@@ -2146,7 +2208,7 @@ export function registerMailReceiver(
 				async () => {
 					await flushPendingMessageEnds();
 				},
-				{ allowDuringClosing: true },
+				{ allowDuringClosing: true, label: "shutdown" },
 			);
 		}
 
@@ -2237,20 +2299,23 @@ export function registerMailReceiver(
 			const resolvedSid = resolveSessionId(ctx);
 			currentSessionId = resolvedSid ?? "";
 			pendingBarrierSeqs.push(barrierSeq);
-			await enqueueSerial(
-				async () => {
-					try {
-						await startReceiver(
-							ctx,
-							startGen,
-							resolvedSid !== undefined,
-							barrierSeq,
-						);
-					} finally {
-						removeBarrierSeq(barrierSeq);
-					}
-				},
-				{ allowDuringClosing: true },
+			await waitForHandlerQueue(
+				"session_start",
+				enqueueSerial(
+					async () => {
+						try {
+							await startReceiver(
+								ctx,
+								startGen,
+								resolvedSid !== undefined,
+								barrierSeq,
+							);
+						} finally {
+							removeBarrierSeq(barrierSeq);
+						}
+					},
+					{ allowDuringClosing: true, label: "session_start" },
+				),
 			);
 		});
 
@@ -2269,28 +2334,31 @@ export function registerMailReceiver(
 			const resolvedSid = resolveSessionId(ctx);
 			currentSessionId = resolvedSid ?? "";
 			pendingBarrierSeqs.push(switchSeq);
-			await enqueueSerial(
-				async () => {
-					try {
-						if (!lockAcquired) {
-							await startReceiver(
-								ctx,
-								switchGen,
-								resolvedSid !== undefined,
-								switchSeq,
-							);
-						} else {
-							await handleSessionSwitch(
-								switchGen,
-								resolvedSid !== undefined,
-								switchSeq,
-							);
+			await waitForHandlerQueue(
+				"session_switch",
+				enqueueSerial(
+					async () => {
+						try {
+							if (!lockAcquired) {
+								await startReceiver(
+									ctx,
+									switchGen,
+									resolvedSid !== undefined,
+									switchSeq,
+								);
+							} else {
+								await handleSessionSwitch(
+									switchGen,
+									resolvedSid !== undefined,
+									switchSeq,
+								);
+							}
+						} finally {
+							removeBarrierSeq(switchSeq);
 						}
-					} finally {
-						removeBarrierSeq(switchSeq);
-					}
-				},
-				{ allowDuringClosing: true },
+					},
+					{ allowDuringClosing: true, label: "session_switch" },
+				),
 			);
 		});
 
@@ -2333,11 +2401,14 @@ export function registerMailReceiver(
 				stopReason,
 			};
 			pendingMessageEnds.push(captured);
-			await enqueueSerial(
-				async () => {
-					await flushPendingMessageEnds();
-				},
-				{ allowDuringClosing: true },
+			await waitForHandlerQueue(
+				"message_end",
+				enqueueSerial(
+					async () => {
+						await flushPendingMessageEnds();
+					},
+					{ allowDuringClosing: true, label: "message_end" },
+				),
 			);
 		});
 
@@ -2357,15 +2428,18 @@ export function registerMailReceiver(
 				stopReason,
 			};
 			pendingBarrierSeqs.push(captured.seq);
-			await enqueueSerial(
-				async () => {
-					try {
-						await handleAgentEnd(captured);
-					} finally {
-						removeBarrierSeq(captured.seq);
-					}
-				},
-				{ allowDuringClosing: true },
+			await waitForHandlerQueue(
+				"agent_end",
+				enqueueSerial(
+					async () => {
+						try {
+							await handleAgentEnd(captured);
+						} finally {
+							removeBarrierSeq(captured.seq);
+						}
+					},
+					{ allowDuringClosing: true, label: "agent_end" },
+				),
 			);
 		});
 	}
