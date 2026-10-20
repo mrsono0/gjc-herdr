@@ -1708,4 +1708,655 @@ describe("scripts/layout-watch.py (#55)", () => {
 		},
 		15_000,
 	);
+
+	test("23. team-up.sh --layout·--spawn (#59): (a) 작은 오차 resize, (b) 2-pane inside, (c) resize 실패, (d) 비숫자 ratio, (e) 리사이즈 중 모양 변경, (f) ext_agent_info 보충 조회·거부, python3 횟수(10회) 및 pane_place 중복 제거", () => {
+		const rawTmp = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-lw-teamup-"));
+		const tmpDir = fs.realpathSync(rawTmp);
+		const sockDir = fs.mkdtempSync(path.join("/tmp", "gjch-lw59-"));
+		cleanups.push(() => {
+			fs.rmSync(tmpDir, { recursive: true, force: true });
+			fs.rmSync(sockDir, { recursive: true, force: true });
+		});
+
+		const binDir = path.join(tmpDir, "bin");
+		const stateDir = path.join(tmpDir, "state");
+		const homeDir = path.join(tmpDir, "home");
+		const herdrLog = path.join(tmpDir, "herdr.log");
+		const pyLog = path.join(tmpDir, "python3.log");
+		const lockPath = path.join(tmpDir, "lead.json");
+		const msgSock = path.join(sockDir, "m.sock");
+		const teamUpSh = path.join(REPO_ROOT, "scripts", "team-up.sh");
+
+		fs.mkdirSync(binDir, { recursive: true });
+		fs.mkdirSync(stateDir, { recursive: true });
+		fs.mkdirSync(homeDir, { recursive: true });
+
+		const sockBind = spawnSync(
+			REAL_PYTHON3,
+			[
+				"-c",
+				"import socket,sys; s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); s.close()",
+				msgSock,
+			],
+			{ encoding: "utf8", timeout: 5_000 },
+		);
+		expect(sockBind.status).toBe(0);
+
+		for (const candidate of ["/opt/homebrew/bin/git", "/usr/bin/git"]) {
+			if (fs.existsSync(candidate)) {
+				fs.symlinkSync(candidate, path.join(binDir, "git"));
+				break;
+			}
+		}
+
+		// python3 호출 횟수를 세는 래퍼
+		const pyWrapper = `#!/bin/sh
+printf '1\\n' >> ${JSON.stringify(pyLog)}
+exec ${JSON.stringify(REAL_PYTHON3)} "$@"
+`;
+		fs.writeFileSync(path.join(binDir, "python3"), pyWrapper, "utf8");
+		fs.chmodSync(path.join(binDir, "python3"), 0o755);
+
+		fs.writeFileSync(
+			path.join(binDir, "agy"),
+			"#!/bin/sh\nprintf '1.0.0-stub\\n'\n",
+			"utf8",
+		);
+		fs.chmodSync(path.join(binDir, "agy"), 0o755);
+		fs.writeFileSync(
+			path.join(binDir, "codex"),
+			"#!/bin/sh\nprintf '0.1.0-stub\\n'\n",
+			"utf8",
+		);
+		fs.chmodSync(path.join(binDir, "codex"), 0o755);
+
+		const codexStatusLine =
+			'tui.status_line=["context-remaining","total-input-tokens","total-output-tokens"]';
+		fs.writeFileSync(
+			path.join(stateDir, "proc-mate.json"),
+			JSON.stringify({
+				id: "req-1",
+				result: {
+					type: "pane_process_info",
+					process_info: {
+						pane_id: MATE_PANE,
+						shell_pid: 1000,
+						foreground_process_group_id: 2000,
+						foreground_processes: [
+							{
+								pid: 3001,
+								name: "agy",
+								argv0: "agy",
+								cwd: REPO_ROOT,
+								argv: [
+									"agy",
+									"--model",
+									"gemini-4-argon-high",
+									"--mode",
+									"accept-edits",
+									"--sandbox",
+								],
+							},
+						],
+					},
+				},
+			}),
+			"utf8",
+		);
+		fs.writeFileSync(
+			path.join(stateDir, "proc-critic.json"),
+			JSON.stringify({
+				id: "req-2",
+				result: {
+					type: "pane_process_info",
+					process_info: {
+						pane_id: CRITIC_PANE,
+						shell_pid: 1001,
+						foreground_process_group_id: 2001,
+						foreground_processes: [
+							{
+								pid: 3002,
+								name: "codex",
+								argv0: "codex",
+								cwd: REPO_ROOT,
+								argv: [
+									"codex",
+									"--no-daemon",
+									"--yolo",
+									"-m",
+									"gpt-6.1-sol",
+									"-C",
+									REPO_ROOT,
+									"--disable",
+									"worktrees",
+									"-c",
+									codexStatusLine,
+									"-c",
+									"project_doc_max_bytes=65536",
+								],
+							},
+						],
+					},
+				},
+			}),
+			"utf8",
+		);
+
+		fs.writeFileSync(
+			path.join(stateDir, "agent-lead.json"),
+			JSON.stringify({
+				result: {
+					agent: {
+						pane_id: LEAD_PANE,
+						workspace_id: TEAM_WS,
+						agent: "claude",
+						name: "gjc-herdr-lead",
+						cwd: REPO_ROOT,
+						foreground_cwd: REPO_ROOT,
+						agent_status: "idle",
+						interactive_ready: true,
+					},
+				},
+			}),
+			"utf8",
+		);
+		const writeDefaultAgents = () => {
+			fs.rmSync(path.join(stateDir, "critic-absent"), { force: true });
+			fs.rmSync(path.join(stateDir, "pane-mate-cwd.txt"), { force: true });
+			fs.writeFileSync(
+				path.join(stateDir, "agent-mate.json"),
+				JSON.stringify({
+					result: {
+						agent: {
+							pane_id: MATE_PANE,
+							workspace_id: TEAM_WS,
+							agent: "agy",
+							name: "gjc-herdr-mate",
+							cwd: REPO_ROOT,
+							foreground_cwd: REPO_ROOT,
+							agent_status: "idle",
+							interactive_ready: true,
+						},
+					},
+				}),
+				"utf8",
+			);
+			fs.writeFileSync(
+				path.join(stateDir, "agent-critic.json"),
+				JSON.stringify({
+					result: {
+						agent: {
+							pane_id: CRITIC_PANE,
+							workspace_id: TEAM_WS,
+							agent: "codex",
+							name: "gjc-herdr-critic",
+							cwd: REPO_ROOT,
+							foreground_cwd: REPO_ROOT,
+							agent_status: "idle",
+							interactive_ready: true,
+						},
+					},
+				}),
+				"utf8",
+			);
+		};
+		writeDefaultAgents();
+
+		// 필요한 명령만 허용하고 그 밖의 명령은 실패시키는 가짜 herdr
+		const fakeHerdr = `#!/bin/sh
+printf '%s\\n' "$*" >> ${JSON.stringify(herdrLog)}
+cmd="\${1:-}"
+sub="\${2:-}"
+if [ "$cmd" = "agent" ] && [ "$sub" = "get" ]; then
+	name="\${3:-}"
+	if [ "$name" = "gjc-herdr-lead" ]; then
+		cat ${JSON.stringify(path.join(stateDir, "agent-lead.json"))}
+		exit 0
+	fi
+	if [ "$name" = "gjc-herdr-mate" ]; then
+		cat ${JSON.stringify(path.join(stateDir, "agent-mate.json"))}
+		exit 0
+	fi
+	if [ "$name" = "gjc-herdr-critic" ]; then
+		if [ -f ${JSON.stringify(path.join(stateDir, "critic-absent"))} ]; then
+			printf '{"error":{"code":"agent_not_found","message":"not found"}}\\n' >&2
+			exit 1
+		fi
+		cat ${JSON.stringify(path.join(stateDir, "agent-critic.json"))}
+		exit 0
+	fi
+	printf '{"error":{"code":"agent_not_found","message":"not found"}}\\n' >&2
+	exit 1
+fi
+if [ "$cmd" = "agent" ] && [ "$sub" = "rename" ]; then
+	printf '{"result":{"ok":true}}\\n'
+	exit 0
+fi
+if [ "$cmd" = "pane" ] && [ "$sub" = "get" ]; then
+	pane="\${3:-}"
+	kind="claude"
+	cwd_val=${JSON.stringify(REPO_ROOT)}
+	if [ "$pane" = "${MATE_PANE}" ]; then
+		kind="agy"
+		if [ -f ${JSON.stringify(path.join(stateDir, "pane-mate-cwd.txt"))} ]; then
+			cwd_val="$(cat ${JSON.stringify(path.join(stateDir, "pane-mate-cwd.txt"))})"
+		fi
+	fi
+	if [ "$pane" = "${CRITIC_PANE}" ]; then kind="codex"; fi
+	printf '{"result":{"pane":{"pane_id":"%s","workspace_id":"${TEAM_WS}","tab_id":"${TEAM_TAB}","agent":"%s","cwd":"%s","foreground_cwd":"%s","agent_status":"idle"}}}\\n' "$pane" "$kind" "$cwd_val" "$cwd_val"
+	exit 0
+fi
+if [ "$cmd" = "pane" ] && [ "$sub" = "rename" ]; then
+	printf '{"result":{"ok":true}}\\n'
+	exit 0
+fi
+if [ "$cmd" = "pane" ] && [ "$sub" = "layout" ]; then
+	cat ${JSON.stringify(path.join(stateDir, "layout.json"))}
+	exit 0
+fi
+if [ "$cmd" = "pane" ] && [ "$sub" = "resize" ]; then
+	if [ -f ${JSON.stringify(path.join(stateDir, "resize-fail"))} ]; then
+		printf '{"error":{"code":"resize_failed","message":"resize failed"}}\\n' >&2
+		exit 1
+	fi
+	if [ -f ${JSON.stringify(path.join(stateDir, "layout-after-resize.json"))} ]; then
+		cp ${JSON.stringify(path.join(stateDir, "layout-after-resize.json"))} ${JSON.stringify(path.join(stateDir, "layout.json"))}
+	fi
+	printf '{"result":{"ok":true}}\\n'
+	exit 0
+fi
+if [ "$cmd" = "pane" ] && [ "$sub" = "process-info" ]; then
+	pane="\${4:-}"
+	if [ "$pane" = "${MATE_PANE}" ]; then
+		cat ${JSON.stringify(path.join(stateDir, "proc-mate.json"))}
+		exit 0
+	fi
+	if [ "$pane" = "${CRITIC_PANE}" ]; then
+		cat ${JSON.stringify(path.join(stateDir, "proc-critic.json"))}
+		exit 0
+	fi
+	exit 1
+fi
+if [ "$cmd" = "workspace" ] && [ "$sub" = "get" ]; then
+	printf '{"result":{"workspace":{"workspace_id":"${TEAM_WS}","label":"GJCH · gjc-herdr"}}}\\n'
+	exit 0
+fi
+if [ "$cmd" = "workspace" ] && [ "$sub" = "rename" ]; then
+	printf '{"result":{"ok":true}}\\n'
+	exit 0
+fi
+printf 'unexpected herdr call: %s\\n' "$*" >&2
+exit 1
+`;
+		fs.writeFileSync(path.join(binDir, "herdr"), fakeHerdr, "utf8");
+		fs.chmodSync(path.join(binDir, "herdr"), 0o755);
+
+		const makeBaseEnv = (overrides: Record<string, string>): NodeJS.ProcessEnv => {
+			const env: NodeJS.ProcessEnv = { ...process.env };
+			for (const key of STRIPPED_ENV_KEYS) {
+				delete env[key];
+			}
+			for (const key of Object.keys(env)) {
+				if (/^GIT_CONFIG_(KEY|VALUE)_/.test(key)) {
+					delete env[key];
+				}
+			}
+			return {
+				...env,
+				PATH: `${binDir}:/usr/bin:/bin:/usr/sbin:/sbin`,
+				HOME: homeDir,
+				GIT_CONFIG_GLOBAL: "/dev/null",
+				GIT_CONFIG_NOSYSTEM: "1",
+				PYTHONNOUSERSITE: "1",
+				CLAUDE_PROJECT_DIR: REPO_ROOT,
+				GJCH_LEAD_LOCK: lockPath,
+				...overrides,
+			};
+		};
+
+		const readLogLines = (p: string): string[] =>
+			fs.existsSync(p)
+				? fs.readFileSync(p, "utf8").trim().split("\n").filter(Boolean)
+				: [];
+
+		const resetLogs = () => {
+			fs.rmSync(herdrLog, { force: true });
+			fs.rmSync(pyLog, { force: true });
+			fs.rmSync(path.join(stateDir, "layout-after-resize.json"), { force: true });
+			fs.rmSync(path.join(stateDir, "resize-fail"), { force: true });
+		};
+
+		const extTargetLayout = (ratio: unknown) =>
+			JSON.stringify({
+				result: {
+					layout: {
+						panes: [
+							{ pane_id: MATE_PANE, rect: { x: 0, y: 0, width: 60, height: 40 } },
+							{ pane_id: CRITIC_PANE, rect: { x: 60, y: 0, width: 60, height: 40 } },
+						],
+						splits: [
+							{
+								direction: "right",
+								rect: { x: 0, y: 0, width: 120, height: 40 },
+								ratio,
+							},
+						],
+					},
+				},
+			});
+
+		const insideTargetLayout = (downRatio: unknown, rightRatio: unknown) =>
+			JSON.stringify({
+				result: {
+					layout: {
+						panes: [
+							{ pane_id: LEAD_PANE, rect: { x: 0, y: 0, width: 120, height: 24 } },
+							{ pane_id: MATE_PANE, rect: { x: 0, y: 24, width: 60, height: 16 } },
+							{ pane_id: CRITIC_PANE, rect: { x: 60, y: 24, width: 60, height: 16 } },
+						],
+						splits: [
+							{
+								direction: "down",
+								rect: { x: 0, y: 0, width: 120, height: 40 },
+								ratio: downRatio,
+							},
+							{
+								direction: "right",
+								rect: { x: 0, y: 24, width: 120, height: 16 },
+								ratio: rightRatio,
+							},
+						],
+					},
+				},
+			});
+
+		const inside2PaneLayout = (downRatio: unknown) =>
+			JSON.stringify({
+				result: {
+					layout: {
+						panes: [
+							{ pane_id: LEAD_PANE, rect: { x: 0, y: 0, width: 120, height: 24 } },
+							{ pane_id: MATE_PANE, rect: { x: 0, y: 24, width: 120, height: 16 } },
+						],
+						splits: [
+							{
+								direction: "down",
+								rect: { x: 0, y: 0, width: 120, height: 40 },
+								ratio: downRatio,
+							},
+						],
+					},
+				},
+			});
+
+		const envExternal = makeBaseEnv({
+			GJCH_EXTERNAL_LEAD: "1",
+			CLAUDE_CODE_SESSION_ID: "ext-lead-sess-59",
+			CLAUDE_CODE_MESSAGING_SOCKET: msgSock,
+		});
+
+		const envInside = makeBaseEnv({
+			HERDR_ENV: "1",
+			HERDR_WORKSPACE_ID: TEAM_WS,
+			HERDR_PANE_ID: LEAD_PANE,
+		});
+
+		const runTeamUp = (env: NodeJS.ProcessEnv, modeArg: "--layout" | "--spawn") =>
+			spawnSync("/bin/bash", [teamUpSh, modeArg], {
+				cwd: REPO_ROOT,
+				env,
+				encoding: "utf8",
+				timeout: 15_000,
+			});
+
+		// 0. 외부 --layout (이미 목표 0.5): resize 미호출, 두 번째 layout 읽기 수행(총 3회), python3 10회
+		resetLogs();
+		fs.writeFileSync(path.join(stateDir, "layout.json"), extTargetLayout(0.5), "utf8");
+		const extOkRes = runTeamUp(envExternal, "--layout");
+		expect(extOkRes.status).toBe(0);
+		expect(extOkRes.stdout.trim()).toBe(
+			`layout: mate ${MATE_PANE} | critic ${CRITIC_PANE} (50%) in ${TEAM_TAB}`,
+		);
+		const extOkHerdr = readLogLines(herdrLog);
+		expect(extOkHerdr.some((c) => c.startsWith("pane resize"))).toBe(false);
+		expect(extOkHerdr.filter((c) => c.startsWith("pane layout")).length).toBe(3);
+		expect(extOkHerdr.filter((c) => c === `pane get ${MATE_PANE}`).length).toBe(1);
+		// python3: team-lead.sh 1 + ext_agent_info 2 + check_member_argv 2 + pane_place 2 + layout_state_external 3 = 10
+		expect(readLogLines(pyLog).length).toBe(10);
+
+		// (a) 작은 오차 (0.005 <= |delta| <= 0.01): external 0.493, inside down 0.593 → resize를 부르고 다시 읽는다
+		resetLogs();
+		fs.writeFileSync(path.join(stateDir, "layout.json"), extTargetLayout(0.493), "utf8");
+		fs.writeFileSync(
+			path.join(stateDir, "layout-after-resize.json"),
+			extTargetLayout(0.5),
+			"utf8",
+		);
+		const extSmallDiff = runTeamUp(envExternal, "--layout");
+		expect(extSmallDiff.status).toBe(0);
+		const extSmallHerdr = readLogLines(herdrLog);
+		expect(extSmallHerdr).toContain(
+			`pane resize --pane ${MATE_PANE} --direction right --amount 0.0070`,
+		);
+		expect(extSmallHerdr.filter((c) => c.startsWith("pane layout")).length).toBe(3);
+
+		fs.rmSync(lockPath, { force: true });
+		resetLogs();
+		fs.writeFileSync(
+			path.join(stateDir, "layout.json"),
+			insideTargetLayout(0.593, 0.5),
+			"utf8",
+		);
+		fs.writeFileSync(
+			path.join(stateDir, "layout-after-resize.json"),
+			insideTargetLayout(0.6, 0.5),
+			"utf8",
+		);
+		const inSmallDiff = runTeamUp(envInside, "--layout");
+		expect(inSmallDiff.status).toBe(0);
+		const inSmallHerdr = readLogLines(herdrLog);
+		expect(inSmallHerdr).toContain(
+			`pane resize --pane ${LEAD_PANE} --direction down --amount 0.0070`,
+		);
+		expect(inSmallHerdr.filter((c) => c.startsWith("pane resize")).length).toBe(1);
+		expect(inSmallHerdr.filter((c) => c.startsWith("pane layout")).length).toBe(3);
+
+		// (b) 2-pane inside (검토 없음): 목표면 resize가 없고, 오차가 있으면 resize한다
+		fs.writeFileSync(path.join(stateDir, "critic-absent"), "1", "utf8");
+		resetLogs();
+		fs.writeFileSync(
+			path.join(stateDir, "layout.json"),
+			inside2PaneLayout(0.6),
+			"utf8",
+		);
+		const in2PaneOk = runTeamUp(envInside, "--layout");
+		expect(in2PaneOk.status).toBe(0);
+		expect(in2PaneOk.stdout.trim()).toBe(
+			`layout: lead ${LEAD_PANE} on top (60%), mate ${MATE_PANE} below`,
+		);
+		expect(
+			readLogLines(herdrLog).some((c) => c.startsWith("pane resize")),
+		).toBe(false);
+
+		resetLogs();
+		fs.writeFileSync(
+			path.join(stateDir, "layout.json"),
+			inside2PaneLayout(0.45),
+			"utf8",
+		);
+		fs.writeFileSync(
+			path.join(stateDir, "layout-after-resize.json"),
+			inside2PaneLayout(0.6),
+			"utf8",
+		);
+		const in2PaneResize = runTeamUp(envInside, "--layout");
+		expect(in2PaneResize.status).toBe(0);
+		expect(in2PaneResize.stdout.trim()).toBe(
+			`layout: lead ${LEAD_PANE} on top (60%), mate ${MATE_PANE} below`,
+		);
+		expect(readLogLines(herdrLog)).toContain(
+			`pane resize --pane ${LEAD_PANE} --direction down --amount 0.1500`,
+		);
+		writeDefaultAgents();
+
+		// (c) resize 실패 (가짜 herdr가 resize에 비0): rc 1과 "resize failed or not reached" 메시지
+		fs.rmSync(lockPath, { force: true });
+		resetLogs();
+		fs.writeFileSync(path.join(stateDir, "layout.json"), extTargetLayout(0.493), "utf8");
+		fs.writeFileSync(path.join(stateDir, "resize-fail"), "1", "utf8");
+		const extResizeFail = runTeamUp(envExternal, "--layout");
+		expect(extResizeFail.status).toBe(1);
+		expect(extResizeFail.stderr).toContain(
+			"resize failed or not reached: mate/critic 0.493 (target 0.5)",
+		);
+		expect(extResizeFail.stderr).toContain(
+			"layout: panes are in place but the split ratio is not 50%; check herdr pane layout",
+		);
+
+		fs.rmSync(lockPath, { force: true });
+		resetLogs();
+		fs.writeFileSync(
+			path.join(stateDir, "layout.json"),
+			insideTargetLayout(0.45, 0.5),
+			"utf8",
+		);
+		fs.writeFileSync(path.join(stateDir, "resize-fail"), "1", "utf8");
+		const inResizeFail = runTeamUp(envInside, "--layout");
+		expect(inResizeFail.status).toBe(1);
+		expect(inResizeFail.stderr).toContain(
+			"resize failed or not reached: lead/below 0.45, mate/critic 0.5 (target 0.6/0.5)",
+		);
+		expect(inResizeFail.stderr).toContain(
+			"layout: panes are in place but the split ratios are not 60%/50%; check herdr pane layout",
+		);
+
+		// (d) 비숫자 ratio: rc 1과 "resize failed or not reached" 메시지. external team(--spawn) 경로도 rc 1이어야 한다
+		fs.rmSync(lockPath, { force: true });
+		resetLogs();
+		fs.writeFileSync(path.join(stateDir, "layout.json"), extTargetLayout("bad"), "utf8");
+		const extBadManual = runTeamUp(envExternal, "--layout");
+		expect(extBadManual.status).toBe(1);
+		expect(extBadManual.stderr).toContain(
+			"resize failed or not reached: mate/critic bad (target 0.5)",
+		);
+		expect(extBadManual.stderr).not.toContain("not side by side");
+
+		resetLogs();
+		const extBadTeam = runTeamUp(envExternal, "--spawn");
+		expect(extBadTeam.status).toBe(1);
+		expect(extBadTeam.stderr).toContain(
+			"resize failed or not reached: mate/critic bad (target 0.5)",
+		);
+		expect(extBadTeam.stderr).toContain(
+			"team layout is not in place; run GJCH_EXTERNAL_LEAD=1 scripts/team-up.sh --layout",
+		);
+		expect(extBadTeam.stderr).not.toContain("not side by side");
+
+		fs.rmSync(lockPath, { force: true });
+		resetLogs();
+		fs.writeFileSync(
+			path.join(stateDir, "layout.json"),
+			insideTargetLayout("bad", 0.5),
+			"utf8",
+		);
+		const inBadManual = runTeamUp(envInside, "--layout");
+		expect(inBadManual.status).toBe(1);
+		expect(inBadManual.stderr).toContain(
+			"resize failed or not reached: lead/below bad, mate/critic 0.5 (target 0.6/0.5)",
+		);
+		expect(inBadManual.stderr).not.toContain("could not read the layout");
+
+		// (e) 두 번째 읽기에서 모양이 바뀜: "layout changed while resizing" 메시지와 rc 1
+		fs.rmSync(lockPath, { force: true });
+		resetLogs();
+		fs.writeFileSync(path.join(stateDir, "layout.json"), extTargetLayout(0.4), "utf8");
+		fs.writeFileSync(
+			path.join(stateDir, "layout-after-resize.json"),
+			STACKED_LAYOUT,
+			"utf8",
+		);
+		const extChanged = runTeamUp(envExternal, "--layout");
+		expect(extChanged.status).toBe(1);
+		expect(extChanged.stderr).toContain(
+			"layout changed while resizing; not in the target layout",
+		);
+
+		fs.rmSync(lockPath, { force: true });
+		resetLogs();
+		fs.writeFileSync(
+			path.join(stateDir, "layout.json"),
+			insideTargetLayout(0.45, 0.5),
+			"utf8",
+		);
+		fs.writeFileSync(
+			path.join(stateDir, "layout-after-resize.json"),
+			STACKED_LAYOUT,
+			"utf8",
+		);
+		const inChanged = runTeamUp(envInside, "--layout");
+		expect(inChanged.status).toBe(1);
+		expect(inChanged.stderr).toContain(
+			"layout changed while resizing; not in the target layout",
+		);
+
+		// (f) ext_agent_info 보충 조회: pane get 호출이 실제로 들어왔는지와 최종 출력·거부 확인
+		fs.rmSync(lockPath, { force: true });
+		resetLogs();
+		fs.writeFileSync(path.join(stateDir, "layout.json"), extTargetLayout(0.5), "utf8");
+		fs.writeFileSync(
+			path.join(stateDir, "agent-mate.json"),
+			JSON.stringify({
+				result: {
+					agent: {
+						pane_id: MATE_PANE,
+						name: "gjc-herdr-mate",
+						agent_status: "idle",
+						interactive_ready: true,
+					},
+				},
+			}),
+			"utf8",
+		);
+		const extFallbackOk = runTeamUp(envExternal, "--layout");
+		expect(extFallbackOk.status).toBe(0);
+		expect(extFallbackOk.stdout.trim()).toBe(
+			`layout: mate ${MATE_PANE} | critic ${CRITIC_PANE} (50%) in ${TEAM_TAB}`,
+		);
+		const fallbackHerdr = readLogLines(herdrLog);
+		// ext_agent_info 보충 조회 1회 + pane_place 1회 = pane get wT:p2 2회
+		expect(
+			fallbackHerdr.filter((c) => c === `pane get ${MATE_PANE}`).length,
+		).toBe(2);
+		expect(readLogLines(pyLog).length).toBe(10);
+
+		// 보충 조회한 cwd가 저장소 밖(/tmp)이면 거부(rc 1)
+		resetLogs();
+		fs.writeFileSync(path.join(stateDir, "pane-mate-cwd.txt"), "/tmp", "utf8");
+		const extFallbackReject = runTeamUp(envExternal, "--layout");
+		expect(extFallbackReject.status).toBe(1);
+		expect(
+			readLogLines(herdrLog).filter((c) => c === `pane get ${MATE_PANE}`).length,
+		).toBe(1);
+		expect(extFallbackReject.stderr).toContain(
+			`agent 'gjc-herdr-mate' (${MATE_PANE}) cwd (`,
+		);
+		expect(extFallbackReject.stderr).toContain(`) is outside ${REPO_ROOT}`);
+		writeDefaultAgents();
+
+		// (추가) Herdr 안 --spawn(apply_layout team): 검토 pane의 pane_place 중복 조회 없이 1회만 조회한다
+		fs.rmSync(lockPath, { force: true });
+		resetLogs();
+		fs.writeFileSync(
+			path.join(stateDir, "layout.json"),
+			insideTargetLayout(0.6, 0.5),
+			"utf8",
+		);
+		const inSpawnRes = runTeamUp(envInside, "--spawn");
+		expect(inSpawnRes.status).toBe(0);
+		const inSpawnHerdr = readLogLines(herdrLog);
+		expect(
+			inSpawnHerdr.filter((c) => c === `pane get ${CRITIC_PANE}`).length,
+		).toBe(1);
+		expect(inSpawnHerdr.some((c) => c.startsWith("pane resize"))).toBe(false);
+	}, 45_000);
 });

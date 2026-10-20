@@ -306,20 +306,25 @@ move_via_temp_tab() { # pane tab target split ratio
 # 외부 팀장용 기존 agent 검증(이름 → "<workspace_id>|<pane_id>|<state>").
 # agent_not_found로 확인되면 빈 값(rc 0), 조회·파싱 실패나 agent 종류·cwd 불일치면 stderr에 이유를 쓰고 rc 1.
 ext_agent_info() { # name expected_kind cwd_mode(inside|exact)
-	local name="$1" expected_kind="$2" cwd_mode="$3" out rc=0 parsed tag rest pane_out
+	local name="$1" expected_kind="$2" cwd_mode="$3" out rc=0
 	out="$(herdr agent get "$name" 2>&1)" || rc=$?
-	parsed="$(printf '%s' "$out" | python3 -c 'import sys,json
-rc=sys.argv[1]
+	printf '%s' "$out" | python3 -c 'import json,os,subprocess,sys
+rc,name,expected_kind,cwd_mode,root=sys.argv[1:6]
+def fail_lookup():
+    print("could not look up agent '\''%s'\''" % name, file=sys.stderr)
+    sys.exit(1)
 try: d=json.load(sys.stdin)
-except Exception: sys.exit(1)
+except Exception: fail_lookup()
+if not isinstance(d,dict): fail_lookup()
 if rc!="0":
-    if ((d.get("error") or {}).get("code"))=="agent_not_found":
-        print("absent")
+    err=d.get("error")
+    if isinstance(err,dict) and err.get("code")=="agent_not_found":
         sys.exit(0)
-    sys.exit(1)
-a=(d.get("result") or {}).get("agent") or {}
+    fail_lookup()
+res=d.get("result")
+a=(res.get("agent") if isinstance(res,dict) else None) or {}
 if not isinstance(a,dict) or not a.get("pane_id"):
-    sys.exit(1)
+    fail_lookup()
 p=a.get("pane_id")
 w=a.get("workspace_id") or ""
 k=a.get("agent") or ""
@@ -330,31 +335,22 @@ if s=="blocked": st="blocked|"+p+"|blocked"
 elif s=="working" or (s in ("idle","done") and r is True): st="ready|"+p+"|"+s
 elif s: st="not_ready|"+p+"|"+s
 else: st="not_ready|"+p+"|idle"
-print("ok\t%s\t%s\t%s\t%s\t%s" % (p, w, k, c, st))' "$rc")" || {
-		echo "could not look up agent '$name'" >&2
-		return 1
-	}
-	[ "$parsed" != absent ] || return 0
-	pane_out=""
-	tag="$(printf '%s' "$parsed" | python3 -c 'import sys
-parts=sys.stdin.read().split("\t")
-p,w,k,c=parts[1],parts[2],parts[3],parts[4]
-print("need" if (not w or not k or not c) else "ok")')"
-	if [ "$tag" = need ]; then
-		rest="${parsed#*$'\t'}"
-		pane_out="$(herdr pane get "${rest%%$'\t'*}" 2>/dev/null)" || pane_out=""
-	fi
-	printf '%s' "$parsed" | python3 -c 'import os,sys,json
-name,expected_kind,cwd_mode,root,pane_raw=sys.argv[1:6]
-parts=sys.stdin.read().split("\t")
-_,p,w,k,c,st=parts
-if pane_raw:
-    try: pd=(json.loads(pane_raw).get("result") or {}).get("pane") or {}
-    except Exception: pd={}
-    if isinstance(pd,dict):
-        if not w: w=pd.get("workspace_id") or ""
-        if not k: k=pd.get("agent") or ""
-        if not c: c=pd.get("foreground_cwd") or pd.get("cwd") or ""
+if not w or not k or not c:
+    try:
+        pr=subprocess.run(["herdr","pane","get",p],stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,text=True)
+        pane_raw=pr.stdout if pr.returncode==0 else ""
+    except Exception:
+        pane_raw=""
+    if pane_raw:
+        try:
+            pdoc=json.loads(pane_raw)
+            pres=pdoc.get("result") if isinstance(pdoc,dict) else None
+            pd=(pres.get("pane") if isinstance(pres,dict) else None) or {}
+        except Exception: pd={}
+        if isinstance(pd,dict):
+            if not w: w=pd.get("workspace_id") or ""
+            if not k: k=pd.get("agent") or ""
+            if not c: c=pd.get("foreground_cwd") or pd.get("cwd") or ""
 if not w:
     print("could not determine workspace of agent '\''%s'\'' (%s)" % (name, p), file=sys.stderr)
     sys.exit(1)
@@ -374,7 +370,7 @@ else:
     if not (real_c.rstrip("/")+"/").startswith(real_root.rstrip("/")+"/"):
         print("agent '\''%s'\'' (%s) cwd (%s) is outside %s" % (name, p, real_c, real_root), file=sys.stderr)
         sys.exit(1)
-print("%s|%s|%s" % (w, p, st))' "$name" "$expected_kind" "$cwd_mode" "$ROOT" "$pane_out"
+print("%s|%s|%s" % (w, p, st))' "$rc" "$name" "$expected_kind" "$cwd_mode" "$ROOT"
 }
 
 # SessionStart(startup) hook에서 기존 팀원·검토가 이미 떠 있으면 상태와 상관없이 argv를 동기로 점검해 stdout(GJCH: 접두사)에 알린다(#42, #58).
@@ -546,7 +542,8 @@ print(hits[0] if hits else "")' "$WS_LABEL")"
 fi
 
 # --- 재배치(--layout): 기존 팀장·팀원·검토 pane을 목표 배치로 ---
-# 출력: "ok <팀장/아래 비율> [<팀원/검토 비율>]"(목표 모양) | "move"(아님, 옮겨도 됨)
+# 출력: "ok <팀장/아래 비율> <0.01안:1|0> <팀장/아래 delta> [<팀원/검토 비율> <팀원/검토 delta>]"(목표 모양)
+#       | "move"(아님, 옮겨도 됨)
 #       | "blocked <이유>"(아님, 팀 pane이 한 분할 영역을 빈틈없이 채우지 않아 옮기면 다른 pane이 커지거나 밀림) | 빈 값(layout 읽기 실패)
 # 빈틈없는 영역: 팀 pane rect의 경계 상자가 splits 중 하나의 rect와 같고, 그 상자와 겹치는 다른 pane이 없으며,
 # 팀 pane 면적 합이 상자 면적과 같다(한 split 노드가 팀 pane만으로 채워짐).
@@ -572,7 +569,25 @@ elif ok: ok=M[2]==L[2]
 down=ok and ratio("down",(L[0],L[1],L[2],L[3]+M[3]))
 right=ok and C and ratio("right",(M[0],M[1],M[2]+C[2],M[3]))
 if not (down is None or not ok or (C and right is None)):
-    print("ok %s %s" % (down, right if C else "")); sys.exit(0)
+    def parse_r(v,target):
+        s=str(v).strip()
+        tok=s.split()[0] if s else "?"
+        try:
+            f=float(s)
+            if f!=f or f in (float("inf"),float("-inf")): raise ValueError
+        except Exception:
+            return tok,False,"x"
+        d=target-f
+        return tok,abs(f-target)<=0.01,("0" if abs(d)<0.005 else "%+.4f" % d)
+    d_tok,d_ok,d_delta=parse_r(down,0.6)
+    if C:
+        r_tok,r_ok,r_delta=parse_r(right,0.5)
+        in_tol="1" if (d_ok and r_ok) else "0"
+        print("ok %s %s %s %s %s" % (d_tok, in_tol, d_delta, r_tok, r_delta))
+    else:
+        in_tol="1" if d_ok else "0"
+        print("ok %s %s %s" % (d_tok, in_tol, d_delta))
+    sys.exit(0)
 ps=[q for q in (L,M,C) if q]
 if len(ps)<(3 if critic else 2): print("blocked the team panes are not all in the layout"); sys.exit(0)
 x0=min(q[0] for q in ps); y0=min(q[1] for q in ps); x1=max(q[0]+q[2] for q in ps); y1=max(q[1]+q[3] for q in ps)
@@ -585,7 +600,7 @@ elif not split or sum(q[2]*q[3] for q in ps)!=box[2]*box[3]: print("blocked the 
 else: print("move")' "$HERDR_PANE_ID" "$1" "${2:-}"
 }
 
-# 외부 팀장 배치 판정: 한 탭 안에서 팀원 왼쪽 | 검토 바로 오른쪽(같은 y·높이)이면 "ok <비율>", 아니면 "mismatch", 조회 실패면 빈 값.
+# 외부 팀장 배치 판정: 한 탭 안에서 팀원 왼쪽 | 검토 바로 오른쪽(같은 y·높이)이면 "ok <비율> <0.01안:1|0> <delta>", 아니면 "mismatch", 조회 실패면 빈 값.
 layout_state_external() { # mate critic
 	local out
 	out="$(herdr pane layout --pane "$1" 2>/dev/null)" || return 0
@@ -605,19 +620,28 @@ M,C=rect(mate),rect(critic)
 ok=bool(M and C) and C[0]==M[0]+M[2] and C[1]==M[1] and C[3]==M[3]
 right=ok and ratio("right",(M[0],M[1],M[2]+C[2],M[3]))
 if ok and right is not None:
-    print("ok %s" % right)
+    s=str(right).strip()
+    r_tok=s.split()[0] if s else "?"
+    try:
+        rf=float(s)
+        if rf!=rf or rf in (float("inf"),float("-inf")): raise ValueError
+        rd=0.5-rf
+        in_tol="1" if abs(rf-0.5)<=0.01 else "0"
+        r_delta="0" if abs(rd)<0.005 else "%+.4f" % rd
+    except Exception:
+        in_tol,r_delta="0","x"
+    print("ok %s %s %s" % (r_tok, in_tol, r_delta))
 else:
     print("mismatch")' "$1" "$2"
 }
 
 # split 비율을 target으로 맞춘다. 늘릴 때는 첫 pane을 경계 쪽으로, 줄일 때는 둘째 pane을 경계 쪽으로 resize한다(amount = 비율 차).
-set_ratio() { # current target first_pane grow_dir second_pane shrink_dir
-	local d
-	d="$(python3 -c 'import sys; d=float(sys.argv[2])-float(sys.argv[1]); print("" if abs(d)<0.005 else "%+.4f" % d)' "$1" "$2")" || return 1
-	case "$d" in
-		"") return 0 ;;
-		+*) herdr pane resize --pane "$3" --direction "$4" --amount "${d#+}" >/dev/null 2>&1 ;;
-		*) herdr pane resize --pane "$5" --direction "$6" --amount "${d#-}" >/dev/null 2>&1 ;;
+set_ratio() { # delta first_pane grow_dir second_pane shrink_dir
+	case "$1" in
+		""|0) return 0 ;;
+		+*) herdr pane resize --pane "$2" --direction "$3" --amount "${1#+}" >/dev/null 2>&1 ;;
+		-*) herdr pane resize --pane "$4" --direction "$5" --amount "${1#-}" >/dev/null 2>&1 ;;
+		*) return 1 ;;
 	esac
 }
 
@@ -629,17 +653,15 @@ fit_ratios() { # mate [critic]
 	# shellcheck disable=SC2046
 	set -- $(layout_state "$mate" "$critic")
 	[ "${1:-}" = ok ] || return 2
-	set_ratio "$2" 0.6 "$HERDR_PANE_ID" down "$mate" up || fail=1
+	set_ratio "${4:-}" "$HERDR_PANE_ID" down "$mate" up || fail=1
 	if [ -n "$critic" ]; then
-		set_ratio "$3" 0.5 "$mate" right "$critic" left || fail=1
+		set_ratio "${6:-}" "$mate" right "$critic" left || fail=1
 	fi
 	# shellcheck disable=SC2046
 	set -- $(layout_state "$mate" "$critic")
 	[ "${1:-}" = ok ] || { echo "layout changed while resizing; not in the target layout" >&2; return 1; }
-	python3 -c 'import sys
-r=sys.argv[1:]
-sys.exit(0 if abs(float(r[0])-0.6)<=0.01 and (len(r)<2 or abs(float(r[1])-0.5)<=0.01) else 1)' "$2" ${3:+"$3"} || fail=1
-	[ "$fail" = 0 ] || echo "resize failed or not reached: lead/below $2${3:+, mate/critic $3} (target 0.6${critic:+/0.5})" >&2
+	[ "${3:-}" = 1 ] || fail=1
+	[ "$fail" = 0 ] || echo "resize failed or not reached: lead/below $2${5:+, mate/critic $5} (target 0.6${critic:+/0.5})" >&2
 	return "$fail"
 }
 
@@ -649,11 +671,11 @@ fit_ratios_external() { # mate critic
 	# shellcheck disable=SC2046
 	set -- $(layout_state_external "$mate" "$critic")
 	[ "${1:-}" = ok ] || return 2
-	set_ratio "$2" 0.5 "$mate" right "$critic" left || fail=1
+	set_ratio "${4:-}" "$mate" right "$critic" left || fail=1
 	# shellcheck disable=SC2046
 	set -- $(layout_state_external "$mate" "$critic")
 	[ "${1:-}" = ok ] || { echo "layout changed while resizing; not in the target layout" >&2; return 1; }
-	python3 -c 'import sys; sys.exit(0 if abs(float(sys.argv[1])-0.5)<=0.01 else 1)' "$2" || fail=1
+	[ "${3:-}" = 1 ] || fail=1
 	[ "$fail" = 0 ] || echo "resize failed or not reached: mate/critic $2 (target 0.5)" >&2
 	return "$fail"
 }
@@ -735,7 +757,7 @@ apply_layout() { # manual|team
 		apply_layout_external "$1"
 		return $?
 	fi
-	local how="$1" lead="$HERDR_PANE_ID" owner lead_tab mate_ps mate mate_st critic_ps critic critic_st place p state
+	local how="$1" lead="$HERDR_PANE_ID" owner lead_tab mate_ps mate mate_st critic_ps critic critic_st critic_place="" place p state
 	owner="$(agent_pane "$LEAD_NAME")" || { layout_error "$how" "could not look up agent '$LEAD_NAME'"; return; }
 	[ "$owner" = "$lead" ] || { layout_refuse "$how" "agent '$LEAD_NAME' is not this pane ($lead)"; return; }
 	mate_ps="$(agent_pane_status "$MATE_NAME")" || { layout_error "$how" "could not look up agent '$MATE_NAME'"; return; }
@@ -755,20 +777,24 @@ apply_layout() { # manual|team
 	lead_tab="$(pane_place "$lead")" || { layout_error "$how" "could not read pane $lead"; return; }
 	lead_tab="${lead_tab% *}"
 	if [ "$how" = team ] && [ -n "$critic" ]; then
-		place="$(pane_place "$critic")" || { layout_error "$how" "could not read pane $critic"; return; }
+		critic_place="$(pane_place "$critic")" || { layout_error "$how" "could not read pane $critic"; return; }
 		if ! codex_enabled; then
-			if [ "${place% *}" = "$lead_tab" ]; then
+			if [ "${critic_place% *}" = "$lead_tab" ]; then
 				layout_refuse "$how" "the Codex reviewer is off but $CRITIC_NAME ($critic) is still in $lead_tab"; return
 			fi
 			echo "team layout: the Codex reviewer is off; laying out the lead and mate only" >&2
 			critic=""
-		elif [ "${place% *}" != "$lead_tab" ]; then
+		elif [ "${critic_place% *}" != "$lead_tab" ]; then
 			echo "team layout: $CRITIC_NAME ($critic) is not in $lead_tab; laying out the lead and mate only" >&2
 			critic=""
 		fi
 	fi
 	for p in "$mate" ${critic:+"$critic"}; do
-		place="$(pane_place "$p")" || { layout_error "$how" "could not read pane $p"; return; }
+		if [ "$p" = "$critic" ] && [ -n "$critic_place" ]; then
+			place="$critic_place"
+		else
+			place="$(pane_place "$p")" || { layout_error "$how" "could not read pane $p"; return; }
+		fi
 		[ "${place% *}" = "$lead_tab" ] || { layout_refuse "$how" "pane $p is not in the lead tab $lead_tab"; return; }
 		[ "${place#* }" = in ] || { layout_refuse "$how" "pane $p cwd is outside $ROOT"; return; }
 	done
