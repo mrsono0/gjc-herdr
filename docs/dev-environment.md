@@ -119,7 +119,8 @@
 | 하위 명령 | 뜻 | 바꾸는 것 | 종료 코드 |
 |---|---|---|---|
 | `--check` | 팀원(agy·선택 Codex) 시작 옵션·cwd와 팀장 잠금 상태를 한 줄씩 점검 | 없음(읽기 전용) | `0` 모두 ok, `1` 불일치·팀원 없음, `2` 판정 불가·가드 실패 |
-| `--up` | `--spawn`과 같이 팀장·팀원 구성과 배치 보정을 한 뒤 끝에 `--check` 요약 출력 | 팀장 잠금 claim, 이름·label, 없는 팀원 pane 생성·기동, 같은 탭 배치 보정(기존 팀원 자동 재시작 없음) | `--spawn` 단계가 비0이면 그 값(다른 세션 잠금 보유 시 `3`), `0`이면 끝 요약의 `0`/`1`/`2` |
+| `--up` | `--spawn`과 같이 팀장·팀원 구성과 배치 보정을 한 뒤 끝에 `--check` 요약 출력 | 팀장 잠금 claim, 이름·label, 없는 팀원 pane 생성·기동, 같은 탭 배치 보정, 세션 있는 팀원의 재개 명령 보고(기존 팀원 자동 재시작 없음) | `--spawn` 단계가 비0이면 그 값(다른 세션 잠금 보유 시 `3`), `0`이면 끝 요약의 `0`/`1`/`2` |
+| `--report-resume` | 팀원(agy·선택 Codex)의 정체(종류·cwd·작업공간)·시작 옵션이 맞고 세션 id가 있으면 옵션이 붙은 재개 명령을 `herdr pane report-agent-session`으로 보고 | 팀장 잠금 claim, 조건이 맞는 팀원 pane의 재개 세션 명령 등록 | `0` 모두 보고 또는 건너뜀, `1` 보고 실패가 하나라도 있음, `3` 다른 세션 잠금 보유, `4` 외부 팀장 정체 미확인, `2` 가드·인자 실패 |
 | `--status` | 네 팀 공통 보고 꼴의 필드를 사람이 그대로 옮겨 적을 수 있게 출력 | 없음(읽기 전용) | `--check`와 같음(`0`/`1`/`2`, 팀원·잠금 판정 기준) |
 | `--lock <status\|claim\|release>` | 팀장 잠금 조회·확보·해제(`--force`는 받지 않으며 `scripts/team-lead.sh release --force` 안내) | `status`는 없음, `claim`·`release`는 잠금 파일(`.local/team/lead.json`)과 그 디렉터리·mutex 파일(`<잠금 파일>.mutex`) | `0` 성공, `3` 다른 살아 있는 세션의 잠금(`claim`·`release`), `4` 정체 미확인(환경변수·소켓)이고 다른 살아 있는 잠금이 없을 때의 `claim`, `2` `--force`·인자 오류, `1` 잠금 실패 |
 | `--hook` | SessionStart hook용. 잠금 확인 후 역할과 팀원 옵션 불일치를 안내하고 백그라운드로 기본/`--spawn` 실행 | 팀장 잠금 claim, 백그라운드 이름·label·팀원 구성 | `0`(잠금 확인 자체 실패 시 `1`) |
@@ -135,7 +136,7 @@ Claude 데스크톱 앱의 Code 탭(로컬 세션)이나 Herdr 밖 터미널의 
    - 팀원 기동·배치: `GJCH_EXTERNAL_LEAD=1 scripts/team-up.sh --spawn`(`--up`은 끝에 점검 요약 출력) 또는 `GJCH_EXTERNAL_LEAD=1 scripts/team-up.sh --layout`
    - 읽기 전용 점검·보고: `GJCH_EXTERNAL_LEAD=1 scripts/team-up.sh --check` 또는 `GJCH_EXTERNAL_LEAD=1 scripts/team-up.sh --status`
    - 검토 전송: `GJCH_EXTERNAL_LEAD=1 scripts/critic-send.sh [--timeout <ms>] [--no-wait | --result <파일>] <지시서 파일>`(`critic-send.sh`는 외부 모드일 때 잠금이 `mine`인지 먼저 확인하고, label 조회 대신 검토 agent(`gjc-herdr-critic`)의 작업공간을 쓰며 팀원(`gjc-herdr-mate`)이 다른 작업공간에 있으면 전송하지 않고 rc `1`로 끝난다)
-   - agy 배정: Herdr 안과 같이 `herdr agent prompt gjc-herdr-mate "<짧은 지시>"`를 쓴다. 세션 환경에 `GJCH_EXTERNAL_LEAD=1`이 이미 들어 있으면 앞의 환경변수 접두는 필요 없다.
+   - agy 배정: Herdr 안과 같이 `herdr agent prompt gjc-herdr-mate "<짧은 지시>"`를 쓴다. 세션 환경에 `GJCH_EXTERNAL_LEAD=1`이 이미 들어 있으면 앞의 환경변수 접두는 필요 없다. `agy`는 막 띄웠을 때 아직 세션 id가 없고 첫 배정 뒤 자동 보고 경로도 없으므로, 첫 배정 뒤 `scripts/team-up.sh --report-resume`(외부 팀장은 `GJCH_EXTERNAL_LEAD=1 scripts/team-up.sh --report-resume`)를 한 번 실행한다.
 5. **작업공간과 배치:**
    - 대상은 label `GJCH · gjc-herdr`(`GJCH_WS_LABEL`)인 작업공간이다. 기존 팀원(`gjc-herdr-mate` 또는 `gjc-herdr-critic`)이 있으면 그 작업공간을 쓴다.
    - 작업공간을 정할 때 기존 `gjc-herdr-mate`(종류 `agy`, 저장소 안 cwd)와 `gjc-herdr-critic`(종류 `codex`, 정확히 저장소 루트 cwd)의 정체와 같은 작업공간 여부를 먼저 한 번에 확인하며, 하나라도 어긋나거나 조회에 실패하면 어떤 pane도 만들거나 나누거나 옮기지 않고 즉시 중단(rc `1`)한다.
@@ -185,7 +186,7 @@ Claude 데스크톱 앱의 Code 탭(로컬 세션)이나 Herdr 밖 터미널의 
 **재개**
 
 1. 먼저 `scripts/team-lead.sh claim` 또는 `scripts/team-up.sh --lock claim`으로 잠금을 확보하고 `mine`을 확인한 뒤(Herdr 안 호환 예외 rc `4`는 §2 앞 "원칙" 줄을 참조하며, 외부 팀장 모드의 `GJCH_EXTERNAL_LEAD=1`은 §2.1 환경 전제를 참조한다), `scripts/team-up.sh --status`로 우리 팀원·작업공간·pane을 확인한다. 다른 소유자(`other live`)이거나 판정 불가이면 팀원에게 입력하지 않고 사용자에게 알린다.
-2. 팀원이 없으면 `/quit` 없이 `GJCH_EXTERNAL_LEAD=1 scripts/team-up.sh --up`으로 구성한다. 옵션 불일치(`--check` mismatch)면 불일치가 확인된 그 팀원만 `idle`·빈 입력란·진행 중인 일 없음을 확인한 뒤 `/quit` → `GJCH_EXTERNAL_LEAD=1 scripts/team-up.sh --up`으로 다시 띄운다. 판정 불가면 다시 점검하고 보고한다.
+2. 팀원이 없으면 `/quit` 없이 `GJCH_EXTERNAL_LEAD=1 scripts/team-up.sh --up`으로 구성한다. 옵션 불일치(`--check` mismatch)면 불일치가 확인된 그 팀원만 `idle`·빈 입력란·진행 중인 일 없음을 확인한 뒤 `/quit` → `GJCH_EXTERNAL_LEAD=1 scripts/team-up.sh --up`으로 다시 띄운다. 판정 불가면 다시 점검하고 보고한다. 보고해 둔 팀원이 옵션대로 되살아났으면(`--check` ok) `/quit` 없이 넘어간다.
 3. `python3 scripts/dialog-watch.py --once`로 확인창을 본다. 폴더 신뢰 창 등은 사용자가 답하고, `agy` 명령·편집 확인창의 한정 위임은 `AGENTS.md` "agy 운용 조건"을 따른다. `--once`의 `none`만으로 안전하다고 단정하지 않는다(조회 실패는 stderr에 남으며 현재 화면도 함께 본다).
 4. 팀장 우편함을 `scripts/mail-watch.sh <받는이> --timeout 0`으로 손으로 확인한다(읽기·ack·오류 처리와 우편 감시 복구는 §4 "우편 받기"를 따른다).
 5. 멈추기 전에 진행 중이던 회차는 결과 파일(회차 지시서가 정한 완료 표시, 예: `#<n> <회차> 완료`)과 화면 하단의 `task(s)` 표시, 지금 상태를 함께 본다(`AGENTS.md` "agy 운용 조건" 참조). `working`이면 기다리고, `blocked`이면 기존 확인창 규칙을 따른다. 실제로 멈춘 것이 확인됐을 때만 부분 결과·변경 파일·남은 작업을 확인하고 그 회차를 다시 보낸다.
@@ -331,5 +332,6 @@ GJC는 상시 팀원이 아니며, 플러그인 로드·token 표시·`/herdr-se
 | GJC → agy `/herdr-call`·`--raw`가 막 띄운 agy에서 `target_typing` | `--mode accept-edits`(또는 `auto`·`plan`)로 띄운 빈 agy 입력란의 모드 안내 문구(전경색 `38;2;131;148;150`, 좁은 pane `...` 잘림 포함)가 흐림(SGR 2)이 아니라 입력된 글로 판정된 #47 증상이다. #47 이후는 이 안내 문구를 빈 입력란으로 본다. GJC의 플러그인을 #47 이후 버전으로 다시 설치하고 GJC를 재시작한다 |
 | `GJCH: 이 세션은 연결 worktree(...)에서 실행 중이라 팀장으로 동작하지 않습니다.` / `연결 worktree(...)에서 실행 중입니다.` | 데스크톱 Code 탭의 worktree 옵션 등으로 `<저장소>/.claude/worktrees/<이름>` 사본이나 Git 연결 worktree에서 실행되어 `ROOT`가 원래 저장소와 어긋난 상태다(#43). 네 진입점(`team-lead.sh`·`team-up.sh`·`critic-send.sh`·`check-env.sh`)은 잠금이나 Herdr 작업공간을 건드리지 않고 거절(또는 `check-env.sh`에서 `FAIL` 표시)하며, 경로에 `/.claude/worktrees/`가 있으면 일반 저장소여도 거절한다(우편 스크립트 `mail-*.sh`는 이 검사를 하지 않으며 후속은 별도 이슈다). 데스크톱 세션의 worktree 옵션을 끄고 원래 저장소 루트 폴더에서 새 세션을 연다 |
 | `↳ <이름> 옵션 불일치: ...` / `↳ <이름> 옵션 판정 불가: ...` (`team-up.sh`·`check-env.sh`) | Herdr 서버 재시작 뒤 native 세션 복구가 팀원을 시작 옵션 없이(`agy --conversation <id>`, `codex resume <id>`) 다시 띄워 `--sandbox`·모델·상태 줄 설정 등이 빠진 상태이거나, 작업 중 자식 프로세스 등으로 foreground argv를 판정할 수 없는 상태다(#42, `--model=x` 같은 `=` 결합형 옵션은 지원하지 않으며 분리형 `--model x`만 비교하므로 결합형은 `없음`으로 판정). 스크립트는 자동 `/quit`·재시작을 하지 않고 안내 후 비0(hook 문맥은 3초 공통 기한 안에서 동기 점검하며 `GJCH: ` 접두사로 stdout 안내 후 0, 기한 초과 시 `GJCH: ↳ 팀원 옵션 점검 시간 초과 — scripts/check-env.sh로 다시 점검`)으로 끝난다. 판정 불가 뒤에 `(작업 중 — 다시 점검)`이 붙으면 팀원이 `idle`/`done`이 된 뒤 `scripts/check-env.sh`나 `scripts/team-up.sh --spawn`으로 다시 점검하고, 옵션 불일치이면 해당 팀원의 `idle`·빈 입력란 확인 → 그 pane에서 `/quit`으로 정상 종료 → `scripts/team-up.sh --spawn`(외부 팀장 모드는 `GJCH_EXTERNAL_LEAD=1 scripts/team-up.sh --spawn`)으로 다시 띄운다 |
+| Codex가 "This conversation is open in another app"에서 멈춤 | 기본 복원(옵션 없음)을 거친 대화에 나중에 `--report-resume`로 보고했을 때 관측됨(원인 추정). 그 pane에서 `/quit`으로 정상 종료한 뒤 `scripts/team-up.sh --up`(외부 팀장은 `GJCH_EXTERNAL_LEAD=1 scripts/team-up.sh --up`)으로 다시 띄운다 |
 
 더 자세한 사용법은 [README](../README.md)를 참조한다.

@@ -134,6 +134,9 @@ describe("team-up.sh --check / --lock / --up (#68)", () => {
 		cwd = REPO_ROOT,
 		status = "idle",
 		interactiveReady = true,
+		agentSession?: { kind: string; value: string; source?: string },
+		workspaceId = "w1",
+		agentKind = "agy",
 	): void {
 		fs.writeFileSync(
 			path.join(stateDir, "agent-mate.json"),
@@ -141,13 +144,14 @@ describe("team-up.sh --check / --lock / --up (#68)", () => {
 				result: {
 					agent: {
 						pane_id: "w1:p2",
-						workspace_id: "w1",
-						agent: "agy",
+						workspace_id: workspaceId,
+						agent: agentKind,
 						name: "gjc-herdr-mate",
 						cwd,
 						foreground_cwd: cwd,
 						agent_status: status,
 						interactive_ready: interactiveReady,
+						...(agentSession ? { agent_session: agentSession } : {}),
 					},
 				},
 			}),
@@ -159,6 +163,9 @@ describe("team-up.sh --check / --lock / --up (#68)", () => {
 		cwd = REPO_ROOT,
 		status = "idle",
 		interactiveReady = true,
+		agentSession?: { kind: string; value: string; source?: string },
+		workspaceId = "w1",
+		agentKind = "codex",
 	): void {
 		fs.writeFileSync(
 			path.join(stateDir, "agent-critic.json"),
@@ -166,13 +173,14 @@ describe("team-up.sh --check / --lock / --up (#68)", () => {
 				result: {
 					agent: {
 						pane_id: "w1:p3",
-						workspace_id: "w1",
-						agent: "codex",
+						workspace_id: workspaceId,
+						agent: agentKind,
 						name: "gjc-herdr-critic",
 						cwd,
 						foreground_cwd: cwd,
 						agent_status: status,
 						interactive_ready: interactiveReady,
+						...(agentSession ? { agent_session: agentSession } : {}),
 					},
 				},
 			}),
@@ -290,6 +298,20 @@ describe("team-up.sh --check / --lock / --up (#68)", () => {
 		return calls;
 	}
 
+	function readAndClearReportArgvCalls(): string[][] {
+		const p = path.join(stateDir, "report-argv.jsonl");
+		if (!fs.existsSync(p)) {
+			return [];
+		}
+		const lines = fs
+			.readFileSync(p, "utf8")
+			.trim()
+			.split("\n")
+			.filter(Boolean);
+		fs.rmSync(p, { force: true });
+		return lines.map((line) => JSON.parse(line) as string[]);
+	}
+
 	function readAndClearGitStatusCalls(): string[] {
 		const calls = fs.existsSync(gitStatusLog)
 			? fs
@@ -338,6 +360,7 @@ describe("team-up.sh --check / --lock / --up (#68)", () => {
 				call.startsWith("pane get ") ||
 				call.startsWith("pane layout ") ||
 				call.startsWith("pane process-info ") ||
+				call.startsWith("pane report-agent-session ") ||
 				call.startsWith("pane resize ") ||
 				call.startsWith("agent rename ") ||
 				call.startsWith("pane rename ") ||
@@ -551,8 +574,36 @@ if [ "$cmd" = "agent" ] && [ "$sub" = "get" ]; then
 	printf '{"error":{"code":"agent_not_found","message":"not found"}}\\n' >&2
 	exit 1
 fi
+if [ "$cmd" = "workspace" ] && [ "$sub" = "get" ]; then
+	ws_id="\${3:-w1}"
+	ws_label="GJCH · gjc-herdr"
+	if [ -f ${JSON.stringify(path.join(stateDir, "workspace-label.txt"))} ]; then
+		ws_label="$(cat ${JSON.stringify(path.join(stateDir, "workspace-label.txt"))})"
+	fi
+	printf '{"result":{"workspace":{"workspace_id":"%s","label":"%s"}}}\\n' "$ws_id" "$ws_label"
+	exit 0
+fi
+if [ "$cmd" = "workspace" ] && [ "$sub" = "rename" ]; then
+	printf '{"result":{"ok":true}}\\n'
+	exit 0
+fi
+if [ "$cmd" = "agent" ] && [ "$sub" = "rename" ]; then
+	printf '{"result":{"ok":true}}\\n'
+	exit 0
+fi
+if [ "$cmd" = "pane" ] && [ "$sub" = "rename" ]; then
+	printf '{"result":{"ok":true}}\\n'
+	exit 0
+fi
 if [ "$cmd" = "pane" ] && [ "$sub" = "get" ]; then
 	pane="\${3:-}"
+	if [ -f ${JSON.stringify(path.join(stateDir, "pane-get-fail"))} ]; then
+		exit 1
+	fi
+	if [ -f ${JSON.stringify(path.join(stateDir, "pane-no-cwd"))} ]; then
+		printf '{"result":{"pane":{"pane_id":"%s","workspace_id":"w1","tab_id":"w1:t1","agent_status":"idle"}}}\\n' "$pane"
+		exit 0
+	fi
 	if [ "$pane" = "w1:p1" ] && [ -f ${JSON.stringify(path.join(stateDir, "lead-pane-outside"))} ]; then
 		printf '{"result":{"pane":{"pane_id":"%s","workspace_id":"w1","tab_id":"w1:t1","cwd":"/tmp","foreground_cwd":"/tmp","agent_status":"idle"}}}\\n' "$pane"
 		exit 0
@@ -594,6 +645,14 @@ if [ "$cmd" = "pane" ] && [ "$sub" = "process-info" ]; then
 		exit 0
 	fi
 	exit 1
+fi
+if [ "$cmd" = "pane" ] && [ "$sub" = "report-agent-session" ]; then
+	python3 -c 'import json,sys; print(json.dumps(sys.argv[1:]))' "$@" >> ${JSON.stringify(path.join(stateDir, "report-argv.jsonl"))}
+	if [ -f ${JSON.stringify(path.join(stateDir, "report-session-fail"))} ]; then
+		printf 'report-agent-session error: SENTINEL_REPORT_ERR\\n' >&2
+		exit 1
+	fi
+	exit 0
 fi
 if [ "$cmd" = "agent" ] && [ "$sub" = "read" ]; then
 	name="\${3:-}"
@@ -1818,5 +1877,459 @@ Run this command?
 			"lock mine",
 		]);
 		assertReadOnlyHerdrCalls(readAndClearHerdrCalls());
+	}, 60_000);
+
+	test("9. #71 --report-resume 및 --up 끝 자동 보고: 인자 정확성(agy·codex), 세션 없음·옵션 불일치·없음 skip, 보고 실패 rc 1, 잠금 other live rc 3·보고 0회, --up 자동 호출 stderr·요약·rc 유지, 세션 id 전체 미노출", () => {
+		const mateFullSid = "mate-sess-12345678-secret-tail";
+		const criticFullSid = "codex-sess-87654321-secret-tail";
+		const extEnv = {
+			GJCH_EXTERNAL_LEAD: "1",
+			CLAUDE_PROJECT_DIR: REPO_ROOT,
+			CLAUDE_CODE_SESSION_ID: "report-lead-sess-1",
+			CLAUDE_CODE_MESSAGING_SOCKET: mySockPath,
+		};
+
+		// (1) 잠금 other live → rc 3, herdr 호출·보고 0회
+		writeLockRecord({
+			kind: "external",
+			sessionId: "other-live-lead-sess",
+			socketPath: otherLiveSockPath,
+		});
+		writeDefaultMateAgent(REPO_ROOT, "idle", true, {
+			kind: "id",
+			value: mateFullSid,
+			source: "herdr:antigravity_cli",
+		});
+		writeDefaultCriticAgent(REPO_ROOT, "idle", true, {
+			kind: "id",
+			value: criticFullSid,
+			source: "herdr:codex",
+		});
+		const otherLockRes = runTeamUp(["--report-resume"], extEnv);
+		expect(otherLockRes.status).toBe(3);
+		expect(otherLockRes.stdout).toBe("");
+		expect(otherLockRes.stderr).toContain("팀장 잠금이 다른 세션");
+		expect(readAndClearHerdrCalls()).toEqual([]);
+
+		// 잠금을 현재 팀장 소유로 전환
+		fs.rmSync(lockPath, { force: true });
+
+		// (2) 세션 없음 → skip 세션 없음, 보고 0회, rc 0
+		writeDefaultMateAgent(REPO_ROOT, "idle", true);
+		writeDefaultCriticAgent(REPO_ROOT, "idle", true);
+		const noSessRes = runTeamUp(["--report-resume"], extEnv);
+		expect(noSessRes.status).toBe(0);
+		expect(noSessRes.stderr).toBe("");
+		expect(noSessRes.stdout.trim().split("\n")).toEqual([
+			"gjc-herdr-mate skip 세션 없음",
+			"gjc-herdr-critic skip 세션 없음",
+		]);
+		const noSessCalls = readAndClearHerdrCalls();
+		expect(
+			noSessCalls.filter((c) => c.startsWith("pane report-agent-session ")),
+		).toEqual([]);
+
+		// (3) agent 없음 + 세션 kind != id → 각각 skip 없음 / skip 세션 없음, 보고 0회, rc 0
+		fs.writeFileSync(path.join(stateDir, "agent-mate-absent"), "1", "utf8");
+		writeDefaultCriticAgent(REPO_ROOT, "idle", true, {
+			kind: "none",
+			value: criticFullSid,
+		});
+		const absentRes = runTeamUp(["--report-resume"], extEnv);
+		expect(absentRes.status).toBe(0);
+		expect(absentRes.stderr).toBe("");
+		expect(absentRes.stdout.trim().split("\n")).toEqual([
+			"gjc-herdr-mate skip 없음",
+			"gjc-herdr-critic skip 세션 없음",
+		]);
+		expect(
+			readAndClearHerdrCalls().filter((c) =>
+				c.startsWith("pane report-agent-session "),
+			),
+		).toEqual([]);
+		fs.rmSync(path.join(stateDir, "agent-mate-absent"), { force: true });
+
+		// (4) 옵션 불일치(기본 복원으로 옵션이 빠진 agy) + GJCH_FROM_HOOK=1(P2) + process-info 실패 unknown(P2) → skip 옵션 불일치, 출력 섞임 없음, 해당 팀원 보고 0회
+		writeDefaultMateAgent(REPO_ROOT, "idle", true, {
+			kind: "id",
+			value: mateFullSid,
+			source: "herdr:antigravity_cli",
+		});
+		writeDefaultCriticAgent(REPO_ROOT, "idle", true, {
+			kind: "id",
+			value: criticFullSid,
+			source: "herdr:codex",
+		});
+		fs.writeFileSync(
+			path.join(stateDir, "proc-mate.json"),
+			makeProcessInfoJson([
+				{
+					pid: 3050,
+					name: "agy",
+					argv0: "agy",
+					cwd: REPO_ROOT,
+					argv: ["agy", "--conversation", mateFullSid],
+				},
+			]),
+			"utf8",
+		);
+		readAndClearReportArgvCalls();
+		const expectedCodexReportArgv = [
+			"pane",
+			"report-agent-session",
+			"--source",
+			"gjch-team",
+			"--agent",
+			"codex",
+			"w1:p3",
+			"--",
+			"codex",
+			"resume",
+			criticFullSid,
+			"--no-daemon",
+			"--yolo",
+			"-m",
+			"gpt-6.1-sol",
+			"-C",
+			REPO_ROOT,
+			"--disable",
+			"worktrees",
+			"-c",
+			CODEX_STATUS_LINE,
+			"-c",
+			"project_doc_max_bytes=65536",
+		];
+		const expectedAgyReportArgv = [
+			"pane",
+			"report-agent-session",
+			"--source",
+			"gjch-team",
+			"--agent",
+			"agy",
+			"w1:p2",
+			"--",
+			"agy",
+			"--conversation",
+			mateFullSid,
+			"--model",
+			"gemini-4-argon-high",
+			"--mode",
+			"accept-edits",
+			"--sandbox",
+		];
+
+		const mismatchRes = runTeamUp(["--report-resume"], {
+			...extEnv,
+			GJCH_FROM_HOOK: "1",
+		});
+		expect(mismatchRes.status).toBe(0);
+		expect(mismatchRes.stderr).toBe("");
+		expect(mismatchRes.stdout).not.toContain("GJCH:");
+		expect(mismatchRes.stdout.trim().split("\n")).toEqual([
+			"gjc-herdr-mate skip 옵션 불일치",
+			"gjc-herdr-critic reported codex-se",
+		]);
+		expect(mismatchRes.stdout).not.toContain(mateFullSid);
+		expect(mismatchRes.stdout).not.toContain(criticFullSid);
+		readAndClearHerdrCalls();
+		expect(readAndClearReportArgvCalls()).toEqual([expectedCodexReportArgv]);
+
+		// process-info 실패(unknown) → skip 옵션 불일치, SENTINEL 미노출, 해당 팀원 보고 0회 (P2)
+		writeValidMateProc();
+		fs.writeFileSync(path.join(stateDir, "proc-mate-fail"), "1", "utf8");
+		const unknownProcRes = runTeamUp(["--report-resume"], extEnv);
+		expect(unknownProcRes.status).toBe(0);
+		expect(unknownProcRes.stderr).toBe("");
+		expect(unknownProcRes.stdout.trim().split("\n")).toEqual([
+			"gjc-herdr-mate skip 옵션 불일치",
+			"gjc-herdr-critic reported codex-se",
+		]);
+		expect(unknownProcRes.stdout).not.toContain("SENTINEL_STDERR_SECRET");
+		expect(unknownProcRes.stderr).not.toContain("SENTINEL_STDERR_SECRET");
+		readAndClearHerdrCalls();
+		expect(readAndClearReportArgvCalls()).toEqual([expectedCodexReportArgv]);
+		fs.rmSync(path.join(stateDir, "proc-mate-fail"), { force: true });
+
+		// (5) 세션 있음·옵션 ok (agy·codex 모두) → JSON 배열 argv 경계까지 검증(P3) + 앞 8자만 출력 + rc 0
+		const bothOkRes = runTeamUp(["--report-resume"], extEnv);
+		expect(bothOkRes.status).toBe(0);
+		expect(bothOkRes.stderr).toBe("");
+		expect(bothOkRes.stdout.trim().split("\n")).toEqual([
+			"gjc-herdr-mate reported mate-ses",
+			"gjc-herdr-critic reported codex-se",
+		]);
+		expect(bothOkRes.stdout).not.toContain(mateFullSid);
+		expect(bothOkRes.stdout).not.toContain(criticFullSid);
+		expect(bothOkRes.stderr).not.toContain(mateFullSid);
+		expect(bothOkRes.stderr).not.toContain(criticFullSid);
+		readAndClearHerdrCalls();
+		expect(readAndClearReportArgvCalls()).toEqual([
+			expectedAgyReportArgv,
+			expectedCodexReportArgv,
+		]);
+
+		// (5-P1) 보고 전 정체 확인 회귀 5종 (옵션·세션 유효 상태에서 보고 0회 확인)
+		// P1-a: agy cwd가 다른 프로젝트(/tmp), Codex cwd가 저장소 하위 폴더(scripts) → skip 정체 불일치, 보고 0회
+		writeDefaultMateAgent("/tmp", "idle", true, {
+			kind: "id",
+			value: mateFullSid,
+			source: "herdr:antigravity_cli",
+		});
+		writeDefaultCriticAgent(
+			path.join(REPO_ROOT, "scripts"),
+			"idle",
+			true,
+			{
+				kind: "id",
+				value: criticFullSid,
+				source: "herdr:codex",
+			},
+		);
+		const p1CwdOtherRes = runTeamUp(["--report-resume"], extEnv);
+		expect(p1CwdOtherRes.status).toBe(0);
+		expect(p1CwdOtherRes.stderr).toBe("");
+		expect(p1CwdOtherRes.stdout.trim().split("\n")).toEqual([
+			"gjc-herdr-mate skip 정체 불일치",
+			"gjc-herdr-critic skip 정체 불일치",
+		]);
+		readAndClearHerdrCalls();
+		expect(readAndClearReportArgvCalls()).toEqual([]);
+
+		// P1-b: cwd 없음(pane-no-cwd) 및 pane get 조회 실패(pane-get-fail) → skip 정체 불일치, 보고 0회
+		writeDefaultMateAgent("", "idle", true, {
+			kind: "id",
+			value: mateFullSid,
+			source: "herdr:antigravity_cli",
+		});
+		writeDefaultCriticAgent("", "idle", true, {
+			kind: "id",
+			value: criticFullSid,
+			source: "herdr:codex",
+		});
+		fs.writeFileSync(path.join(stateDir, "pane-no-cwd"), "1", "utf8");
+		const p1NoCwdRes = runTeamUp(["--report-resume"], extEnv);
+		expect(p1NoCwdRes.status).toBe(0);
+		expect(p1NoCwdRes.stdout.trim().split("\n")).toEqual([
+			"gjc-herdr-mate skip 정체 불일치",
+			"gjc-herdr-critic skip 정체 불일치",
+		]);
+		readAndClearHerdrCalls();
+		expect(readAndClearReportArgvCalls()).toEqual([]);
+		fs.rmSync(path.join(stateDir, "pane-no-cwd"), { force: true });
+
+		fs.writeFileSync(path.join(stateDir, "pane-get-fail"), "1", "utf8");
+		const p1PaneFailRes = runTeamUp(["--report-resume"], extEnv);
+		expect(p1PaneFailRes.status).toBe(0);
+		expect(p1PaneFailRes.stdout.trim().split("\n")).toEqual([
+			"gjc-herdr-mate skip 정체 불일치",
+			"gjc-herdr-critic skip 정체 불일치",
+		]);
+		readAndClearHerdrCalls();
+		expect(readAndClearReportArgvCalls()).toEqual([]);
+		fs.rmSync(path.join(stateDir, "pane-get-fail"), { force: true });
+
+		// P1-c: 두 팀원의 작업공간이 다름(w1 vs w2) → skip 정체 불일치, 보고 0회
+		writeDefaultMateAgent(
+			REPO_ROOT,
+			"idle",
+			true,
+			{
+				kind: "id",
+				value: mateFullSid,
+				source: "herdr:antigravity_cli",
+			},
+			"w1",
+		);
+		writeDefaultCriticAgent(
+			REPO_ROOT,
+			"idle",
+			true,
+			{
+				kind: "id",
+				value: criticFullSid,
+				source: "herdr:codex",
+			},
+			"w2",
+		);
+		const p1DiffWsRes = runTeamUp(["--report-resume"], extEnv);
+		expect(p1DiffWsRes.status).toBe(0);
+		expect(p1DiffWsRes.stdout.trim().split("\n")).toEqual([
+			"gjc-herdr-mate skip 정체 불일치",
+			"gjc-herdr-critic skip 정체 불일치",
+		]);
+		readAndClearHerdrCalls();
+		expect(readAndClearReportArgvCalls()).toEqual([]);
+
+		// P1-d: 작업공간 label이 팀 것이 아님 → skip 정체 불일치, 보고 0회
+		writeDefaultCriticAgent(
+			REPO_ROOT,
+			"idle",
+			true,
+			{
+				kind: "id",
+				value: criticFullSid,
+				source: "herdr:codex",
+			},
+			"w1",
+		);
+		fs.writeFileSync(
+			path.join(stateDir, "workspace-label.txt"),
+			"other-project-ws",
+			"utf8",
+		);
+		const p1BadLabelRes = runTeamUp(["--report-resume"], extEnv);
+		expect(p1BadLabelRes.status).toBe(0);
+		expect(p1BadLabelRes.stdout.trim().split("\n")).toEqual([
+			"gjc-herdr-mate skip 정체 불일치",
+			"gjc-herdr-critic skip 정체 불일치",
+		]);
+		readAndClearHerdrCalls();
+		expect(readAndClearReportArgvCalls()).toEqual([]);
+		fs.rmSync(path.join(stateDir, "workspace-label.txt"), { force: true });
+
+		// P1-e: agent 종류가 다름(mate=claude, critic=agy) → skip 정체 불일치, 보고 0회
+		writeDefaultMateAgent(
+			REPO_ROOT,
+			"idle",
+			true,
+			{
+				kind: "id",
+				value: mateFullSid,
+				source: "herdr:antigravity_cli",
+			},
+			"w1",
+			"claude",
+		);
+		writeDefaultCriticAgent(
+			REPO_ROOT,
+			"idle",
+			true,
+			{
+				kind: "id",
+				value: criticFullSid,
+				source: "herdr:codex",
+			},
+			"w1",
+			"agy",
+		);
+		const p1BadKindRes = runTeamUp(["--report-resume"], extEnv);
+		expect(p1BadKindRes.status).toBe(0);
+		expect(p1BadKindRes.stdout.trim().split("\n")).toEqual([
+			"gjc-herdr-mate skip 정체 불일치",
+			"gjc-herdr-critic skip 정체 불일치",
+		]);
+		readAndClearHerdrCalls();
+		expect(readAndClearReportArgvCalls()).toEqual([]);
+
+		// 정체 정상 복원 + P2: 외부 rc 4 → 보고 0회 / Herdr 안 rc 4 → 호환 허용(보고 수행)
+		writeDefaultMateAgent(REPO_ROOT, "idle", true, {
+			kind: "id",
+			value: mateFullSid,
+			source: "herdr:antigravity_cli",
+		});
+		writeDefaultCriticAgent(REPO_ROOT, "idle", true, {
+			kind: "id",
+			value: criticFullSid,
+			source: "herdr:codex",
+		});
+		fs.rmSync(lockPath, { force: true });
+		const extRc4Res = runTeamUp(["--report-resume"], {
+			GJCH_EXTERNAL_LEAD: "1",
+			CLAUDE_PROJECT_DIR: REPO_ROOT,
+			CLAUDE_CODE_SESSION_ID: undefined,
+			CLAUDE_CODE_MESSAGING_SOCKET: undefined,
+		});
+		expect(extRc4Res.status).toBe(4);
+		expect(extRc4Res.stdout).toBe("");
+		expect(extRc4Res.stderr).toContain("외부 팀장이 아닙니다");
+		expect(readAndClearHerdrCalls()).toEqual([]);
+		expect(readAndClearReportArgvCalls()).toEqual([]);
+
+		const insideRc4Res = runTeamUp(["--report-resume"], {
+			HERDR_ENV: "1",
+			HERDR_WORKSPACE_ID: "w1",
+			HERDR_PANE_ID: "w1:p1",
+			CLAUDE_PROJECT_DIR: REPO_ROOT,
+			CLAUDE_CODE_SESSION_ID: undefined,
+			CLAUDE_CODE_MESSAGING_SOCKET: undefined,
+		});
+		expect(insideRc4Res.status).toBe(0);
+		expect(insideRc4Res.stderr).toBe("");
+		expect(insideRc4Res.stdout.trim().split("\n")).toEqual([
+			"gjc-herdr-mate reported mate-ses",
+			"gjc-herdr-critic reported codex-se",
+		]);
+		readAndClearHerdrCalls();
+		expect(readAndClearReportArgvCalls()).toEqual([
+			expectedAgyReportArgv,
+			expectedCodexReportArgv,
+		]);
+
+		// (6) 보고 실패 → fail <rc>, 종료 코드 1, 세션 id·stderr 오류문 미노출
+		fs.writeFileSync(path.join(stateDir, "report-session-fail"), "1", "utf8");
+		const failRes = runTeamUp(["--report-resume"], extEnv);
+		expect(failRes.status).toBe(1);
+		expect(failRes.stderr).toBe("");
+		expect(failRes.stdout.trim().split("\n")).toEqual([
+			"gjc-herdr-mate fail 1",
+			"gjc-herdr-critic fail 1",
+		]);
+		expect(failRes.stdout).not.toContain(mateFullSid);
+		expect(failRes.stdout).not.toContain(criticFullSid);
+		expect(failRes.stderr).not.toContain("SENTINEL_REPORT_ERR");
+		readAndClearHerdrCalls();
+		readAndClearReportArgvCalls();
+		fs.rmSync(path.join(stateDir, "report-session-fail"), { force: true });
+
+		// (7) --up 및 --spawn(P2) 끝 자동 호출: 보고 줄은 stderr에 나오고 stdout 요약과 rc는 그대로 유지(실패해도 rc 불변)
+		fs.writeFileSync(path.join(stateDir, "allow-up-mode"), "1", "utf8");
+		writeDefaultMateAgent(REPO_ROOT, "idle", true); // 막 띄운 agy: 세션 없음
+		writeDefaultCriticAgent(REPO_ROOT, "idle", true, {
+			kind: "id",
+			value: criticFullSid,
+			source: "herdr:codex",
+		});
+		const spawnAutoOk = runTeamUp(["--spawn"], extEnv);
+		expect(spawnAutoOk.status).toBe(0);
+		expect(spawnAutoOk.stderr.trim().split("\n")).toEqual([
+			"gjc-herdr-mate skip 세션 없음",
+			"gjc-herdr-critic reported codex-se",
+		]);
+		assertAllowedUpHerdrCalls(readAndClearHerdrCalls());
+		expect(readAndClearReportArgvCalls()).toEqual([expectedCodexReportArgv]);
+
+		const upAutoOk = runTeamUp(["--up"], extEnv);
+		expect(upAutoOk.status).toBe(0);
+		expect(upAutoOk.stdout.trim().split("\n").slice(-3)).toEqual([
+			"gjc-herdr-mate w1:p2 ok",
+			"gjc-herdr-critic w1:p3 ok",
+			"lock mine",
+		]);
+		expect(upAutoOk.stderr.trim().split("\n")).toEqual([
+			"gjc-herdr-mate skip 세션 없음",
+			"gjc-herdr-critic reported codex-se",
+		]);
+		expect(upAutoOk.stdout).not.toContain(criticFullSid);
+		expect(upAutoOk.stderr).not.toContain(criticFullSid);
+		const upAutoCalls = readAndClearHerdrCalls();
+		assertAllowedUpHerdrCalls(upAutoCalls);
+		expect(readAndClearReportArgvCalls()).toEqual([expectedCodexReportArgv]);
+
+		// --up 자동 보고가 실패해도 --up의 rc 0과 stdout 요약은 그대로 유지
+		fs.writeFileSync(path.join(stateDir, "report-session-fail"), "1", "utf8");
+		const upAutoFail = runTeamUp(["--up"], extEnv);
+		expect(upAutoFail.status).toBe(0);
+		expect(upAutoFail.stdout.trim().split("\n").slice(-3)).toEqual([
+			"gjc-herdr-mate w1:p2 ok",
+			"gjc-herdr-critic w1:p3 ok",
+			"lock mine",
+		]);
+		expect(upAutoFail.stderr.trim().split("\n")).toEqual([
+			"gjc-herdr-mate skip 세션 없음",
+			"gjc-herdr-critic fail 1",
+		]);
+		assertAllowedUpHerdrCalls(readAndClearHerdrCalls());
+		readAndClearReportArgvCalls();
+		fs.rmSync(path.join(stateDir, "report-session-fail"), { force: true });
 	}, 60_000);
 });

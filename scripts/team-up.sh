@@ -10,6 +10,7 @@
 #   scripts/team-up.sh --status  읽기 전용. 네 팀 공통 보고 꼴의 필드를 출력(0=ok, 1=mismatch, 2=unknown)
 #   scripts/team-up.sh --lock <status|claim|release>  팀장 잠금 조회·확보·해제(--force는 받지 않음)
 #   scripts/team-up.sh --up      --spawn과 같은 동작을 수행한 뒤 끝에 --check 요약을 출력
+#   scripts/team-up.sh --report-resume  팀원(agy·선택 Codex)의 시작 옵션이 맞고 세션 id가 있으면 재개 명령을 herdr에 보고
 #   목표 배치(공식 기준): Herdr 안은 팀장 위(높이 60%), 그 아래 왼쪽 팀원 agy | 오른쪽 검토 Codex(반반). 검토가 없으면 팀장 60% / 팀원 아래.
 #                         외부 팀장(GJCH_EXTERNAL_LEAD=1, Herdr 밖)은 팀 작업공간 한 탭 안에서 팀원 agy | 검토 Codex(반반).
 #   팀장 잠금(scripts/team-lead.sh, GJCH_LEAD_LOCK): 잠금이 다른 세션에 있으면 Herdr 안 Claude는 부팀장(GJCH_DEPUTY_NAME, 기본 gjc-herdr-deputy)이 되고,
@@ -117,21 +118,21 @@ if [ "${HERDR_ENV:-}" = 1 ] && [ -n "${HERDR_PANE_ID:-}" ]; then
 elif [ "${GJCH_EXTERNAL_LEAD:-}" = 1 ]; then
 	lead_mode=external
 else
-	if [ "$mode" = "--check" ] || [ "$mode" = "--status" ]; then
+	if [ "$mode" = "--check" ] || [ "$mode" = "--status" ] || [ "$mode" = "--report-resume" ]; then
 		echo "Herdr 안(HERDR_ENV=1, HERDR_PANE_ID) 또는 외부 팀장(GJCH_EXTERNAL_LEAD=1)에서 실행하세요." >&2
 		exit 2
 	fi
 	exit 0
 fi
 if [ -n "${GJCH_TEAM_ROLE:-}" ]; then
-	if [ "$mode" = "--check" ] || [ "$mode" = "--status" ]; then
+	if [ "$mode" = "--check" ] || [ "$mode" = "--status" ] || [ "$mode" = "--report-resume" ]; then
 		echo "팀원 역할(GJCH_TEAM_ROLE=$GJCH_TEAM_ROLE)에서는 ${mode}를 실행할 수 없습니다." >&2
 		exit 2
 	fi
 	exit 0
 fi
 if ! here="$(cd "${CLAUDE_PROJECT_DIR:-$PWD}" 2>/dev/null && pwd -P)"; then
-	if [ "$mode" = "--check" ] || [ "$mode" = "--status" ]; then
+	if [ "$mode" = "--check" ] || [ "$mode" = "--status" ] || [ "$mode" = "--report-resume" ]; then
 		echo "작업 경로(${CLAUDE_PROJECT_DIR:-$PWD})를 확인할 수 없습니다." >&2
 		exit 2
 	fi
@@ -140,7 +141,7 @@ fi
 case "$here/" in
 	"$ROOT"/*) ;;
 	*)
-		if [ "$mode" = "--check" ] || [ "$mode" = "--status" ]; then
+		if [ "$mode" = "--check" ] || [ "$mode" = "--status" ] || [ "$mode" = "--report-resume" ]; then
 			echo "현재 경로($here)가 저장소($ROOT) 밖입니다." >&2
 			exit 2
 		fi
@@ -153,20 +154,20 @@ if wt_reason="$(gjch_worktree_reason "$ROOT")"; then
 		exit 0
 	fi
 	printf '%s\n' "$wt_reason" >&2
-	if [ "$mode" = "--check" ] || [ "$mode" = "--status" ]; then
+	if [ "$mode" = "--check" ] || [ "$mode" = "--status" ] || [ "$mode" = "--report-resume" ]; then
 		exit 2
 	fi
 	exit 1
 fi
 if ! command -v herdr >/dev/null; then
-	if [ "$mode" = "--check" ] || [ "$mode" = "--status" ]; then
+	if [ "$mode" = "--check" ] || [ "$mode" = "--status" ] || [ "$mode" = "--report-resume" ]; then
 		echo "herdr를 찾을 수 없습니다." >&2
 		exit 2
 	fi
 	exit 0
 fi
 if ! command -v python3 >/dev/null; then
-	if [ "$mode" = "--check" ] || [ "$mode" = "--status" ]; then
+	if [ "$mode" = "--check" ] || [ "$mode" = "--status" ] || [ "$mode" = "--report-resume" ]; then
 		echo "python3를 찾을 수 없습니다." >&2
 		exit 2
 	fi
@@ -284,6 +285,289 @@ check_member_argv() { # name pane kind [status]
 	[ -n "$msg" ] && printf '%s\n' "$msg" >&2
 	return 1
 }
+
+# pane의 "<tab_id> in|out"(cwd가 저장소 안/밖). 조회·파싱 실패나 tab·cwd 없음이면 rc 1.
+pane_place() { # pane
+	local out
+	out="$(herdr pane get "$1" 2>/dev/null)" || return 1
+	printf '%s' "$out" | python3 -c 'import sys,json,os
+root=sys.argv[1]
+try: p=json.load(sys.stdin)["result"]["pane"]
+except Exception: sys.exit(1)
+cwd=p.get("foreground_cwd") or p.get("cwd")
+if not p.get("tab_id") or not isinstance(cwd,str) or not cwd.startswith("/"): sys.exit(1)
+print(p["tab_id"], "in" if (os.path.realpath(cwd).rstrip("/")+"/").startswith(root.rstrip("/")+"/") else "out")' "$ROOT"
+}
+
+# 외부 팀장·보고용 기존 agent 정체 검증(이름 → 기본: "<workspace_id>|<pane_id>|<state>", report 모드: 첫 줄 상태 태그).
+# 기본(3인자): agent_not_found로 확인되면 빈 값(rc 0), 조회·파싱 실패나 agent 종류·cwd 불일치면 stderr에 이유를 쓰고 rc 1.
+# report(4번째 인자 "report"): stderr 출력 없이 첫 줄에 상태(not_found|lookup_fail|mismatch|no_session|ok)를 출력하고 rc 0.
+ext_agent_info() { # name expected_kind cwd_mode(inside|exact) [report]
+	local name="$1" expected_kind="$2" cwd_mode="$3" mode_arg="${4:-}" out rc=0
+	out="$(herdr agent get "$name" 2>&1)" || rc=$?
+	printf '%s' "$out" | python3 -c 'import json,os,subprocess,sys
+rc,name,expected_kind,cwd_mode,root,mode_arg=sys.argv[1:7]
+report_mode=(mode_arg=="report")
+def fail_lookup():
+    if report_mode:
+        print("lookup_fail")
+        sys.exit(0)
+    print("could not look up agent '\''%s'\''" % name, file=sys.stderr)
+    sys.exit(1)
+def fail_mismatch(msg, w=""):
+    if report_mode:
+        print("mismatch\n%s" % w)
+        sys.exit(0)
+    print(msg, file=sys.stderr)
+    sys.exit(1)
+try: d=json.load(sys.stdin)
+except Exception: fail_lookup()
+if not isinstance(d,dict): fail_lookup()
+if rc!="0":
+    err=d.get("error")
+    if isinstance(err,dict) and err.get("code")=="agent_not_found":
+        if report_mode:
+            print("not_found")
+        sys.exit(0)
+    fail_lookup()
+res=d.get("result")
+a=(res.get("agent") if isinstance(res,dict) else None) or {}
+if not isinstance(a,dict) or not a.get("pane_id"):
+    fail_lookup()
+p=str(a.get("pane_id"))
+w=a.get("workspace_id") if isinstance(a.get("workspace_id"),str) else ""
+k=a.get("agent") if isinstance(a.get("agent"),str) else ""
+fg_c=a.get("foreground_cwd") if isinstance(a.get("foreground_cwd"),str) else ""
+base_c=a.get("cwd") if isinstance(a.get("cwd"),str) else ""
+c=fg_c or base_c
+s=a.get("agent_status") if isinstance(a.get("agent_status"),str) else ""
+r=a.get("interactive_ready")
+if s=="blocked": st="blocked|"+p+"|blocked"
+elif s=="working" or (s in ("idle","done") and r is True): st="ready|"+p+"|"+s
+elif s: st="not_ready|"+p+"|"+s
+else: st="not_ready|"+p+"|idle"
+if not w or not k or not c:
+    try:
+        pr=subprocess.run(["herdr","pane","get",p],stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,text=True)
+        pane_raw=pr.stdout if pr.returncode==0 else ""
+    except Exception:
+        pane_raw=""
+    if pane_raw:
+        try:
+            pdoc=json.loads(pane_raw)
+            pres=pdoc.get("result") if isinstance(pdoc,dict) else None
+            pd=(pres.get("pane") if isinstance(pres,dict) else None) or {}
+        except Exception: pd={}
+        if isinstance(pd,dict):
+            if not w and isinstance(pd.get("workspace_id"),str): w=pd.get("workspace_id") or ""
+            if not k and isinstance(pd.get("agent"),str): k=pd.get("agent") or ""
+            if not c:
+                p_fg=pd.get("foreground_cwd") if isinstance(pd.get("foreground_cwd"),str) else ""
+                p_base=pd.get("cwd") if isinstance(pd.get("cwd"),str) else ""
+                c=p_fg or p_base
+if not w:
+    fail_mismatch("could not determine workspace of agent '\''%s'\'' (%s)" % (name, p), "")
+if k != expected_kind:
+    fail_mismatch("agent '\''%s'\'' (%s) is '\''%s'\'', expected '\''%s'\''" % (name, p, k or "unknown", expected_kind), w)
+if not c or not c.startswith("/"):
+    fail_mismatch("could not determine cwd of agent '\''%s'\'' (%s)" % (name, p), w)
+real_c=os.path.realpath(c)
+real_root=os.path.realpath(root)
+if cwd_mode=="exact":
+    if real_c != real_root:
+        fail_mismatch("agent '\''%s'\'' (%s) cwd (%s) is not %s" % (name, p, real_c, real_root), w)
+else:
+    if not (real_c.rstrip("/")+"/").startswith(real_root.rstrip("/")+"/"):
+        fail_mismatch("agent '\''%s'\'' (%s) cwd (%s) is outside %s" % (name, p, real_c, real_root), w)
+if report_mode:
+    sess=a.get("agent_session")
+    val=sess.get("value") if isinstance(sess,dict) and sess.get("kind")=="id" else None
+    st_val=s or "idle"
+    if isinstance(val,str) and val:
+        print("ok\n%s\n%s\n%s\n%s" % (w, p, st_val, val))
+    else:
+        print("no_session\n%s\n%s\n%s" % (w, p, st_val))
+    sys.exit(0)
+print("%s|%s|%s" % (w, p, st))' "$rc" "$name" "$expected_kind" "$cwd_mode" "$ROOT" "$mode_arg"
+}
+
+probe_ws_state() { # parsed_probe
+	local parsed="$1" state rest w
+	state="${parsed%%$'\n'*}"
+	case "$state" in
+		not_found) printf 'not_found\n' ;;
+		lookup_fail) printf 'lookup_fail\n' ;;
+		mismatch|no_session|ok)
+			rest="${parsed#*$'\n'}"
+			w="${rest%%$'\n'*}"
+			if [ -n "$w" ]; then
+				printf '%s\n' "$w"
+			else
+				printf 'lookup_fail\n'
+			fi
+			;;
+		*) printf 'lookup_fail\n' ;;
+	esac
+}
+
+# 보고 대상 팀원의 작업공간이 현재 팀 작업공간과 일치하는지 확인한다(#71 P1).
+# - inside 모드: 팀장 pane(HERDR_PANE_ID)이 저장소 안(pane_place "... in")이고 같은 workspace_id여야 한다.
+# - external 모드: 다른 팀원이 존재하면 같은 workspace_id여야 하고, 그 작업공간의 label이 WS_LABEL이어야 한다.
+check_report_workspace() { # target_ws [other_ws_state]
+	local target_ws="$1" other_ws="${2:-}" place lead_ws ws_label
+	[ -n "$target_ws" ] || return 1
+	if [ "$lead_mode" = inside ]; then
+		place="$(pane_place "$HERDR_PANE_ID")" || return 1
+		[ "${place#* }" = in ] || return 1
+		lead_ws="$(herdr pane get "$HERDR_PANE_ID" 2>/dev/null | jget result.pane.workspace_id)"
+		[ -n "$lead_ws" ] && [ "$target_ws" = "$lead_ws" ]
+		return $?
+	fi
+	case "$other_ws" in
+		""|not_found) ;;
+		lookup_fail) return 1 ;;
+		*) [ "$target_ws" = "$other_ws" ] || return 1 ;;
+	esac
+	ws_label="$(herdr workspace get "$target_ws" 2>/dev/null | jget result.workspace.label)"
+	[ "$ws_label" = "$WS_LABEL" ]
+}
+
+# 팀원 하나에 대해 정체(종류·cwd·작업공간)·세션 id·시작 옵션이 맞으면 herdr에 재개 명령을 보고한다(#71).
+# 반환: 0=reported 또는 skip, 1=fail. 결과 줄은 REPORT_LINE, 상태 태그는 REPORT_STATE에 담는다.
+REPORT_LINE=""
+REPORT_STATE=""
+report_resume_one() { # name kind [peer_ws_state] [pre_probed]
+	local name="$1" kind="$2" peer_ws="${3:-}" parsed="${4:-}" cwd_mode=inside state rest target_ws pane status sess_id="" id8 report_rc=0
+	REPORT_LINE=""
+	REPORT_STATE=""
+	[ "$kind" = codex ] && cwd_mode=exact
+	if [ -z "$parsed" ]; then
+		parsed="$(ext_agent_info "$name" "$kind" "$cwd_mode" report)"
+	fi
+	state="${parsed%%$'\n'*}"
+	if [ "$state" = not_found ] || [ "$state" = lookup_fail ]; then
+		REPORT_STATE=absent
+		REPORT_LINE="$name skip 없음"
+		return 0
+	fi
+	if [ "$state" = mismatch ]; then
+		REPORT_STATE=skip_identity
+		REPORT_LINE="$name skip 정체 불일치"
+		return 0
+	fi
+	if [ "$state" != no_session ] && [ "$state" != ok ]; then
+		REPORT_STATE=absent
+		REPORT_LINE="$name skip 없음"
+		return 0
+	fi
+	rest="${parsed#*$'\n'}"
+	target_ws="${rest%%$'\n'*}"
+	rest="${rest#*$'\n'}"
+	pane="${rest%%$'\n'*}"
+	rest="${rest#*$'\n'}"
+	if [ "$state" = ok ]; then
+		status="${rest%%$'\n'*}"
+		sess_id="${rest#*$'\n'}"
+	else
+		status="$rest"
+	fi
+	if ! check_report_workspace "$target_ws" "$peer_ws"; then
+		REPORT_STATE=skip_identity
+		REPORT_LINE="$name skip 정체 불일치"
+		return 0
+	fi
+	if [ "$state" = no_session ] || [ -z "$sess_id" ]; then
+		REPORT_STATE=no_session
+		REPORT_LINE="$name skip 세션 없음"
+		return 0
+	fi
+	if ! GJCH_FROM_HOOK="" check_member_argv "$name" "$pane" "$kind" "$status" >/dev/null 2>&1; then
+		REPORT_STATE=skip_argv
+		REPORT_LINE="$name skip 옵션 불일치"
+		return 0
+	fi
+	case "$kind" in
+		agy)
+			herdr pane report-agent-session --source gjch-team --agent agy "$pane" -- agy --conversation "$sess_id" "${MATE_START_ARGS[@]}" >/dev/null 2>&1 || report_rc=$?
+			;;
+		codex)
+			herdr pane report-agent-session --source gjch-team --agent codex "$pane" -- codex resume "$sess_id" "${CRITIC_START_ARGS[@]}" >/dev/null 2>&1 || report_rc=$?
+			;;
+		*)
+			report_rc=1
+			;;
+	esac
+	if [ "$report_rc" != 0 ]; then
+		REPORT_STATE=fail
+		REPORT_LINE="$name fail $report_rc"
+		return 1
+	fi
+	id8="${sess_id:0:8}"
+	REPORT_STATE=reported
+	REPORT_LINE="$name reported $id8"
+	return 0
+}
+
+report_resume() { # [auto|codex]
+	local sub="${1:-}" rc=0 has_session=0 line mate_probe="" critic_probe="" mate_ws="" critic_ws=""
+	local -a lines=()
+	if [ "$sub" = codex ]; then
+		critic_probe="$(ext_agent_info "$CRITIC_NAME" codex exact report)"
+		if [ "$lead_mode" = external ]; then
+			mate_probe="$(ext_agent_info "$MATE_NAME" agy inside report)"
+			mate_ws="$(probe_ws_state "$mate_probe")"
+		fi
+		report_resume_one "$CRITIC_NAME" codex "$mate_ws" "$critic_probe" || rc=1
+		printf '%s\n' "$REPORT_LINE"
+		return "$rc"
+	fi
+	mate_probe="$(ext_agent_info "$MATE_NAME" agy inside report)"
+	mate_ws="$(probe_ws_state "$mate_probe")"
+	if codex_enabled || [ "$lead_mode" = external ]; then
+		critic_probe="$(ext_agent_info "$CRITIC_NAME" codex exact report)"
+		critic_ws="$(probe_ws_state "$critic_probe")"
+	fi
+	report_resume_one "$MATE_NAME" agy "$critic_ws" "$mate_probe" || rc=1
+	lines+=("$REPORT_LINE")
+	case "$REPORT_STATE" in
+		absent|no_session) ;;
+		*) has_session=1 ;;
+	esac
+	if codex_enabled; then
+		report_resume_one "$CRITIC_NAME" codex "$mate_ws" "$critic_probe" || rc=1
+		lines+=("$REPORT_LINE")
+		case "$REPORT_STATE" in
+			absent|no_session) ;;
+			*) has_session=1 ;;
+		esac
+	fi
+	if [ "$sub" = auto ]; then
+		if [ "${GJCH_FROM_HOOK:-}" = 1 ] || [ "$has_session" = 0 ]; then
+			return "$rc"
+		fi
+	fi
+	for line in "${lines[@]}"; do
+		printf '%s\n' "$line"
+	done
+	return "$rc"
+}
+
+if [ "$mode" = "--report-resume" ]; then
+	if [ "$#" -gt 2 ] || { [ "$#" -eq 2 ] && [ "${2:-}" != codex ]; }; then
+		printf '사용법: %s --report-resume [codex]\n' "$0" >&2
+		exit 2
+	fi
+	if [ "$lead_rc" = 3 ]; then
+		print_role_line >&2
+		exit 3
+	fi
+	if [ "$lead_mode" = external ] && [ "$lead_rc" != 0 ]; then
+		print_role_line >&2
+		exit "$lead_rc"
+	fi
+	report_resume "${2:-}"
+	exit $?
+fi
 
 # agent 이름 → pane ID. agent_not_found로 확인되면 빈 값(rc 0), 조회·파싱 실패면 rc 1.
 # herdr는 오류 JSON을 stderr로 내므로 함께 읽는다.
@@ -421,76 +705,6 @@ move_via_temp_tab() { # pane tab target split ratio
 		echo "$2 shows no new pane now, but one may still appear because the wait was not completed" >&2
 		return 3
 	fi
-}
-
-# 외부 팀장용 기존 agent 검증(이름 → "<workspace_id>|<pane_id>|<state>").
-# agent_not_found로 확인되면 빈 값(rc 0), 조회·파싱 실패나 agent 종류·cwd 불일치면 stderr에 이유를 쓰고 rc 1.
-ext_agent_info() { # name expected_kind cwd_mode(inside|exact)
-	local name="$1" expected_kind="$2" cwd_mode="$3" out rc=0
-	out="$(herdr agent get "$name" 2>&1)" || rc=$?
-	printf '%s' "$out" | python3 -c 'import json,os,subprocess,sys
-rc,name,expected_kind,cwd_mode,root=sys.argv[1:6]
-def fail_lookup():
-    print("could not look up agent '\''%s'\''" % name, file=sys.stderr)
-    sys.exit(1)
-try: d=json.load(sys.stdin)
-except Exception: fail_lookup()
-if not isinstance(d,dict): fail_lookup()
-if rc!="0":
-    err=d.get("error")
-    if isinstance(err,dict) and err.get("code")=="agent_not_found":
-        sys.exit(0)
-    fail_lookup()
-res=d.get("result")
-a=(res.get("agent") if isinstance(res,dict) else None) or {}
-if not isinstance(a,dict) or not a.get("pane_id"):
-    fail_lookup()
-p=a.get("pane_id")
-w=a.get("workspace_id") or ""
-k=a.get("agent") or ""
-c=a.get("foreground_cwd") or a.get("cwd") or ""
-s=a.get("agent_status") or ""
-r=a.get("interactive_ready")
-if s=="blocked": st="blocked|"+p+"|blocked"
-elif s=="working" or (s in ("idle","done") and r is True): st="ready|"+p+"|"+s
-elif s: st="not_ready|"+p+"|"+s
-else: st="not_ready|"+p+"|idle"
-if not w or not k or not c:
-    try:
-        pr=subprocess.run(["herdr","pane","get",p],stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,text=True)
-        pane_raw=pr.stdout if pr.returncode==0 else ""
-    except Exception:
-        pane_raw=""
-    if pane_raw:
-        try:
-            pdoc=json.loads(pane_raw)
-            pres=pdoc.get("result") if isinstance(pdoc,dict) else None
-            pd=(pres.get("pane") if isinstance(pres,dict) else None) or {}
-        except Exception: pd={}
-        if isinstance(pd,dict):
-            if not w: w=pd.get("workspace_id") or ""
-            if not k: k=pd.get("agent") or ""
-            if not c: c=pd.get("foreground_cwd") or pd.get("cwd") or ""
-if not w:
-    print("could not determine workspace of agent '\''%s'\'' (%s)" % (name, p), file=sys.stderr)
-    sys.exit(1)
-if k != expected_kind:
-    print("agent '\''%s'\'' (%s) is '\''%s'\'', expected '\''%s'\''" % (name, p, k or "unknown", expected_kind), file=sys.stderr)
-    sys.exit(1)
-if not c:
-    print("could not determine cwd of agent '\''%s'\'' (%s)" % (name, p), file=sys.stderr)
-    sys.exit(1)
-real_c=os.path.realpath(c)
-real_root=os.path.realpath(root)
-if cwd_mode=="exact":
-    if real_c != real_root:
-        print("agent '\''%s'\'' (%s) cwd (%s) is not %s" % (name, p, real_c, real_root), file=sys.stderr)
-        sys.exit(1)
-else:
-    if not (real_c.rstrip("/")+"/").startswith(real_root.rstrip("/")+"/"):
-        print("agent '\''%s'\'' (%s) cwd (%s) is outside %s" % (name, p, real_c, real_root), file=sys.stderr)
-        sys.exit(1)
-print("%s|%s|%s" % (w, p, st))' "$rc" "$name" "$expected_kind" "$cwd_mode" "$ROOT"
 }
 
 # SessionStart(startup) hook에서 기존 팀원·검토가 이미 떠 있으면 상태와 상관없이 argv를 동기로 점검해 stdout(GJCH: 접두사)에 알린다(#42, #58).
@@ -798,19 +1012,6 @@ fit_ratios_external() { # mate critic
 	[ "${3:-}" = 1 ] || fail=1
 	[ "$fail" = 0 ] || echo "resize failed or not reached: mate/critic $2 (target 0.5)" >&2
 	return "$fail"
-}
-
-# pane의 "<tab_id> in|out"(cwd가 저장소 안/밖). 조회·파싱 실패나 tab·cwd 없음이면 rc 1.
-pane_place() { # pane
-	local out
-	out="$(herdr pane get "$1" 2>/dev/null)" || return 1
-	printf '%s' "$out" | python3 -c 'import sys,json,os
-root=sys.argv[1]
-try: p=json.load(sys.stdin)["result"]["pane"]
-except Exception: sys.exit(1)
-cwd=p.get("foreground_cwd") or p.get("cwd")
-if not p.get("tab_id") or not cwd: sys.exit(1)
-print(p["tab_id"], "in" if (os.path.realpath(cwd).rstrip("/")+"/").startswith(root.rstrip("/")+"/") else "out")' "$ROOT"
 }
 
 # 확인된 조건 불일치: 수동 --layout은 오류(1), 팀 구성(team)은 건너뜀(0). 어느 쪽이든 아무것도 옮기지 않는다.
@@ -1200,6 +1401,7 @@ if [ "$layout_status" != 0 ]; then
 		echo "team layout is not in place; run scripts/team-up.sh --layout from the lead pane" >&2
 	fi
 fi
+report_resume auto >&2 || true
 # 기동 실패 rc를 배치·옵션 점검 rc보다 우선한다.
 spawn_rc=0
 if [ "$critic_status" != 0 ]; then

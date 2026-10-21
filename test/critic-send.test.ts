@@ -65,6 +65,11 @@ interface RunCriticSendOptions {
 	agentStatus?: string;
 	interactiveReady?: boolean;
 	prePromptWorkingOnce?: boolean;
+	noWait?: boolean;
+	resultMode?: "none" | "written" | "unwritten";
+	agentSession?: { kind: string; value: string; source?: string };
+	reportSessionFail?: boolean;
+	externalMode?: boolean;
 }
 
 function makeAgentJson(params: {
@@ -76,6 +81,7 @@ function makeAgentJson(params: {
 	interactiveReady: boolean;
 	revision: number;
 	stateChangeSeq: number;
+	agentSession?: { kind: string; value: string; source?: string };
 }): string {
 	return JSON.stringify({
 		result: {
@@ -92,6 +98,7 @@ function makeAgentJson(params: {
 				interactive_ready: params.interactiveReady,
 				revision: params.revision,
 				state_change_seq: params.stateChangeSeq,
+				...(params.agentSession ? { agent_session: params.agentSession } : {}),
 			},
 		},
 	});
@@ -102,10 +109,12 @@ function runCriticSend(options: RunCriticSendOptions): {
 	stdout: string;
 	stderr: string;
 	calls: string[];
+	reportArgvCalls: string[][];
 } {
 	const tmpDir = fs.mkdtempSync("/tmp/gjch-t-critic-send-");
 	try {
 		const logPath = path.join(tmpDir, "herdr-calls.log");
+		const reportArgvPath = path.join(tmpDir, "report-argv.jsonl");
 		const screenPath = path.join(tmpDir, "screen.ansi");
 		const newTypedScreenPath = path.join(tmpDir, "screen-new-typed.ansi");
 		const freshScreenPath = path.join(tmpDir, "screen-fresh.ansi");
@@ -116,18 +125,62 @@ function runCriticSend(options: RunCriticSendOptions): {
 		const postEnterGetsPath = path.join(tmpDir, "post-enter-gets");
 		const prePromptWorkingUsedPath = path.join(tmpDir, "pre-prompt-working-used");
 		const briefPath = path.join(tmpDir, "brief.md");
+		const resultPath = path.join(tmpDir, "critic-result.md");
+		const procCriticPath = path.join(tmpDir, "proc-critic.json");
 		const lockPath = path.join(tmpDir, "lead.json");
+		const sockPath = path.join(tmpDir, "lead.sock");
 		const herdrBin = path.join(tmpDir, "herdr");
+		const lsofBin = path.join(tmpDir, "lsof");
 
 		const workspaceId = "w-test";
 		const leadPaneId = "w-test:p-lead";
 		const criticPaneId = "w-test:p-critic";
 		const criticName = "gjc-herdr-critic";
+		const codexStatusLine =
+			'tui.status_line=["context-remaining","total-input-tokens","total-output-tokens"]';
 
 		fs.writeFileSync(screenPath, options.screen, "utf8");
 		fs.writeFileSync(newTypedScreenPath, NEW_TYPED_SCREEN, "utf8");
 		fs.writeFileSync(freshScreenPath, FRESH_SCREEN, "utf8");
 		fs.writeFileSync(briefPath, "# 검토 지시서\n내용 확인\n", "utf8");
+		fs.writeFileSync(
+			procCriticPath,
+			JSON.stringify({
+				id: "req-1",
+				result: {
+					type: "pane_process_info",
+					process_info: {
+						pane_id: criticPaneId,
+						shell_pid: 1000,
+						foreground_process_group_id: 2000,
+						foreground_processes: [
+							{
+								pid: 4002,
+								name: "codex",
+								argv0: "codex",
+								cwd: REPO_ROOT,
+								argv: [
+									"codex",
+									"--no-daemon",
+									"--yolo",
+									"-m",
+									"gpt-6.1-sol",
+									"-C",
+									REPO_ROOT,
+									"--disable",
+									"worktrees",
+									"-c",
+									codexStatusLine,
+									"-c",
+									"project_doc_max_bytes=65536",
+								],
+							},
+						],
+					},
+				},
+			}),
+			"utf8",
+		);
 
 		fs.writeFileSync(
 			agentInitialPath,
@@ -140,6 +193,7 @@ function runCriticSend(options: RunCriticSendOptions): {
 				interactiveReady: options.interactiveReady ?? true,
 				revision: 1,
 				stateChangeSeq: 1,
+				agentSession: options.agentSession,
 			}),
 			"utf8",
 		);
@@ -154,6 +208,7 @@ function runCriticSend(options: RunCriticSendOptions): {
 				interactiveReady: false,
 				revision: 2,
 				stateChangeSeq: 2,
+				agentSession: options.agentSession,
 			}),
 			"utf8",
 		);
@@ -168,6 +223,7 @@ function runCriticSend(options: RunCriticSendOptions): {
 				interactiveReady: true,
 				revision: 3,
 				stateChangeSeq: 3,
+				agentSession: options.agentSession,
 			}),
 			"utf8",
 		);
@@ -186,10 +242,18 @@ ENTER_SENT=${JSON.stringify(enterSentPath)}
 POST_GETS=${JSON.stringify(postEnterGetsPath)}
 PRE_WORK_ONCE=${JSON.stringify(options.prePromptWorkingOnce ? "1" : "0")}
 PRE_WORK_USED=${JSON.stringify(prePromptWorkingUsedPath)}
+PROC_CRITIC=${JSON.stringify(procCriticPath)}
+RESULT_PATH=${JSON.stringify(resultPath)}
+RESULT_MODE=${JSON.stringify(options.resultMode ?? "none")}
+REPORT_FAIL=${JSON.stringify(options.reportSessionFail ? "1" : "0")}
 
 case "$1 $2" in
 	"agent get")
 		target="\${3:-}"
+		if [ "$target" = "gjc-herdr-mate" ]; then
+			printf '{"error":{"code":"agent_not_found","message":"not found"}}\\n' >&2
+			exit 1
+		fi
 		if [ "$target" != "$CRITIC_NAME" ] && [ "$target" != "$CRITIC_PANE" ]; then
 			printf 'unexpected agent get target: %s\\n' "$target" >&2
 			exit 1
@@ -216,6 +280,16 @@ case "$1 $2" in
 			exit 0
 		fi
 		cat "$AGENT_INIT"
+		exit 0
+		;;
+	"pane get")
+		pane="\${3:-}"
+		printf '{"result":{"pane":{"pane_id":"%s","workspace_id":"w-test","tab_id":"w-test:t1","cwd":%s,"foreground_cwd":%s,"agent_status":"idle"}}}\\n' "$pane" ${JSON.stringify(JSON.stringify(REPO_ROOT))} ${JSON.stringify(JSON.stringify(REPO_ROOT))}
+		exit 0
+		;;
+	"workspace get")
+		ws_id="\${3:-w-test}"
+		printf '{"result":{"workspace":{"workspace_id":"%s","label":"GJCH · gjc-herdr"}}}\\n' "$ws_id"
 		exit 0
 		;;
 	"pane read")
@@ -254,6 +328,9 @@ case "$1 $2" in
 			printf 'unexpected agent prompt args: %s\\n' "$*" >&2
 			exit 1
 		fi
+		if [ "$RESULT_MODE" = "written" ]; then
+			printf '# 검토 결과\\n완료\\n' > "$RESULT_PATH"
+		fi
 		printf '{"ok":true}'
 		exit 0
 		;;
@@ -265,32 +342,79 @@ case "$1 $2" in
 		printf '{"ok":true}'
 		exit 0
 		;;
+	"pane process-info")
+		cat "$PROC_CRITIC"
+		exit 0
+		;;
+	"pane report-agent-session")
+		python3 -c 'import json,sys; print(json.dumps(sys.argv[1:]))' "$@" >> ${JSON.stringify(reportArgvPath)}
+		if [ "$REPORT_FAIL" = "1" ]; then
+			printf 'report-agent-session error: SENTINEL_CRITIC_REPORT_ERR\\n' >&2
+			exit 1
+		fi
+		exit 0
+		;;
 esac
 printf 'unexpected herdr command: %s\\n' "$*" >&2
 exit 1
 `;
 		fs.writeFileSync(herdrBin, fakeHerdrScript, "utf8");
 		fs.chmodSync(herdrBin, 0o755);
+		fs.writeFileSync(lsofBin, "#!/bin/sh\nprintf '42424\\n'\nexit 0\n", "utf8");
+		fs.chmodSync(lsofBin, 0o755);
 
 		if (REAL_PYTHON3) {
 			fs.symlinkSync(REAL_PYTHON3, path.join(tmpDir, "python3"));
 		}
 
-		const proc = spawnSync("/bin/bash", [CRITIC_SEND_SH, "--no-wait", briefPath], {
+		if (options.externalMode && REAL_PYTHON3) {
+			spawnSync(
+				REAL_PYTHON3,
+				[
+					"-c",
+					"import socket,sys; s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); s.close()",
+					sockPath,
+				],
+				{ encoding: "utf8", timeout: 5_000 },
+			);
+		}
+
+		const cliArgs: string[] = [];
+		if (options.noWait ?? true) {
+			cliArgs.push("--no-wait");
+		} else if (options.resultMode && options.resultMode !== "none") {
+			cliArgs.push("--result", resultPath);
+		}
+		cliArgs.push(briefPath);
+
+		const runEnv: NodeJS.ProcessEnv = {
+			...process.env,
+			PATH: `${tmpDir}:${process.env.PATH ?? ""}`,
+			PYTHONNOUSERSITE: "1",
+			CLAUDE_PROJECT_DIR: REPO_ROOT,
+			GJCH_LEAD_LOCK: lockPath,
+			GJCH_CRITIC_NAME: criticName,
+		};
+		if (options.externalMode) {
+			delete runEnv.HERDR_ENV;
+			delete runEnv.HERDR_WORKSPACE_ID;
+			delete runEnv.HERDR_PANE_ID;
+			runEnv.GJCH_EXTERNAL_LEAD = "1";
+			runEnv.CLAUDE_CODE_SESSION_ID = "ext-critic-send-sess-1";
+			runEnv.CLAUDE_CODE_MESSAGING_SOCKET = sockPath;
+		} else {
+			delete runEnv.GJCH_EXTERNAL_LEAD;
+			runEnv.HERDR_ENV = "1";
+			runEnv.HERDR_WORKSPACE_ID = workspaceId;
+			runEnv.HERDR_PANE_ID = leadPaneId;
+			runEnv.CLAUDE_CODE_SESSION_ID = "";
+			runEnv.CLAUDE_CODE_MESSAGING_SOCKET = "";
+		}
+
+		const proc = spawnSync("/bin/bash", [CRITIC_SEND_SH, ...cliArgs], {
 			cwd: REPO_ROOT,
 			encoding: "utf8",
-			env: {
-				...process.env,
-				PATH: `${tmpDir}:${process.env.PATH ?? ""}`,
-				PYTHONNOUSERSITE: "1",
-				HERDR_ENV: "1",
-				HERDR_WORKSPACE_ID: workspaceId,
-				HERDR_PANE_ID: leadPaneId,
-				GJCH_LEAD_LOCK: lockPath,
-				GJCH_CRITIC_NAME: criticName,
-				CLAUDE_CODE_SESSION_ID: "",
-				CLAUDE_CODE_MESSAGING_SOCKET: "",
-			},
+			env: runEnv,
 		});
 
 		const calls = fs.existsSync(logPath)
@@ -300,12 +424,21 @@ exit 1
 					.split("\n")
 					.filter(Boolean)
 			: [];
+		const reportArgvCalls = fs.existsSync(reportArgvPath)
+			? fs
+					.readFileSync(reportArgvPath, "utf8")
+					.trim()
+					.split("\n")
+					.filter(Boolean)
+					.map((line) => JSON.parse(line) as string[])
+			: [];
 
 		return {
 			status: proc.status,
 			stdout: proc.stdout ?? "",
 			stderr: proc.stderr ?? "",
 			calls,
+			reportArgvCalls,
 		};
 	} finally {
 		fs.rmSync(tmpDir, { recursive: true, force: true });
@@ -435,6 +568,129 @@ describe("scripts/critic-send.sh focus & input box checks (#46)", () => {
 			expect(enterIndex).toBeGreaterThan(0);
 			expect(lastReadIndex).toBeGreaterThan(enterIndex);
 			expect(promptIndex).toBeGreaterThan(lastReadIndex);
+		},
+		60_000,
+	);
+
+	test(
+		"7. #71 완료 대기 뒤 끝나기 직전(rc 0·4 경로 모두, 외부 모드·결과 파일 미지정 포함) Codex 재개 명령을 다시 보고하고(JSON 배열 argv 경계 검증), 보고가 실패해도 critic-send의 rc는 바뀌지 않는다",
+		() => {
+			const fullSid = "critic-new-sess-99887766-full-secret";
+			const expectedReportArgv = [
+				"pane",
+				"report-agent-session",
+				"--source",
+				"gjch-team",
+				"--agent",
+				"codex",
+				"w-test:p-critic",
+				"--",
+				"codex",
+				"resume",
+				fullSid,
+				"--no-daemon",
+				"--yolo",
+				"-m",
+				"gpt-6.1-sol",
+				"-C",
+				REPO_ROOT,
+				"--disable",
+				"worktrees",
+				"-c",
+				'tui.status_line=["context-remaining","total-input-tokens","total-output-tokens"]',
+				"-c",
+				"project_doc_max_bytes=65536",
+			];
+
+			// (a) 완료·결과 파일 확인(rc 0): stderr에 reported 한 줄, JSON 배열 argv 경계까지 검증(P3), 전체 id 미노출
+			const okRes = runCriticSend({
+				focused: false,
+				screen: FRESH_SCREEN,
+				noWait: false,
+				resultMode: "written",
+				agentSession: {
+					kind: "id",
+					value: fullSid,
+					source: "herdr:codex",
+				},
+			});
+			expect(okRes.status).toBe(0);
+			expect(okRes.stderr.trim()).toBe("gjc-herdr-critic reported critic-n");
+			expect(okRes.stdout).not.toContain(fullSid);
+			expect(okRes.stderr).not.toContain(fullSid);
+			expect(okRes.reportArgvCalls).toEqual([expectedReportArgv]);
+
+			// (a-2) 외부 팀장 모드(GJCH_EXTERNAL_LEAD=1 전달) + 결과 파일 미지정 경로(rc 0, P2)
+			const extNoResultRes = runCriticSend({
+				focused: false,
+				screen: FRESH_SCREEN,
+				noWait: false,
+				resultMode: "none",
+				externalMode: true,
+				agentSession: {
+					kind: "id",
+					value: fullSid,
+					source: "herdr:codex",
+				},
+			});
+			expect(extNoResultRes.status).toBe(0);
+			expect(extNoResultRes.stderr.trim()).toBe(
+				"gjc-herdr-critic reported critic-n",
+			);
+			expect(extNoResultRes.stdout).not.toContain(fullSid);
+			expect(extNoResultRes.stderr).not.toContain(fullSid);
+			expect(extNoResultRes.reportArgvCalls).toEqual([expectedReportArgv]);
+
+			// (b) 완료됐으나 결과 파일 미작성(rc 4): 끝나기 직전 Codex 재보고 수행 후 rc 4 유지
+			const rc4Res = runCriticSend({
+				focused: false,
+				screen: FRESH_SCREEN,
+				noWait: false,
+				resultMode: "unwritten",
+				agentSession: {
+					kind: "id",
+					value: fullSid,
+					source: "herdr:codex",
+				},
+			});
+			expect(rc4Res.status).toBe(4);
+			expect(rc4Res.stderr).toContain("gjc-herdr-critic reported critic-n");
+			expect(rc4Res.stdout).not.toContain(fullSid);
+			expect(rc4Res.stderr).not.toContain(fullSid);
+			expect(rc4Res.reportArgvCalls).toEqual([expectedReportArgv]);
+
+			// (c) 보고 실패 시에도 critic-send의 rc(0 및 4)는 바뀌지 않고 stderr에 fail 한 줄만 남김
+			const failRc0Res = runCriticSend({
+				focused: false,
+				screen: FRESH_SCREEN,
+				noWait: false,
+				resultMode: "written",
+				agentSession: {
+					kind: "id",
+					value: fullSid,
+					source: "herdr:codex",
+				},
+				reportSessionFail: true,
+			});
+			expect(failRc0Res.status).toBe(0);
+			expect(failRc0Res.stderr.trim()).toBe("gjc-herdr-critic fail 1");
+			expect(failRc0Res.stderr).not.toContain("SENTINEL_CRITIC_REPORT_ERR");
+
+			const failRc4Res = runCriticSend({
+				focused: false,
+				screen: FRESH_SCREEN,
+				noWait: false,
+				resultMode: "unwritten",
+				agentSession: {
+					kind: "id",
+					value: fullSid,
+					source: "herdr:codex",
+				},
+				reportSessionFail: true,
+			});
+			expect(failRc4Res.status).toBe(4);
+			expect(failRc4Res.stderr).toContain("gjc-herdr-critic fail 1");
+			expect(failRc4Res.stderr).not.toContain("SENTINEL_CRITIC_REPORT_ERR");
 		},
 		60_000,
 	);

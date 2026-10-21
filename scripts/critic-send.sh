@@ -424,10 +424,17 @@ while :; do
 	[ "$(now_ms)" -lt "$deadline" ] || { echo '완료 대기 timeout. 원격 작업은 중단하지 않았습니다. 공개 상태와 결과 파일을 확인하세요.' >&2; exit 2; }
 	sleep 1
 done
+report_critic_resume() {
+	GJCH_EXTERNAL_LEAD="${GJCH_EXTERNAL_LEAD:-}" /bin/bash "$ROOT/scripts/team-up.sh" --report-resume codex >&2 || true
+}
 echo "완료(idle/done) 확인: $CRITIC_NAME ($pane)"
-[ -n "$result_file" ] || exit 0
+if [ -z "$result_file" ]; then
+	report_critic_resume
+	exit 0
+fi
 if result_written "$result_file" "$result_before"; then
 	echo "완료·결과 파일 확인: $result_file"
+	report_critic_resume
 	exit 0
 fi
 {
@@ -435,4 +442,5 @@ fi
 	herdr pane read "$pane" --source visible | python3 -c 'import sys; print("\n".join(sys.stdin.read().splitlines()[-8:]))' || true
 	echo '원인을 확인한 뒤 같은 지시서를 다시 보낼 수 있습니다(이번 회차는 완료됨).'
 } >&2
+report_critic_resume
 exit 4
