@@ -1,7 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { spawn, spawnSync } from "node:child_process";
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
 
 const REPO_ROOT = fs.realpathSync(path.resolve(import.meta.dir, ".."));
@@ -49,7 +48,7 @@ function resolvePython3(): string {
 const REAL_PYTHON3 = resolvePython3();
 
 function canConnectUnixSocket(): boolean {
-	const probeDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-lw-probe-"));
+	const probeDir = fs.mkdtempSync("/tmp/gjch-t-lw-probe-");
 	const probeSock = path.join(fs.realpathSync(probeDir), "probe.sock");
 	let server: ReturnType<typeof Bun.listen> | null = null;
 	try {
@@ -205,7 +204,7 @@ function createHarness(options?: {
 	repairMoveMateToTab?: string;
 	repairSelfSignal?: string;
 }): Harness {
-	const rawTmp = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-lw-"));
+	const rawTmp = fs.mkdtempSync("/tmp/gjch-t-lw-");
 	const tmpDir = fs.realpathSync(rawTmp);
 	const binDir = path.join(tmpDir, "bin");
 	const watchDir = path.join(tmpDir, "watch");
@@ -1710,7 +1709,7 @@ describe("scripts/layout-watch.py (#55)", () => {
 	);
 
 	test("23. team-up.sh --layout·--spawn (#59): (a) 작은 오차 resize, (b) 2-pane inside, (c) resize 실패, (d) 비숫자 ratio, (e) 리사이즈 중 모양 변경, (f) ext_agent_info 보충 조회·거부, python3 횟수(10회) 및 pane_place 중복 제거", () => {
-		const rawTmp = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-lw-teamup-"));
+		const rawTmp = fs.mkdtempSync("/tmp/gjch-t-lw-teamup-");
 		const tmpDir = fs.realpathSync(rawTmp);
 		const sockDir = fs.mkdtempSync(path.join("/tmp", "gjch-lw59-"));
 		cleanups.push(() => {

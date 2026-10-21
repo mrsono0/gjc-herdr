@@ -1,7 +1,6 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
 
 const REPO_ROOT = fs.realpathSync(path.resolve(import.meta.dir, ".."));
@@ -234,7 +233,7 @@ describe("team-up.sh --check / --lock / --up (#68)", () => {
 		);
 	}
 
-	function buildEnv(overrides?: Record<string, string>): NodeJS.ProcessEnv {
+	function buildEnv(overrides?: Record<string, string | undefined>): NodeJS.ProcessEnv {
 		const env: NodeJS.ProcessEnv = { ...process.env };
 		for (const key of STRIPPED_ENV_KEYS) {
 			delete env[key];
@@ -259,7 +258,7 @@ describe("team-up.sh --check / --lock / --up (#68)", () => {
 
 	function runTeamUp(
 		args: string[],
-		envOverrides?: Record<string, string>,
+		envOverrides?: Record<string, string | undefined>,
 		cwd = REPO_ROOT,
 	): { status: number | null; stdout: string; stderr: string } {
 		const res = spawnSync("/bin/bash", [TEAM_UP_SH, ...args], {
@@ -385,7 +384,7 @@ with open(dst,"w",encoding="utf-8") as f:
 	}
 
 	beforeAll(() => {
-		const rawTmp = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-herdr-team-up-check-"));
+		const rawTmp = fs.mkdtempSync("/tmp/gjch-t-team-up-check-");
 		tmpDir = fs.realpathSync(rawTmp);
 		sockDir = fs.mkdtempSync(path.join("/tmp", "gjch-c-"));
 		mySockPath = path.join(sockDir, "my.sock");

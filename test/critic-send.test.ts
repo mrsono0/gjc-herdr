@@ -1,7 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
 
 const REPO_ROOT = fs.realpathSync(path.resolve(import.meta.dir, ".."));
@@ -104,7 +103,7 @@ function runCriticSend(options: RunCriticSendOptions): {
 	stderr: string;
 	calls: string[];
 } {
-	const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-herdr-critic-send-"));
+	const tmpDir = fs.mkdtempSync("/tmp/gjch-t-critic-send-");
 	try {
 		const logPath = path.join(tmpDir, "herdr-calls.log");
 		const screenPath = path.join(tmpDir, "screen.ansi");

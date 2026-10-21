@@ -1,7 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
 
 const REPO_ROOT = fs.realpathSync(path.resolve(import.meta.dir, ".."));
@@ -138,7 +137,7 @@ interface Harness {
 }
 
 function createHarness(): Harness {
-	const rawTmp = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-dw-"));
+	const rawTmp = fs.mkdtempSync("/tmp/gjch-t-dw-");
 	const tmpDir = fs.realpathSync(rawTmp);
 	const binDir = path.join(tmpDir, "bin");
 	const fixturesDir = path.join(tmpDir, "fixtures");

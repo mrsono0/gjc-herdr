@@ -1,7 +1,6 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
 
 const REPO_ROOT = fs.realpathSync(path.resolve(import.meta.dir, ".."));
@@ -136,7 +135,7 @@ describe("worktree guard (#43)", () => {
 	}
 
 	beforeAll(() => {
-		const rawTmp = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-herdr-wt-guard-"));
+		const rawTmp = fs.mkdtempSync("/tmp/gjch-t-wt-guard-");
 		tmpDir = fs.realpathSync(rawTmp);
 		mainRepo = path.join(tmpDir, "main-repo");
 		linkedWt = path.join(tmpDir, "wt");

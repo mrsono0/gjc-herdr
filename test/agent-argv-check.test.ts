@@ -1,7 +1,6 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
 
 const REPO_ROOT = fs.realpathSync(path.resolve(import.meta.dir, ".."));
@@ -285,7 +284,7 @@ describe("agent argv check (#42)", () => {
 	}
 
 	beforeAll(() => {
-		const rawTmp = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-herdr-argv-check-"));
+		const rawTmp = fs.mkdtempSync("/tmp/gjch-t-argv-");
 		tmpDir = fs.realpathSync(rawTmp);
 		sockDir = fs.mkdtempSync(path.join("/tmp", "gjch-s-"));
 		sockPath = path.join(sockDir, "s.sock");
