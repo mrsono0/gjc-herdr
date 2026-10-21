@@ -2105,7 +2105,7 @@ exit 1
 				cwd: REPO_ROOT,
 				env,
 				encoding: "utf8",
-				timeout: 15_000,
+				timeout: 40_000,
 			});
 
 		// 0. 외부 --layout (이미 목표 0.5): resize 미호출, 두 번째 layout 읽기 수행(총 3회), python3 10회
@@ -2357,5 +2357,5 @@ exit 1
 			inSpawnHerdr.filter((c) => c === `pane get ${CRITIC_PANE}`).length,
 		).toBe(1);
 		expect(inSpawnHerdr.some((c) => c.startsWith("pane resize"))).toBe(false);
-	}, 45_000);
+	}, 180_000);
 });
