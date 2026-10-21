@@ -40,7 +40,7 @@
   - 플러그인의 `/herdr-send --raw`와 `/herdr-call`은 입력란을 읽을 수 없을 때만 `focused`를 보며, 그때 `focused=true`이면 거절하거나 기다릴 수 있다.
 - 플러그인(`/herdr-send --raw`·`/herdr-call`)이 입력란을 읽지 못해 `focused`로 거절·대기했을 때의 복구. 지금은 사용자가 포커스를 옮기는 방식이다. 원격에서 이 절차를 어떻게 할지 정해야 한다. 승인 없이 팀장이 포커스를 바꾸지 않는다(`herdr pane focus`는 전역 활성 작업공간을 바꾼다).
 - 클라이언트 없이 확인창·질문을 감지하고 사용자에게 알린 뒤, 승인된 응답을 회수하는 절차. 다음을 포함한다.
-  - Codex 신뢰 창이 `idle`로 보이는 경우(§6). `blocked` 감시만으로는 놓칠 수 있다.
+  - 확인창·편집기의 Herdr 상태(§6, #60): GJCH 재현(2026-10-18)에서는 Codex·agy 신뢰 창과 agy 명령 확인이 모두 `blocked`였고, 다른 팀 운영에서는 Codex 신뢰 창·worktree 선택창이 `idle`로 보였으며, agy 전문 보기 편집기는 `done`이다. 그래서 `scripts/dialog-watch.py`는 상태와 무관하게 화면 끝 문구로 판정한다.
   - agy 폴더 신뢰 창. 지금은 사용자가 그 pane에서 답한 뒤 `team-up.sh --spawn`을 다시 실행한다.
   - 잘린 명령을 `zoom`·`ctrl+g`로 펼쳐 전문을 확인하는 절차
 - agy 완료 감시(결과 파일과 화면 하단 `task(s)` 표시를 함께 확인)와 팀장 깨우기·감시 재등록이 원격 실행 환경에서도 유지되는지
@@ -279,7 +279,8 @@ GJC는 상시 팀원이 아니며, 플러그인 로드·token 표시·`/herdr-se
 | `agy`가 작업 중 `blocked` | sandbox 밖 실행이나 편집 확인창일 수 있다. 화면을 보고 §5 "agy 운용 조건"의 응답 규칙을 따르며, 명령이 잘려 보이면 §5의 전문 확인 절차를 따른다 |
 | Codex pane이 안 생김 | `codex` 없음 또는 `GJCH_TEAM_CODEX=0`이면 선택 단계 생략. 기존 critic이 있으면 새 pane을 만들지 않음. `scripts/team-up.sh --spawn`의 stderr를 확인 |
 | 조회 실패(`could not look up agent ...`)로 팀원·검토를 만들지 않음 | `herdr agent get` 조회나 JSON 파싱이 실패하면 부재(`agent_not_found`)로 추정하지 않고 그 단계를 비0으로 끝낸다. `herdr agent list`로 Herdr 상태를 확인한 뒤 `scripts/team-up.sh --spawn`을 다시 실행한다 |
-| Codex가 "Trust and continue" 화면에서 멈춤 | 처음 저장소 폴더에서 실행하면 Codex가 폴더 신뢰를 묻는다(Herdr 상태는 idle로 보일 수 있음). 사용자 설정(`~/.codex/config.toml`)에 기록되므로 사용자 승인 후 선택한다. 그 전에는 `critic-send.sh`가 형식 판정 불가로 거부한다 |
+| 팀원이 확인창·질문에서 멈춤 | `python3 scripts/dialog-watch.py`를 백그라운드로 띄우면 나타날 때 `DIALOG <이름> <pane> <종류> <요약>` 한 줄을 내고 끝난다. 응답은 'agy 운용 조건'대로 사용자·팀장이 한다. `--once`는 지금 한 번 판정 |
+| Codex가 "Trust and continue" 화면에서 멈춤 | 처음 저장소 폴더에서 실행하면 Codex가 폴더 신뢰를 묻는다(GJCH 재현 2026-10-18에서는 `blocked`였고 다른 팀 운영에서는 `idle`로 보였으며, `scripts/dialog-watch.py`는 상태와 무관하게 화면 끝 문구로 판정한다). 사용자 설정(`~/.codex/config.toml`)에 기록되므로 사용자 승인 후 선택한다. 그 전에는 `critic-send.sh`가 형식 판정 불가로 거부한다 |
 | `critic-send.sh`가 `/new` 직후 "대상 거부: … 상태=working" | `/new` 뒤 Codex의 일시적인 working을 준비 전에 본 옛 버전(#22 이전) 증상이다. 화면이 이미 새 빈 대화(`Context 100% left · 0 in · 0 out`)이고 idle/done이면 같은 명령을 다시 실행해도 `/new` 없이 보낸다(지시서는 아직 보내지 않은 상태). 현재 버전은 준비 한도 안에서 기다린다 |
 | `critic-send.sh`가 `/new` 뒤 "새 입력란 준비 확인 timeout" | `/new` 뒤 Codex가 30초 넘게 working이었다. 실측 1회는 Codex 경고 `MCP client for codex_apps failed to start: … timed out awaiting tools/list after 30s`와 함께였다(보통 1–4초). 지시서는 보내지 않았으므로, done/idle과 새 빈 대화를 확인한 뒤 다시 실행하면 `/new` 없이 보낸다 |
 | Codex `/new`가 "Where should the new conversation run?" 메뉴를 띄움 | `--disable worktrees` 없이 떠 있는 Codex다. `critic-send.sh`가 1번(현재 worktree) 선택에만 Enter를 보낸다. 없애려면 사용자 승인 후 그 Codex를 정상 종료하고 `scripts/team-up.sh --spawn`으로 다시 띄운다. `codex features disable`은 전역 영구 설정이라 쓰지 않는다 |

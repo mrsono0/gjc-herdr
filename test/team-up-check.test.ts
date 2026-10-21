@@ -308,6 +308,7 @@ describe("team-up.sh --check / --lock / --up (#68)", () => {
 		for (const call of calls) {
 			const isReadOnly =
 				call.startsWith("agent get ") ||
+				call.startsWith("agent read ") ||
 				call.startsWith("pane get ") ||
 				call.startsWith("pane process-info ");
 			expect(isReadOnly).toBe(true);
@@ -334,6 +335,7 @@ describe("team-up.sh --check / --lock / --up (#68)", () => {
 			}
 			const isAllowed =
 				call.startsWith("agent get ") ||
+				call.startsWith("agent read ") ||
 				call.startsWith("pane get ") ||
 				call.startsWith("pane layout ") ||
 				call.startsWith("pane process-info ") ||
@@ -594,6 +596,49 @@ if [ "$cmd" = "pane" ] && [ "$sub" = "process-info" ]; then
 	fi
 	exit 1
 fi
+if [ "$cmd" = "agent" ] && [ "$sub" = "read" ]; then
+	name="\${3:-}"
+	case " $* " in
+		*" --source recent-unwrapped "*)
+			if [ "$name" = "gjc-herdr-mate" ] && grep -q '"agent_status":"working"' ${JSON.stringify(path.join(stateDir, "agent-mate.json"))} 2>/dev/null; then
+				printf '{"error":{"code":"agent_not_idle","message":"Target agent is working"}}\\n'
+				exit 1
+			fi
+			if [ "$name" = "gjc-herdr-critic" ] && grep -q '"agent_status":"working"' ${JSON.stringify(path.join(stateDir, "agent-critic.json"))} 2>/dev/null; then
+				printf '{"error":{"code":"agent_not_idle","message":"Target agent is working"}}\\n'
+				exit 1
+			fi
+			;;
+	esac
+	if [ "$name" = "gjc-herdr-mate" ]; then
+		if [ -f ${JSON.stringify(path.join(stateDir, "read-mate-slow"))} ]; then
+			sleep 2
+		fi
+		if [ -f ${JSON.stringify(path.join(stateDir, "read-mate-fail"))} ]; then
+			printf 'agent read error\\n' >&2
+			exit 1
+		fi
+		if [ -f ${JSON.stringify(path.join(stateDir, "screen-mate.txt"))} ]; then
+			cat ${JSON.stringify(path.join(stateDir, "screen-mate.txt"))}
+		else
+			printf 'normal\\n>\\n'
+		fi
+		exit 0
+	fi
+	if [ "$name" = "gjc-herdr-critic" ]; then
+		if [ -f ${JSON.stringify(path.join(stateDir, "read-critic-fail"))} ]; then
+			printf 'agent read error\\n' >&2
+			exit 1
+		fi
+		if [ -f ${JSON.stringify(path.join(stateDir, "screen-critic.txt"))} ]; then
+			cat ${JSON.stringify(path.join(stateDir, "screen-critic.txt"))}
+		else
+			printf '› Ask Codex to do anything\\n'
+		fi
+		exit 0
+	fi
+	exit 1
+fi
 printf 'unexpected or mutating herdr command: %s\\n' "$*" >&2
 exit 99
 `;
@@ -674,6 +719,11 @@ exit 99
 		fs.rmSync(path.join(stateDir, "git-status-fail"), { force: true });
 		fs.rmSync(path.join(stateDir, "git-status-mock"), { force: true });
 		fs.rmSync(path.join(stateDir, "pane-no-status"), { force: true });
+		fs.rmSync(path.join(stateDir, "read-mate-fail"), { force: true });
+		fs.rmSync(path.join(stateDir, "read-mate-slow"), { force: true });
+		fs.rmSync(path.join(stateDir, "read-critic-fail"), { force: true });
+		fs.rmSync(path.join(stateDir, "screen-mate.txt"), { force: true });
+		fs.rmSync(path.join(stateDir, "screen-critic.txt"), { force: true });
 		writeDefaultMateAgent(REPO_ROOT, "idle", true);
 		writeDefaultCriticAgent(REPO_ROOT, "idle", true);
 		writeValidMateProc();
@@ -1006,18 +1056,32 @@ print(json.dumps({
 		]);
 		assertReadOnlyHerdrCalls(readAndClearHerdrCalls());
 
-		// (e) 상태가 blocked면 줄 끝에 ' (blocked)' 접미사
+		// (e) 상태가 blocked이고 화면 읽기가 성공하면 (dialog=question), 화면 읽기 실패(종류 없음)면 ' (blocked)' 접미사
 		writeDefaultMateAgent(REPO_ROOT, "blocked", false);
 		writeDefaultCriticAgent(REPO_ROOT, "blocked", false);
 		fs.writeFileSync(path.join(stateDir, "proc-critic-fail"), "1", "utf8");
 		const blockedRes = runTeamUp(["--check"], extEnv);
 		expect(blockedRes.status).toBe(2);
 		expect(blockedRes.stdout.trim().split("\n")).toEqual([
+			"gjc-herdr-mate w1:p2 ok (dialog=question)",
+			"gjc-herdr-critic w1:p3 unknown process-info 실패 (dialog=question)",
+			"lock none",
+		]);
+		assertReadOnlyHerdrCalls(readAndClearHerdrCalls());
+
+		fs.writeFileSync(path.join(stateDir, "read-mate-fail"), "1", "utf8");
+		fs.writeFileSync(path.join(stateDir, "read-critic-fail"), "1", "utf8");
+		const blockedReadFailRes = runTeamUp(["--check"], extEnv);
+		expect(blockedReadFailRes.status).toBe(2);
+		expect(blockedReadFailRes.stdout.trim().split("\n")).toEqual([
 			"gjc-herdr-mate w1:p2 ok (blocked)",
 			"gjc-herdr-critic w1:p3 unknown process-info 실패 (blocked)",
 			"lock none",
 		]);
 		assertReadOnlyHerdrCalls(readAndClearHerdrCalls());
+		fs.rmSync(path.join(stateDir, "read-mate-fail"), { force: true });
+		fs.rmSync(path.join(stateDir, "read-mate-slow"), { force: true });
+		fs.rmSync(path.join(stateDir, "read-critic-fail"), { force: true });
 	}, 60_000);
 
 	test("4. --check: lock 줄 네 가지(none, mine, other live, stale) + 잠금 파일 무변경 + Herdr 안(inside) 모드 대표 1건", () => {
@@ -1340,7 +1404,7 @@ print(json.dumps({
 			"- 팀장 감시: 모름(팀장이 채움)",
 			"- 띄운 것·바꾼 것: 없음(--status는 읽기 전용)",
 			"- 진행 중이던 일·잃은 것: 모름(팀장이 채움)",
-			"- 미확인: 확인창 내용 판정 없음(#60)",
+			"- 미확인: 없음",
 		]);
 		expect(okRes.stdout).not.toContain("status-lead-session-9999");
 		expect(fs.readFileSync(lockPath, "utf8")).toBe(beforeSnap);
@@ -1500,7 +1564,7 @@ print(json.dumps({
 			"- 팀장 감시: 모름(팀장이 채움)",
 			"- 띄운 것·바꾼 것: 없음(--status는 읽기 전용)",
 			"- 진행 중이던 일·잃은 것: 모름(팀장이 채움)",
-			"- 미확인: 확인창 내용 판정 없음(#60)",
+			"- 미확인: 없음",
 		]);
 		expect(mismatchRes.stdout).not.toContain("SECRET_ACTUAL_MODEL_TOKEN_999");
 		expect(mismatchRes.stdout).not.toContain("SECRET_CONV_ID_888");
@@ -1530,12 +1594,12 @@ print(json.dumps({
 		expect(combinedRes.stderr).toBe("");
 		expect(combinedRes.stdout.trim().split("\n")).toEqual([
 			"- 팀장 세션: 이 세션(id 앞 8자 모름), 팀장 모드 herdr 밖(외부 팀장), 잠금 other live",
-			"- 팀원: gjc-herdr-mate w1:p2 agy 옵션 일치 ○ resume 해당 없음 확인창 blocked 상태 blocked",
+			"- 팀원: gjc-herdr-mate w1:p2 agy 옵션 일치 ○ resume 해당 없음 확인창 question 상태 blocked",
 			"- 저장소: 모름",
 			"- 팀장 감시: 모름(팀장이 채움)",
 			"- 띄운 것·바꾼 것: 없음(--status는 읽기 전용)",
 			"- 진행 중이던 일·잃은 것: 모름(팀장이 채움)",
-			"- 미확인: 확인창 내용 판정 없음(#60), 팀장 세션 id 모름, 저장소 모름",
+			"- 미확인: 팀장 세션 id 모름, 저장소 모름",
 		]);
 		expect(combinedRes.stdout).not.toContain("other-secret-lock-sid");
 		expect(combinedRes.stdout).not.toContain("gjc-herdr-critic");
@@ -1543,6 +1607,7 @@ print(json.dumps({
 		expect(readAndClearHerdrCalls()).toEqual([
 			"agent get gjc-herdr-mate",
 			"pane process-info --pane w1:p2",
+			"agent read gjc-herdr-mate --source visible",
 		]);
 		readAndClearGitStatusCalls();
 
@@ -1572,12 +1637,13 @@ print(json.dumps({
 			"- 팀장 감시: 모름(팀장이 채움)",
 			"- 띄운 것·바꾼 것: 없음(--status는 읽기 전용)",
 			"- 진행 중이던 일·잃은 것: 모름(팀장이 채움)",
-			"- 미확인: 확인창 내용 판정 없음(#60), gjc-herdr-mate 상태 모름",
+			"- 미확인: gjc-herdr-mate 상태 모름",
 		]);
 		expect(readAndClearHerdrCalls()).toEqual([
 			"agent get gjc-herdr-mate",
 			"pane get w1:p2",
 			"pane process-info --pane w1:p2",
+			"agent read gjc-herdr-mate --source visible",
 		]);
 		readAndClearGitStatusCalls();
 
@@ -1588,5 +1654,170 @@ print(json.dumps({
 			"lock mine",
 		]);
 		assertReadOnlyHerdrCalls(readAndClearHerdrCalls());
-	});
+	}, 60_000);
+
+	test("8. (#60 3·4회차) --check (dialog=agy-command), --status 확인창 codex-trust(상태 idle), 화면 읽기 실패·지연 시 모름·미확인 기록 및 옵션/lock/rc 불변(P2)", () => {
+		fs.writeFileSync(path.join(stateDir, "git-status-mock"), "", "utf8");
+		writeLockRecord({
+			kind: "external",
+			sessionId: "dialog-lead-session-6000",
+			socketPath: mySockPath,
+		});
+		const env60 = {
+			GJCH_EXTERNAL_LEAD: "1",
+			CLAUDE_PROJECT_DIR: REPO_ROOT,
+			CLAUDE_CODE_SESSION_ID: "dialog-lead-session-6000",
+			CLAUDE_CODE_MESSAGING_SOCKET: mySockPath,
+		};
+
+		const agyCommandScreen = `Requesting permission for:
+   echo hello
+
+Run this command?
+> 1. Yes, run command
+  4. No, cancel
+
+  ↑/↓ Navigate · tab Amend · enter Confirm
+`;
+		const codexTrustIdleScreen = `  Folder access
+  /Users/test-secret/project
+
+  Trust this folder? Codex can read, edit, and run files here.
+
+› 1. Trust and continue
+  2. Back to Agent Command Center
+
+  enter continue · esc back
+`;
+
+		// (1) mate는 blocked + agy-command 화면, critic은 idle + codex-trust 화면
+		writeDefaultMateAgent(REPO_ROOT, "blocked", false);
+		writeDefaultCriticAgent(REPO_ROOT, "idle", true);
+		fs.writeFileSync(path.join(stateDir, "screen-mate.txt"), agyCommandScreen, "utf8");
+		fs.writeFileSync(path.join(stateDir, "screen-critic.txt"), codexTrustIdleScreen, "utf8");
+
+		const checkDialogRes = runTeamUp(["--check"], env60);
+		// 확인창은 rc에 넣지 않으므로 모두 옵션·cwd 일치 시 rc 0
+		expect(checkDialogRes.status).toBe(0);
+		expect(checkDialogRes.stderr).toBe("");
+		expect(checkDialogRes.stdout.trim().split("\n")).toEqual([
+			"gjc-herdr-mate w1:p2 ok (dialog=agy-command)",
+			"gjc-herdr-critic w1:p3 ok (dialog=codex-trust)",
+			"lock mine",
+		]);
+		assertReadOnlyHerdrCalls(readAndClearHerdrCalls());
+
+		const statusDialogRes = runTeamUp(["--status"], env60);
+		expect(statusDialogRes.status).toBe(0);
+		expect(statusDialogRes.stderr).toBe("");
+		expect(statusDialogRes.stdout.trim().split("\n")).toEqual([
+			"- 팀장 세션: 이 세션(id 앞 8자 dialog-l), 팀장 모드 herdr 밖(외부 팀장), 잠금 mine",
+			"- 팀원: gjc-herdr-mate w1:p2 agy 옵션 일치 ○ resume 해당 없음 확인창 agy-command 상태 blocked",
+			"- 팀원: gjc-herdr-critic w1:p3 codex 옵션 일치 ○ resume 해당 없음 확인창 codex-trust 상태 idle",
+			"- 저장소: i68 @1a2b3c4, 작업 트리 깨끗",
+			"- 팀장 감시: 모름(팀장이 채움)",
+			"- 띄운 것·바꾼 것: 없음(--status는 읽기 전용)",
+			"- 진행 중이던 일·잃은 것: 모름(팀장이 채움)",
+			"- 미확인: 없음",
+		]);
+		assertReadOnlyHerdrCalls(readAndClearHerdrCalls());
+		readAndClearGitStatusCalls();
+
+		// (2) 화면 읽기 실패 시: --status는 '확인창 모름' + 미확인 줄에 '<이름> 확인창 모름',
+		//     --check는 blocked면 ' (blocked)', idle이면 접미사 없음 (rc는 바꾸지 않음)
+		fs.writeFileSync(path.join(stateDir, "read-mate-fail"), "1", "utf8");
+		fs.writeFileSync(path.join(stateDir, "read-critic-fail"), "1", "utf8");
+
+		const statusReadFailRes = runTeamUp(["--status"], env60);
+		expect(statusReadFailRes.status).toBe(0);
+		expect(statusReadFailRes.stderr).toBe("");
+		expect(statusReadFailRes.stdout.trim().split("\n")).toEqual([
+			"- 팀장 세션: 이 세션(id 앞 8자 dialog-l), 팀장 모드 herdr 밖(외부 팀장), 잠금 mine",
+			"- 팀원: gjc-herdr-mate w1:p2 agy 옵션 일치 ○ resume 해당 없음 확인창 모름 상태 blocked",
+			"- 팀원: gjc-herdr-critic w1:p3 codex 옵션 일치 ○ resume 해당 없음 확인창 모름 상태 idle",
+			"- 저장소: i68 @1a2b3c4, 작업 트리 깨끗",
+			"- 팀장 감시: 모름(팀장이 채움)",
+			"- 띄운 것·바꾼 것: 없음(--status는 읽기 전용)",
+			"- 진행 중이던 일·잃은 것: 모름(팀장이 채움)",
+			"- 미확인: gjc-herdr-mate 확인창 모름, gjc-herdr-critic 확인창 모름",
+		]);
+		assertReadOnlyHerdrCalls(readAndClearHerdrCalls());
+		readAndClearGitStatusCalls();
+
+		const checkReadFailRes = runTeamUp(["--check"], env60);
+		expect(checkReadFailRes.status).toBe(0);
+		expect(checkReadFailRes.stderr).toBe("");
+		expect(checkReadFailRes.stdout.trim().split("\n")).toEqual([
+			"gjc-herdr-mate w1:p2 ok (blocked)",
+			"gjc-herdr-critic w1:p3 ok",
+			"lock mine",
+		]);
+		assertReadOnlyHerdrCalls(readAndClearHerdrCalls());
+
+		// (3) P2: 팀원 1의 agent read가 느려도(GJCH_CHECK_TIMEOUT 소진) 이미 먼저 마친 팀원 2의 옵션 점검·잠금·git 결과와 rc 0은 바뀌지 않고 확인창만 모름 처리
+		fs.rmSync(path.join(stateDir, "read-mate-fail"), { force: true });
+		fs.rmSync(path.join(stateDir, "read-critic-fail"), { force: true });
+		fs.writeFileSync(path.join(stateDir, "read-mate-slow"), "1", "utf8");
+
+		const slowReadEnv = {
+			...env60,
+			GJCH_CHECK_TIMEOUT: "1",
+		};
+		const checkSlowReadRes = runTeamUp(["--check"], slowReadEnv);
+		expect(checkSlowReadRes.status).toBe(0);
+		expect(checkSlowReadRes.stderr).toBe("");
+		expect(checkSlowReadRes.stdout.trim().split("\n")).toEqual([
+			"gjc-herdr-mate w1:p2 ok (blocked)",
+			"gjc-herdr-critic w1:p3 ok",
+			"lock mine",
+		]);
+		assertReadOnlyHerdrCalls(readAndClearHerdrCalls());
+
+		const statusSlowReadRes = runTeamUp(["--status"], slowReadEnv);
+		expect(statusSlowReadRes.status).toBe(0);
+		expect(statusSlowReadRes.stderr).toBe("");
+		expect(statusSlowReadRes.stdout.trim().split("\n")).toEqual([
+			"- 팀장 세션: 이 세션(id 앞 8자 dialog-l), 팀장 모드 herdr 밖(외부 팀장), 잠금 mine",
+			"- 팀원: gjc-herdr-mate w1:p2 agy 옵션 일치 ○ resume 해당 없음 확인창 모름 상태 blocked",
+			"- 팀원: gjc-herdr-critic w1:p3 codex 옵션 일치 ○ resume 해당 없음 확인창 모름 상태 idle",
+			"- 저장소: i68 @1a2b3c4, 작업 트리 깨끗",
+			"- 팀장 감시: 모름(팀장이 채움)",
+			"- 띄운 것·바꾼 것: 없음(--status는 읽기 전용)",
+			"- 진행 중이던 일·잃은 것: 모름(팀장이 채움)",
+			"- 미확인: gjc-herdr-mate 확인창 모름, gjc-herdr-critic 확인창 모름",
+		]);
+		assertReadOnlyHerdrCalls(readAndClearHerdrCalls());
+		readAndClearGitStatusCalls();
+
+		// (4) 5회차 항목 3: agent read가 rc 0이어도 화면이 비었거나 공백뿐이면 관측 실패('확인창 모름' + 미확인 줄 기록)로 처리
+		fs.rmSync(path.join(stateDir, "read-mate-slow"), { force: true });
+		fs.writeFileSync(path.join(stateDir, "screen-mate.txt"), "   \n\t\n", "utf8");
+		fs.writeFileSync(path.join(stateDir, "screen-critic.txt"), "", "utf8");
+
+		const statusEmptyScreenRes = runTeamUp(["--status"], env60);
+		expect(statusEmptyScreenRes.status).toBe(0);
+		expect(statusEmptyScreenRes.stderr).toBe("");
+		expect(statusEmptyScreenRes.stdout.trim().split("\n")).toEqual([
+			"- 팀장 세션: 이 세션(id 앞 8자 dialog-l), 팀장 모드 herdr 밖(외부 팀장), 잠금 mine",
+			"- 팀원: gjc-herdr-mate w1:p2 agy 옵션 일치 ○ resume 해당 없음 확인창 모름 상태 blocked",
+			"- 팀원: gjc-herdr-critic w1:p3 codex 옵션 일치 ○ resume 해당 없음 확인창 모름 상태 idle",
+			"- 저장소: i68 @1a2b3c4, 작업 트리 깨끗",
+			"- 팀장 감시: 모름(팀장이 채움)",
+			"- 띄운 것·바꾼 것: 없음(--status는 읽기 전용)",
+			"- 진행 중이던 일·잃은 것: 모름(팀장이 채움)",
+			"- 미확인: gjc-herdr-mate 확인창 모름, gjc-herdr-critic 확인창 모름",
+		]);
+		assertReadOnlyHerdrCalls(readAndClearHerdrCalls());
+		readAndClearGitStatusCalls();
+
+		const checkEmptyScreenRes = runTeamUp(["--check"], env60);
+		expect(checkEmptyScreenRes.status).toBe(0);
+		expect(checkEmptyScreenRes.stderr).toBe("");
+		expect(checkEmptyScreenRes.stdout.trim().split("\n")).toEqual([
+			"gjc-herdr-mate w1:p2 ok (blocked)",
+			"gjc-herdr-critic w1:p3 ok",
+			"lock mine",
+		]);
+		assertReadOnlyHerdrCalls(readAndClearHerdrCalls());
+	}, 60_000);
 });

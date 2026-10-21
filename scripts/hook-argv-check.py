@@ -9,6 +9,7 @@ Python 한 프로세스 안에서 단일 time.monotonic() 마감 시각을 공�
 5) scripts/agent-argv-check.py의 비교 논리로 기대 단위와 대조해 GJCH: 접두사로 출력한다.
 """
 
+import importlib.util
 import json
 import math
 import os
@@ -24,6 +25,20 @@ if SCRIPT_DIR not in sys.path:
 
 sys.dont_write_bytecode = True
 checker = __import__("agent-argv-check")
+
+
+def _load_dialog_watch():
+	spec = importlib.util.spec_from_file_location(
+		"dialog_watch", os.path.join(SCRIPT_DIR, "dialog-watch.py")
+	)
+	if spec is None or spec.loader is None:
+		raise ImportError("dialog-watch.py 로드 실패")
+	mod = importlib.util.module_from_spec(spec)
+	spec.loader.exec_module(mod)
+	return mod
+
+
+dialog_watch = _load_dialog_watch()
 
 TIMEOUT_MSG = "GJCH: ↳ 팀원 옵션 점검 시간 초과 — scripts/check-env.sh로 다시 점검"
 DEFAULT_TIMEOUT = 3.0
@@ -300,27 +315,72 @@ def format_status_member_line(
 	kind: str,
 	opt_str: str,
 	agent_status: str,
+	dialog: str = "없음",
 ) -> str:
-	dialog = "blocked" if agent_status == "blocked" else "없음"
 	return f"- 팀원: {name} {pane} {kind} 옵션 일치 {opt_str} resume 해당 없음 확인창 {dialog} 상태 {agent_status}"
 
 
-def evaluate_member_detail(
+def read_member_dialog(
+	name: str, status: str, deadline: float
+) -> Tuple[Optional[str], str, List[str]]:
+	"""팀원 보이는 화면(--source visible)을 읽어 (check용 종류|None, status용 '종류'|'없음'|'모름', 미확인 사유)를 돌려준다."""
+	rc, out = run_herdr(
+		["agent", "read", name, "--source", "visible"],
+		deadline,
+		combined=False,
+	)
+	if rc != 0:
+		return None, "모름", [f"{name} 확인창 모름"]
+	text = out
+	stripped = out.lstrip()
+	if stripped.startswith("{"):
+		try:
+			doc = json.loads(stripped)
+			if isinstance(doc, dict):
+				res_obj = doc.get("result")
+				if isinstance(res_obj, dict):
+					read_obj = res_obj.get("read")
+					if isinstance(read_obj, dict) and isinstance(read_obj.get("text"), str):
+						text = read_obj["text"]
+					elif isinstance(res_obj.get("text"), str):
+						text = res_obj["text"]
+				elif isinstance(doc.get("text"), str):
+					text = doc["text"]
+		except Exception:
+			pass
+	window_text, _ = dialog_watch.prepare_window(text)
+	if not window_text.strip():
+		return None, "모름", [f"{name} 확인창 모름"]
+	judged = dialog_watch.judge_screen(window_text, status)
+	if judged is not None:
+		kind = judged[0]
+		return kind, kind, []
+	return None, "없음", []
+
+
+def evaluate_member_base(
 	name: str,
 	expected_kind: str,
 	cwd_mode: str,
 	real_root: str,
 	expected_units: List[Tuple[str, Optional[str]]],
 	deadline: float,
-) -> Tuple[str, str, str, List[str]]:
-	"""('ok'|'mismatch'|'unknown', check 한 줄, status 한 줄, 미확인 사유 목록)을 돌려준다."""
+) -> Tuple[str, str, str, str, str, str, List[str], bool]:
+	"""화면 읽기 전 팀원 옵션·cwd 점검을 수행한다.
+
+	반환: (state, check_base_line, pane_id, opt_str, status_for_report, effective_status, base_reasons, should_read_dialog)
+	"""
 	rc, out = run_herdr(["agent", "get", name], deadline, combined=True)
 	if rc == 124:
 		return (
 			"unknown",
 			f"{name} - unknown 시간 초과",
-			format_status_member_line(name, "-", expected_kind, "?(시간 초과)", "없음"),
+			"-",
+			"?(시간 초과)",
+			"없음",
+			"idle",
 			[f"{name} 시간 초과"],
+			False,
 		)
 	try:
 		d = json.loads(out)
@@ -330,8 +390,12 @@ def evaluate_member_detail(
 		return (
 			"unknown",
 			f"{name} - unknown JSON 오류",
-			format_status_member_line(name, "-", expected_kind, "?(JSON 오류)", "없음"),
+			"-",
+			"?(JSON 오류)",
+			"없음",
+			"idle",
 			[f"{name} JSON 오류"],
+			False,
 		)
 	if rc != 0:
 		err = d.get("error")
@@ -340,14 +404,22 @@ def evaluate_member_detail(
 			return (
 				"mismatch",
 				f"{name} - mismatch 실제=없음 기대=실행 중",
-				format_status_member_line(name, "-", expected_kind, "×(실제=없음)", "없음"),
+				"-",
+				"×(실제=없음)",
+				"없음",
+				"idle",
 				[],
+				False,
 			)
 		return (
 			"unknown",
 			f"{name} - unknown agent 조회 실패",
-			format_status_member_line(name, "-", expected_kind, "?(agent 조회 실패)", "없음"),
+			"-",
+			"?(agent 조회 실패)",
+			"없음",
+			"idle",
 			[f"{name} agent 조회 실패"],
+			False,
 		)
 
 	res = d.get("result")
@@ -357,8 +429,12 @@ def evaluate_member_detail(
 		return (
 			"unknown",
 			f"{name} - unknown JSON 오류",
-			format_status_member_line(name, "-", expected_kind, "?(JSON 오류)", "없음"),
+			"-",
+			"?(JSON 오류)",
+			"없음",
+			"idle",
 			[f"{name} JSON 오류"],
+			False,
 		)
 
 	k = a.get("agent") if isinstance(a.get("agent"), str) else ""
@@ -373,14 +449,20 @@ def evaluate_member_detail(
 		if pane_rc == 124:
 			bs = " (blocked)" if s == "blocked" else ""
 			st_for_status = s if s else "없음"
+			eff_s = s if s else "idle"
 			reasons = [f"{name} 시간 초과"]
 			if not s:
 				reasons.append(f"{name} 상태 모름")
+			reasons.append(f"{name} 확인창 모름")
 			return (
 				"unknown",
 				f"{name} {p} unknown 시간 초과{bs}",
-				format_status_member_line(name, p, expected_kind, "?(시간 초과)", st_for_status),
+				p,
+				"?(시간 초과)",
+				st_for_status,
+				eff_s,
 				reasons,
+				False,
 			)
 		if pane_rc == 0 and pane_out:
 			try:
@@ -429,8 +511,12 @@ def evaluate_member_detail(
 		return (
 			"unknown",
 			f"{name} {p} unknown 시간 초과{blocked_suffix}",
-			format_status_member_line(name, p, expected_kind, "?(시간 초과)", status_for_report),
-			[f"{name} 시간 초과"] + extra_status_reasons,
+			p,
+			"?(시간 초과)",
+			status_for_report,
+			s,
+			[f"{name} 시간 초과"] + extra_status_reasons + [f"{name} 확인창 모름"],
+			False,
 		)
 
 	proc_state, proc_reason, actual_parts, expected_parts = inspect_process_info_for_check(
@@ -452,40 +538,106 @@ def evaluate_member_detail(
 			act_str = ",".join(actual_parts)
 			return (
 				"mismatch",
-				f"{name} {p} mismatch 실제={act_str} 기대={','.join(expected_parts)}{blocked_suffix}",
-				format_status_member_line(name, p, expected_kind, f"×(실제={act_str})", status_for_report),
+				f"{name} {p} mismatch 실제={act_str} 기대={','.join(expected_parts)}",
+				p,
+				f"×(실제={act_str})",
+				status_for_report,
+				s,
 				extra_status_reasons,
+				True,
 			)
 		return (
 			"unknown",
-			f"{name} {p} unknown {proc_reason}{blocked_suffix}",
-			format_status_member_line(name, p, expected_kind, f"?({proc_reason})", status_for_report),
+			f"{name} {p} unknown {proc_reason}",
+			p,
+			f"?({proc_reason})",
+			status_for_report,
+			s,
 			[f"{name} {proc_reason}"] + extra_status_reasons,
+			True,
 		)
 
 	if actual_parts:
 		act_str = ",".join(actual_parts)
 		return (
 			"mismatch",
-			f"{name} {p} mismatch 실제={act_str} 기대={','.join(expected_parts)}{blocked_suffix}",
-			format_status_member_line(name, p, expected_kind, f"×(실제={act_str})", status_for_report),
+			f"{name} {p} mismatch 실제={act_str} 기대={','.join(expected_parts)}",
+			p,
+			f"×(실제={act_str})",
+			status_for_report,
+			s,
 			extra_status_reasons,
+			True,
 		)
 
 	if cwd_ok is None:
 		return (
 			"unknown",
-			f"{name} {p} unknown cwd 미확인{blocked_suffix}",
-			format_status_member_line(name, p, expected_kind, "?(cwd 미확인)", status_for_report),
+			f"{name} {p} unknown cwd 미확인",
+			p,
+			"?(cwd 미확인)",
+			status_for_report,
+			s,
 			[f"{name} cwd 미확인"] + extra_status_reasons,
+			True,
 		)
 
 	return (
 		"ok",
-		f"{name} {p} ok{blocked_suffix}",
-		format_status_member_line(name, p, expected_kind, "○", status_for_report),
+		f"{name} {p} ok",
+		p,
+		"○",
+		status_for_report,
+		s,
 		extra_status_reasons,
+		True,
 	)
+
+
+def finalize_member_dialog(
+	name: str,
+	expected_kind: str,
+	base: Tuple[str, str, str, str, str, str, List[str], bool],
+	deadline: float,
+) -> Tuple[str, str, str, List[str]]:
+	st, check_base, p, opt_str, status_for_report, eff_s, base_reasons, should_read = base
+	reasons = list(base_reasons)
+	if should_read:
+		dialog_kind, dialog_for_status, dialog_reasons = read_member_dialog(
+			name, eff_s, deadline
+		)
+		reasons.extend(dialog_reasons)
+		if dialog_kind:
+			check_suffix = f" (dialog={dialog_kind})"
+		elif eff_s == "blocked":
+			check_suffix = " (blocked)"
+		else:
+			check_suffix = ""
+		check_line = f"{check_base}{check_suffix}"
+	else:
+		check_line = check_base
+		dialog_for_status = (
+			"모름" if f"{name} 확인창 모름" in reasons else "없음"
+		)
+	status_line = format_status_member_line(
+		name, p, expected_kind, opt_str, status_for_report, dialog_for_status
+	)
+	return st, check_line, status_line, reasons
+
+
+def evaluate_member_detail(
+	name: str,
+	expected_kind: str,
+	cwd_mode: str,
+	real_root: str,
+	expected_units: List[Tuple[str, Optional[str]]],
+	deadline: float,
+) -> Tuple[str, str, str, List[str]]:
+	"""('ok'|'mismatch'|'unknown', check 한 줄, status 한 줄, 미확인 사유 목록)을 돌려준다."""
+	base = evaluate_member_base(
+		name, expected_kind, cwd_mode, real_root, expected_units, deadline
+	)
+	return finalize_member_dialog(name, expected_kind, base, deadline)
 
 
 def evaluate_member_for_check(
@@ -659,8 +811,9 @@ def main() -> int:
 		if codex_on:
 			check_targets.append((critic_name, "codex", "exact"))
 		states: List[str] = []
+		base_entries = []
 		for t_name, t_kind, t_cwd_mode in check_targets:
-			st, line = evaluate_member_for_check(
+			base = evaluate_member_base(
 				t_name,
 				t_kind,
 				t_cwd_mode,
@@ -668,9 +821,12 @@ def main() -> int:
 				expected_by_kind[t_kind],
 				deadline,
 			)
-			states.append(st)
-			print(line, flush=True)
+			states.append(base[0])
+			base_entries.append((t_name, t_kind, base))
 		lock_line = get_lock_line(real_root, deadline)
+		for t_name, t_kind, base in base_entries:
+			_, line, _, _ = finalize_member_dialog(t_name, t_kind, base, deadline)
+			print(line, flush=True)
 		print(lock_line, flush=True)
 		if "mismatch" in states:
 			return 1
@@ -683,10 +839,9 @@ def main() -> int:
 		if codex_on:
 			status_targets.append((critic_name, "codex", "exact"))
 		status_states: List[str] = []
-		member_lines: List[str] = []
-		unknown_extras: List[str] = []
+		base_entries = []
 		for t_name, t_kind, t_cwd_mode in status_targets:
-			st, _, s_line, u_reasons = evaluate_member_detail(
+			base = evaluate_member_base(
 				t_name,
 				t_kind,
 				t_cwd_mode,
@@ -694,16 +849,24 @@ def main() -> int:
 				expected_by_kind[t_kind],
 				deadline,
 			)
-			status_states.append(st)
-			member_lines.append(s_line)
-			if u_reasons:
-				unknown_extras.extend(u_reasons)
+			status_states.append(base[0])
+			base_entries.append((t_name, t_kind, base))
 		lock_line = get_lock_line(real_root, deadline)
 		lock_val = (
 			lock_line[len("lock ") :]
 			if lock_line.startswith("lock ")
 			else "unknown"
 		)
+		git_line, git_ok = get_git_status_line(real_root, deadline)
+		member_lines: List[str] = []
+		unknown_extras: List[str] = []
+		for t_name, t_kind, base in base_entries:
+			_, _, s_line, u_reasons = finalize_member_dialog(
+				t_name, t_kind, base, deadline
+			)
+			member_lines.append(s_line)
+			if u_reasons:
+				unknown_extras.extend(u_reasons)
 		if lock_val == "unknown":
 			unknown_extras.append("잠금 unknown")
 		raw_sid = os.environ.get("CLAUDE_CODE_SESSION_ID", "").strip()
@@ -711,10 +874,9 @@ def main() -> int:
 		if sid8 == "모름":
 			unknown_extras.append("팀장 세션 id 모름")
 		mode_label = "herdr 안" if lead_mode == "inside" else "herdr 밖(외부 팀장)"
-		git_line, git_ok = get_git_status_line(real_root, deadline)
 		if not git_ok:
 			unknown_extras.append("저장소 모름")
-		unconfirmed = ["확인창 내용 판정 없음(#60)"] + unknown_extras
+		unconfirmed_str = ", ".join(unknown_extras) if unknown_extras else "없음"
 		print(
 			f"- 팀장 세션: 이 세션(id 앞 8자 {sid8}), 팀장 모드 {mode_label}, 잠금 {lock_val}",
 			flush=True,
@@ -725,7 +887,7 @@ def main() -> int:
 		print("- 팀장 감시: 모름(팀장이 채움)", flush=True)
 		print("- 띄운 것·바꾼 것: 없음(--status는 읽기 전용)", flush=True)
 		print("- 진행 중이던 일·잃은 것: 모름(팀장이 채움)", flush=True)
-		print(f"- 미확인: {', '.join(unconfirmed)}", flush=True)
+		print(f"- 미확인: {unconfirmed_str}", flush=True)
 		if "mismatch" in status_states:
 			return 1
 		if "unknown" in status_states or lock_line == "lock unknown":
