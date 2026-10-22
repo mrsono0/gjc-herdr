@@ -28,7 +28,7 @@
 	"scripts": {
 		"build": "bun scripts/build.ts",
 		"check": "tsc --noEmit",
-		"test": "bun test test/metadata.test.ts test/input.test.ts test/send.test.ts test/call.test.ts test/mail.test.ts test/mail-receive.test.ts test/mail-cli.test.ts test/critic-send.test.ts test/worktree-guard.test.ts test/agent-argv-check.test.ts test/layout-watch.test.ts"
+		"test": "bun test ./test/"
 	},
 	"devDependencies": {
 		"@gajae-code/coding-agent": "0.18.6",
