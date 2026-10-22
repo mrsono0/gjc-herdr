@@ -1066,7 +1066,7 @@ describe("scripts/layout-watch.py (#55)", () => {
 	});
 
 	test(
-		"10. 잠금: 같은 GJCH_LAYOUT_WATCH_DIR로 두 번째 실행 → already running, rc 0",
+		"10. 잠금: 같은 GJCH_LAYOUT_WATCH_DIR로 두 번째 실행 → already running, rc 0 / 첫 LOCK_EX 충돌 관측 뒤 LOCK_SH 해제 → 재시도로 잠금 획득 후 정상 실행",
 		async () => {
 			const h = createHarness();
 			cleanups.push(h.cleanup);
@@ -1086,6 +1086,121 @@ describe("scripts/layout-watch.py (#55)", () => {
 
 			const firstRes = await stopWatch(first.proc, first.done);
 			expect(firstRes.status === 0 || firstRes.signal === "SIGTERM").toBe(true);
+
+			// 결정적 사례: 보조 프로세스가 LOCK_SH를 쥐고 감시의 첫 LOCK_EX 충돌(OSError)이 기록될 때까지 기다린 뒤
+			// 약 0.15초 뒤 LOCK_SH를 풀면, 감시가 재시도로 잠금을 획득해 "already running" 없이 정상 동작한다.
+			fs.rmSync(path.join(h.watchDir, "layout-watch.log"), { force: true });
+			const shReadyFile = path.join(h.tmpDir, "sh-lock-ready");
+			const conflictFile = path.join(h.tmpDir, "ex-lock-conflict");
+			const shTimeoutFile = path.join(h.tmpDir, "sh-lock-timeout");
+			const wrapperScript = path.join(h.tmpDir, "watch-lock-wrapper.py");
+			fs.writeFileSync(
+				wrapperScript,
+				`import fcntl
+import importlib.util
+import sys
+
+sys.dont_write_bytecode = True
+watch_py_path, conflict_path = sys.argv[1:3]
+
+spec = importlib.util.spec_from_file_location("layout_watch", watch_py_path)
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+
+orig_flock = mod.fcntl.flock
+wrote_conflict = False
+
+def wrapped_flock(fd, op):
+    global wrote_conflict
+    try:
+        return orig_flock(fd, op)
+    except OSError:
+        if (op & fcntl.LOCK_EX) and not wrote_conflict:
+            wrote_conflict = True
+            with open(conflict_path, "w", encoding="utf-8") as fh:
+                fh.write("conflict\\n")
+        raise
+
+mod.fcntl.flock = wrapped_flock
+sys.exit(mod.main(["--once"]))
+`,
+				"utf8",
+			);
+
+			const shHolder = spawn(
+				REAL_PYTHON3,
+				[
+					"-B",
+					"-c",
+					`import fcntl, os, sys, time
+lock_path, ready_path, conflict_path, timeout_path = sys.argv[1:5]
+fd = os.open(lock_path, os.O_RDONLY | os.O_CREAT, 0o644)
+fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+with open(ready_path, "w", encoding="utf-8") as f:
+    f.write("1\\n")
+deadline = time.monotonic() + 5.0
+seen = False
+while time.monotonic() < deadline:
+    if os.path.exists(conflict_path):
+        seen = True
+        break
+    time.sleep(0.01)
+if not seen:
+    with open(timeout_path, "w", encoding="utf-8") as f:
+        f.write("timeout\\n")
+    fcntl.flock(fd, fcntl.LOCK_UN)
+    os.close(fd)
+    sys.exit(1)
+time.sleep(0.15)
+fcntl.flock(fd, fcntl.LOCK_UN)
+os.close(fd)
+sys.exit(0)
+`,
+					lockFile,
+					shReadyFile,
+					conflictFile,
+					shTimeoutFile,
+				],
+				{
+					env: h.buildEnv({ PYTHONDONTWRITEBYTECODE: "1" }),
+					stdio: "ignore",
+				},
+			);
+			const shHolderDone = new Promise<number | null>((resolve) => {
+				shHolder.on("close", (code) => resolve(code));
+			});
+			try {
+				const shReady = await waitFor(() => fs.existsSync(shReadyFile), 3_000, 10);
+				expect(shReady).toBe(true);
+
+				const afterSh = spawnSync(
+					REAL_PYTHON3,
+					["-B", wrapperScript, LAYOUT_WATCH_PY, conflictFile],
+					{
+						cwd: REPO_ROOT,
+						env: h.buildEnv({ PYTHONDONTWRITEBYTECODE: "1" }),
+						encoding: "utf8",
+						timeout: 10_000,
+					},
+				);
+				const holderRc = await shHolderDone;
+				expect(fs.existsSync(conflictFile)).toBe(true);
+				expect(fs.existsSync(shTimeoutFile)).toBe(false);
+				expect(holderRc).toBe(0);
+				expect(afterSh.status).toBe(0);
+				expect(afterSh.stdout).toBe("");
+				expect(afterSh.stderr).not.toContain("already running");
+				expect(h.readWatchLog()).toContain(
+					"check trigger=start status=ok tab=wT:t1 detail=3-pane",
+				);
+			} finally {
+				try {
+					shHolder.kill("SIGKILL");
+				} catch {
+					// ignore
+				}
+				await shHolderDone;
+			}
 		},
 		15_000,
 	);
@@ -2092,12 +2207,14 @@ exit 1
 			GJCH_EXTERNAL_LEAD: "1",
 			CLAUDE_CODE_SESSION_ID: "ext-lead-sess-59",
 			CLAUDE_CODE_MESSAGING_SOCKET: msgSock,
+			GJCH_LAYOUT_WATCH: "0",
 		});
 
 		const envInside = makeBaseEnv({
 			HERDR_ENV: "1",
 			HERDR_WORKSPACE_ID: TEAM_WS,
 			HERDR_PANE_ID: LEAD_PANE,
+			GJCH_LAYOUT_WATCH: "0",
 		});
 
 		const runTeamUp = (env: NodeJS.ProcessEnv, modeArg: "--layout" | "--spawn") =>

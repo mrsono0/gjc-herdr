@@ -587,11 +587,20 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     os.makedirs(watch_dir, exist_ok=True)
 
+    LOCK_RETRY_INTERVAL = 0.1
+    LOCK_RETRY_COUNT = 10
     lock_path = os.path.join(watch_dir, "layout-watch.lock")
     lock_fh = open(lock_path, "a+", encoding="utf-8")
-    try:
-        fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
+    locked = False
+    for attempt in range(LOCK_RETRY_COUNT + 1):
+        try:
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            locked = True
+            break
+        except OSError:
+            if attempt < LOCK_RETRY_COUNT:
+                time.sleep(LOCK_RETRY_INTERVAL)
+    if not locked:
         sys.stderr.write("layout-watch: already running\n")
         lock_fh.close()
         return 0

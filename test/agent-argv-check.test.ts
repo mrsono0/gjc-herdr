@@ -17,6 +17,10 @@ const RECOVERY_EXTERNAL =
 	"idle·빈 입력란 확인 → /quit → GJCH_EXTERNAL_LEAD=1 scripts/team-up.sh --spawn";
 
 const STRIPPED_ENV_KEYS = [
+	"GJCH_LAYOUT_WATCH",
+	"GJCH_LAYOUT_WATCH_DIR",
+	"GJCH_LAYOUT_WATCH_CMD",
+	"GJCH_LAYOUT_WATCH_LAUNCH",
 	"GJCH_EXTERNAL_LEAD",
 	"HERDR_ENV",
 	"HERDR_PANE_ID",
@@ -189,6 +193,7 @@ describe("agent argv check (#42)", () => {
 	let herdrLog = "";
 	let lockPath = "";
 	let stateDir = "";
+	let watchDir = "";
 
 	function writeDefaultMateAgent(status = "idle", interactiveReady = true): void {
 		fs.writeFileSync(
@@ -268,7 +273,10 @@ describe("agent argv check (#42)", () => {
 			GIT_CONFIG_GLOBAL: "/dev/null",
 			GIT_CONFIG_NOSYSTEM: "1",
 			PYTHONNOUSERSITE: "1",
+			PYTHONDONTWRITEBYTECODE: "1",
 			GJCH_LEAD_LOCK: lockPath,
+			GJCH_LAYOUT_WATCH: "0",
+			GJCH_LAYOUT_WATCH_DIR: watchDir,
 			...overrides,
 		};
 	}
@@ -294,9 +302,11 @@ describe("agent argv check (#42)", () => {
 		herdrLog = path.join(tmpDir, "herdr-calls.log");
 		lockPath = path.join(tmpDir, "lead.json");
 		stateDir = path.join(tmpDir, "state");
+		watchDir = path.join(tmpDir, "watch");
 
 		fs.mkdirSync(binDir, { recursive: true });
 		fs.mkdirSync(stateDir, { recursive: true });
+		fs.mkdirSync(watchDir, { recursive: true });
 		fs.mkdirSync(path.dirname(tmpHerdrConfig), { recursive: true });
 		fs.writeFileSync(tmpHerdrConfig, "# isolated test config (gjc_herdr_model)\n", "utf8");
 
@@ -980,6 +990,14 @@ printf '{"result":{"ok":true}}\\n'
 			CLAUDE_PROJECT_DIR: REPO_ROOT,
 		});
 
+		const repoWatchLockPath = path.join(
+			REPO_ROOT,
+			".local",
+			"team",
+			"layout-watch.lock",
+		);
+		const repoWatchLockExistedBefore = fs.existsSync(repoWatchLockPath);
+
 		const spawnRes = spawnSync("/bin/bash", [TEAM_UP_SH, "--spawn"], {
 			cwd: REPO_ROOT,
 			encoding: "utf8",
@@ -987,6 +1005,11 @@ printf '{"result":{"ok":true}}\\n'
 			timeout: SPAWN_TIMEOUT_MS,
 		});
 		expect(spawnRes.status).toBe(1);
+		// 실제 격리 근거는 buildEnv의 GJCH_LAYOUT_WATCH=0이고, 이 파일 확인은 보조 확인이다.
+		expect(fs.existsSync(path.join(watchDir, "layout-watch.lock"))).toBe(false);
+		if (!repoWatchLockExistedBefore) {
+			expect(fs.existsSync(repoWatchLockPath)).toBe(false);
+		}
 		expect(spawnRes.stdout).toContain("mate already exists at w1:p2; nothing spawned");
 		expect(spawnRes.stdout).toContain("critic already exists at w1:p3; nothing spawned");
 		expect(spawnRes.stdout).toContain("layout: lead w1:p1 on top (60%)");

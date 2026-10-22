@@ -2,11 +2,11 @@
 # gjc-herdr 팀 구성 보조. 기본: 이 pane의 이름·label만 맞춘다(pane 생성 없음).
 #   scripts/team-up.sh --hook    SessionStart hook용. 잠금 확인 후 역할을 한 줄로 출력하고 백그라운드에서 기본/--spawn 수행
 #   scripts/team-up.sh           기본 동작을 지금 수행(외부 팀장은 역할 한 줄만 출력)
-#   scripts/team-up.sh --spawn   기본 동작 + 없는 agy 팀원·선택 Codex 검토 구성(남은 빈 셸 pane 재사용) + 마지막에 목표 배치 보정
+#   scripts/team-up.sh --spawn   기본 동작 + 없는 agy 팀원·선택 Codex 검토 구성(남은 빈 셸 pane 재사용) + 마지막에 목표 배치 보정 + (Herdr 안) 배치 감시 자동 기동
 #                                (팀원이 팀장 탭에 없는 등 조건이 안 맞으면 옮기지 않고 건너뜀, 조회 실패는 비0,
 #                                 검토는 선택 Codex가 켜져 있고 같은 탭일 때만 포함)
 #   scripts/team-up.sh --layout  기본 동작 + 기존 팀장·팀원·검토 pane을 목표 배치로 재배치(조건이 안 맞으면 오류)
-#   scripts/team-up.sh --check   읽기 전용. 팀원(agy·선택 Codex) 시작 옵션·cwd와 팀장 잠금 상태를 한 줄씩 출력(0=ok, 1=mismatch, 2=unknown)
+#   scripts/team-up.sh --check   읽기 전용. 팀원(agy·선택 Codex) 시작 옵션·cwd와 팀장 잠금 상태(Herdr 안은 끝에 배치 감시 상태 줄 추가)를 한 줄씩 출력(0=ok, 1=mismatch, 2=unknown)
 #   scripts/team-up.sh --status  읽기 전용. 네 팀 공통 보고 꼴의 필드를 출력(0=ok, 1=mismatch, 2=unknown)
 #   scripts/team-up.sh --lock <status|claim|release>  팀장 잠금 조회·확보·해제(--force는 받지 않음)
 #   scripts/team-up.sh --up      --spawn과 같은 동작을 수행한 뒤 끝에 --check 요약을 출력
@@ -196,8 +196,92 @@ run_format_summary() {
 		"${CRITIC_START_ARGS[@]}"
 }
 
+# 시험용: GJCH_LAYOUT_WATCH_LAUNCH(비었으면 기본 경로 $ROOT/scripts/layout-watch.py를 python3로 실행)
+LAYOUT_WATCH_LAUNCH="${GJCH_LAYOUT_WATCH_LAUNCH:-}"
+
+# Herdr 안 모드에서 배치 감시(layout-watch.py)의 잠금·상태 파일을 읽기 전용으로 확인해 한 줄로 출력한다(#55).
+# 잠금·상태 파일을 만들거나 내용·mtime을 바꾸지 않는다.
+layout_watch_status_line() {
+	python3 -c 'import datetime,fcntl,json,math,os,sys
+root=sys.argv[1]
+watch_dir=os.environ.get("GJCH_LAYOUT_WATCH_DIR","").strip() or os.path.join(root,".local","team")
+lock_path=os.path.join(watch_dir,"layout-watch.lock")
+state_path=os.path.join(watch_dir,"layout-watch.state")
+run_state="stopped"
+fd=None
+try:
+    fd=os.open(lock_path,os.O_RDONLY)
+    try:
+        fcntl.flock(fd,fcntl.LOCK_SH|fcntl.LOCK_NB)
+    except OSError:
+        run_state="running"
+    else:
+        try:
+            fcntl.flock(fd,fcntl.LOCK_UN)
+        except OSError:
+            pass
+except OSError:
+    run_state="stopped"
+finally:
+    if fd is not None:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+st_label="없음"
+time_label="-"
+try:
+    with open(state_path,"r",encoding="utf-8") as fh:
+        raw=fh.read()
+except (FileNotFoundError,NotADirectoryError):
+    pass
+except Exception:
+    st_label="모름"
+else:
+    try:
+        d=json.loads(raw)
+        if not isinstance(d,dict): raise ValueError
+        s=d.get("status")
+        if s not in ("ok","limit","relayout_timeout"): raise ValueError
+        at=d.get("at")
+        if isinstance(at,bool) or not isinstance(at,(int,float)) or not math.isfinite(at): raise ValueError
+        time_label=datetime.datetime.fromtimestamp(at).strftime("%Y-%m-%d %H:%M")
+        st_label=s
+    except Exception:
+        st_label="모름"
+        time_label="-"
+print(f"layout-watch {run_state} 상태={st_label} 시각={time_label}")' "$ROOT"
+}
+
+# Herdr 안 팀장 모드에서 배치 감시(scripts/layout-watch.py)를 백그라운드로 자동 기동한다(#55).
+# lead_rc=3(다른 세션이 잠금 보유)은 위 870행 부근에서 이미 종료되므로 여기 도달하지 않는다.
+start_layout_watch() {
+	[ "$lead_mode" = inside ] || return 0
+	[ "${GJCH_LAYOUT_WATCH:-1}" != 0 ] || return 0
+	local status_line
+	status_line="$(layout_watch_status_line 2>/dev/null)" || return 0
+	case "$status_line" in
+		"layout-watch running "*)
+			echo "layout-watch already running" >&2
+			return 0
+			;;
+	esac
+	if [ -n "$LAYOUT_WATCH_LAUNCH" ]; then
+		nohup "$LAYOUT_WATCH_LAUNCH" </dev/null >/dev/null 2>&1 &
+	else
+		nohup python3 "$ROOT/scripts/layout-watch.py" </dev/null >/dev/null 2>&1 &
+	fi
+	echo "layout-watch started (log: .local/team/layout-watch.log)" >&2
+	return 0
+}
+
 run_check_summary() {
-	run_format_summary check
+	local rc=0
+	run_format_summary check || rc=$?
+	if [ "$lead_mode" = inside ]; then
+		layout_watch_status_line || true
+	fi
+	return "$rc"
 }
 
 exit_with_up_summary() {
@@ -1402,6 +1486,7 @@ if [ "$layout_status" != 0 ]; then
 	fi
 fi
 report_resume auto >&2 || true
+start_layout_watch >&2 || true
 # 기동 실패 rc를 배치·옵션 점검 rc보다 우선한다.
 spawn_rc=0
 if [ "$critic_status" != 0 ]; then

@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
@@ -11,6 +11,10 @@ const CODEX_STATUS_LINE =
 	'tui.status_line=["context-remaining","total-input-tokens","total-output-tokens"]';
 
 const STRIPPED_ENV_KEYS = [
+	"GJCH_LAYOUT_WATCH",
+	"GJCH_LAYOUT_WATCH_DIR",
+	"GJCH_LAYOUT_WATCH_CMD",
+	"GJCH_LAYOUT_WATCH_LAUNCH",
 	"GJCH_EXTERNAL_LEAD",
 	"HERDR_ENV",
 	"HERDR_PANE_ID",
@@ -129,6 +133,9 @@ describe("team-up.sh --check / --lock / --up (#68)", () => {
 	let gitStatusLog = "";
 	let lockPath = "";
 	let stateDir = "";
+	let watchDir = "";
+	let watchCallsLog = "";
+	let fakeWatchCmd = "";
 
 	function writeDefaultMateAgent(
 		cwd = REPO_ROOT,
@@ -259,7 +266,10 @@ describe("team-up.sh --check / --lock / --up (#68)", () => {
 			GIT_CONFIG_GLOBAL: "/dev/null",
 			GIT_CONFIG_NOSYSTEM: "1",
 			PYTHONNOUSERSITE: "1",
+			PYTHONDONTWRITEBYTECODE: "1",
 			GJCH_LEAD_LOCK: lockPath,
+			GJCH_LAYOUT_WATCH_DIR: watchDir,
+			GJCH_LAYOUT_WATCH_LAUNCH: fakeWatchCmd,
 			...overrides,
 		};
 	}
@@ -423,13 +433,21 @@ with open(dst,"w",encoding="utf-8") as f:
 		gitStatusLog = path.join(tmpDir, "git-status-calls.log");
 		lockPath = path.join(tmpDir, "lead.json");
 		stateDir = path.join(tmpDir, "state");
+		watchDir = path.join(tmpDir, "watch");
+		watchCallsLog = path.join(tmpDir, "layout-watch-calls.log");
+		fakeWatchCmd = path.join(binDir, "fake-layout-watch");
 
 		fs.mkdirSync(binDir, { recursive: true });
 		fs.mkdirSync(noHerdrBinDir, { recursive: true });
 		fs.mkdirSync(noPythonBinDir, { recursive: true });
 		fs.mkdirSync(stateDir, { recursive: true });
+		fs.mkdirSync(watchDir, { recursive: true });
 		fs.mkdirSync(path.dirname(tmpHerdrConfig), { recursive: true });
 		fs.writeFileSync(tmpHerdrConfig, "# isolated test config\n", "utf8");
+		writeExecutable(
+			fakeWatchCmd,
+			`#!/bin/sh\nprintf 'called %s\\n' "$*" >> ${JSON.stringify(watchCallsLog)}\n`,
+		);
 
 		for (const sp of [mySockPath, otherLiveSockPath, staleSockPath]) {
 			const sockBind = spawnSync(
@@ -763,6 +781,9 @@ exit 99
 		fs.rmSync(herdrLog, { force: true });
 		fs.rmSync(lsofLog, { force: true });
 		fs.rmSync(gitStatusLog, { force: true });
+		fs.rmSync(watchCallsLog, { force: true });
+		fs.rmSync(watchDir, { recursive: true, force: true });
+		fs.mkdirSync(watchDir, { recursive: true });
 		fs.rmSync(lockPath, { force: true });
 		fs.rmSync(`${lockPath}.mutex`, { force: true });
 		fs.rmSync(path.join(stateDir, "proc-mate-fail"), { force: true });
@@ -1211,6 +1232,7 @@ print(json.dumps({
 			"gjc-herdr-mate w1:p2 ok",
 			"gjc-herdr-critic w1:p3 ok",
 			"lock none",
+			"layout-watch stopped 상태=없음 시각=-",
 		]);
 		expect(fs.existsSync(lockPath)).toBe(false);
 		assertReadOnlyHerdrCalls(readAndClearHerdrCalls());
@@ -1411,6 +1433,7 @@ print(json.dumps({
 			"gjc-herdr-mate w1:p2 ok",
 			"gjc-herdr-critic w1:p3 ok",
 			"lock mine",
+			"layout-watch stopped 상태=없음 시각=-",
 		]);
 		assertReadOnlyHerdrCalls(readAndClearHerdrCalls());
 
@@ -2331,5 +2354,407 @@ Run this command?
 		assertAllowedUpHerdrCalls(readAndClearHerdrCalls());
 		readAndClearReportArgvCalls();
 		fs.rmSync(path.join(stateDir, "report-session-fail"), { force: true });
+	}, 60_000);
+
+	test("10. #55 배치 감시 자동 기동(--spawn·--up) 및 --check 감시 상태 줄: Herdr 안/외부 모드, flock running/stopped, GJCH_LAYOUT_WATCH=0, 잠금 other live, 상태 파일(ok·limit·relayout_timeout·깨진 JSON) 및 파일 내용·mtime·rc 불변", () => {
+		function readAndClearWatchCalls(expectedMin = 0): string[] {
+			if (expectedMin > 0) {
+				const deadline = Date.now() + 2_000;
+				while (Date.now() < deadline) {
+					if (fs.existsSync(watchCallsLog)) {
+						const lines = fs
+							.readFileSync(watchCallsLog, "utf8")
+							.trim()
+							.split("\n")
+							.filter(Boolean);
+						if (lines.length >= expectedMin) {
+							break;
+						}
+					}
+					spawnSync(REAL_PYTHON3, ["-B", "-c", "import time; time.sleep(0.02)"], {
+						env: buildEnv(),
+					});
+				}
+			} else {
+				spawnSync(REAL_PYTHON3, ["-B", "-c", "import time; time.sleep(0.05)"], {
+					env: buildEnv(),
+				});
+			}
+			const calls = fs.existsSync(watchCallsLog)
+				? fs
+						.readFileSync(watchCallsLog, "utf8")
+						.trim()
+						.split("\n")
+						.filter(Boolean)
+				: [];
+			fs.rmSync(watchCallsLog, { force: true });
+			return calls;
+		}
+
+		function formatExpectedLocalTime(epochSec: number): string {
+			const py = spawnSync(
+				REAL_PYTHON3,
+				[
+					"-B",
+					"-c",
+					'import datetime,sys; print(datetime.datetime.fromtimestamp(int(sys.argv[1])).strftime("%Y-%m-%d %H:%M"))',
+					String(epochSec),
+				],
+				{ encoding: "utf8", env: buildEnv(), timeout: 5_000 },
+			);
+			expect(py.status).toBe(0);
+			return py.stdout.trim();
+		}
+
+		function withHeldWatchLock(lockFilePath: string, fn: () => void): void {
+			const readyFile = path.join(tmpDir, "watch-lock-ready");
+			fs.rmSync(readyFile, { force: true });
+			const holder = spawn(
+				REAL_PYTHON3,
+				[
+					"-B",
+					"-c",
+					`import fcntl, os, sys, time
+lock_path, ready_path = sys.argv[1:3]
+fd = os.open(lock_path, os.O_RDONLY)
+fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+with open(ready_path, "w", encoding="utf-8") as f:
+    f.write("1")
+time.sleep(30)
+`,
+					lockFilePath,
+					readyFile,
+				],
+				{
+					env: buildEnv(),
+					stdio: "ignore",
+				},
+			);
+			try {
+				const deadline = Date.now() + 3_000;
+				while (!fs.existsSync(readyFile) && Date.now() < deadline) {
+					spawnSync(REAL_PYTHON3, ["-B", "-c", "import time; time.sleep(0.02)"], {
+						env: buildEnv(),
+					});
+				}
+				expect(fs.existsSync(readyFile)).toBe(true);
+				fn();
+			} finally {
+				try {
+					holder.kill("SIGKILL");
+				} catch {
+					// ignore
+				}
+				spawnSync(
+					REAL_PYTHON3,
+					[
+						"-B",
+						"-c",
+						`import os, sys, time
+pid = int(sys.argv[1])
+for _ in range(50):
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        break
+    time.sleep(0.02)
+`,
+						String(holder.pid ?? 0),
+					],
+					{ env: buildEnv(), timeout: 5_000 },
+				);
+				fs.rmSync(readyFile, { force: true });
+			}
+		}
+
+		fs.writeFileSync(path.join(stateDir, "allow-up-mode"), "1", "utf8");
+		const insideEnv = {
+			HERDR_ENV: "1",
+			HERDR_WORKSPACE_ID: "w1",
+			HERDR_PANE_ID: "w1:p1",
+			CLAUDE_PROJECT_DIR: REPO_ROOT,
+			CLAUDE_CODE_SESSION_ID: "lw-lead-sess-1",
+			CLAUDE_CODE_MESSAGING_SOCKET: mySockPath,
+		};
+		const extEnv = {
+			GJCH_EXTERNAL_LEAD: "1",
+			CLAUDE_PROJECT_DIR: REPO_ROOT,
+			CLAUDE_CODE_SESSION_ID: "lw-lead-sess-1",
+			CLAUDE_CODE_MESSAGING_SOCKET: mySockPath,
+		};
+		const watchLockPath = path.join(watchDir, "layout-watch.lock");
+		const watchStatePath = path.join(watchDir, "layout-watch.state");
+
+		// (1) Herdr 안 --spawn 정상 → 가짜 감시 1회 호출, stderr에 layout-watch started, rc·stdout 그대로
+		const spawnInsideOk = runTeamUp(["--spawn"], insideEnv);
+		expect(spawnInsideOk.status).toBe(0);
+		expect(spawnInsideOk.stdout.trim().split("\n")).toEqual([
+			"mate already exists at w1:p2; nothing spawned",
+			"critic already exists at w1:p3; nothing spawned",
+			"layout: lead w1:p1 on top (60%), mate w1:p2 | critic w1:p3 below",
+		]);
+		expect(spawnInsideOk.stderr.trim()).toBe(
+			"layout-watch started (log: .local/team/layout-watch.log)",
+		);
+		expect(readAndClearWatchCalls(1).length).toBe(1);
+		assertAllowedUpHerdrCalls(readAndClearHerdrCalls());
+
+		// (2) 잠금 파일을 시험이 flock으로 쥐고 있으면 → 호출 0회, stderr에 layout-watch already running
+		fs.writeFileSync(watchLockPath, "lock-sentinel\n", "utf8");
+		withHeldWatchLock(watchLockPath, () => {
+			const spawnLocked = runTeamUp(["--spawn"], insideEnv);
+			expect(spawnLocked.status).toBe(0);
+			expect(spawnLocked.stdout.trim().split("\n")).toEqual([
+				"mate already exists at w1:p2; nothing spawned",
+				"critic already exists at w1:p3; nothing spawned",
+				"layout: lead w1:p1 on top (60%), mate w1:p2 | critic w1:p3 below",
+			]);
+			expect(spawnLocked.stderr.trim()).toBe("layout-watch already running");
+			expect(readAndClearWatchCalls(0)).toEqual([]);
+			assertAllowedUpHerdrCalls(readAndClearHerdrCalls());
+		});
+		fs.rmSync(watchLockPath, { force: true });
+
+		// (3) GJCH_LAYOUT_WATCH=0 → 호출 0회, 감시 관련 stderr 없음
+		const spawnWatchDisabled = runTeamUp(["--spawn"], {
+			...insideEnv,
+			GJCH_LAYOUT_WATCH: "0",
+		});
+		expect(spawnWatchDisabled.status).toBe(0);
+		expect(spawnWatchDisabled.stderr).toBe("");
+		expect(readAndClearWatchCalls(0)).toEqual([]);
+		assertAllowedUpHerdrCalls(readAndClearHerdrCalls());
+
+		// (4) 외부 모드 --spawn·--up → 호출 0회, 감시 관련 출력 없음
+		const spawnExt = runTeamUp(["--spawn"], extEnv);
+		expect(spawnExt.status).toBe(0);
+		expect(spawnExt.stderr).toBe("");
+		expect(spawnExt.stdout).not.toContain("layout-watch");
+		expect(readAndClearWatchCalls(0)).toEqual([]);
+		assertAllowedUpHerdrCalls(readAndClearHerdrCalls());
+
+		const upExt = runTeamUp(["--up"], extEnv);
+		expect(upExt.status).toBe(0);
+		expect(upExt.stderr).toBe("");
+		expect(upExt.stdout).not.toContain("layout-watch");
+		expect(upExt.stdout.trim().split("\n").slice(-3)).toEqual([
+			"gjc-herdr-mate w1:p2 ok",
+			"gjc-herdr-critic w1:p3 ok",
+			"lock mine",
+		]);
+		expect(readAndClearWatchCalls(0)).toEqual([]);
+		assertAllowedUpHerdrCalls(readAndClearHerdrCalls());
+
+		// (5) Herdr 안 잠금 other live(rc 3) → 호출 0회
+		writeLockRecord({
+			kind: "herdr",
+			sessionId: "other-live-holder-55",
+			socketPath: otherLiveSockPath,
+		});
+		const spawnOtherLive = runTeamUp(["--spawn"], insideEnv);
+		expect(spawnOtherLive.status).toBe(3);
+		expect(spawnOtherLive.stderr).not.toContain("layout-watch");
+		expect(readAndClearWatchCalls(0)).toEqual([]);
+		readAndClearHerdrCalls();
+		fs.rmSync(lockPath, { force: true });
+
+		// (6) --check Herdr 안:
+		// (6-a) 잠금 없음·상태 없음 → layout-watch stopped 상태=없음 시각=-, 잠금·상태 파일 미생성
+		const checkEmpty = runTeamUp(["--check"], insideEnv);
+		expect(checkEmpty.status).toBe(0);
+		expect(checkEmpty.stderr).toBe("");
+		expect(checkEmpty.stdout.trim().split("\n")).toEqual([
+			"gjc-herdr-mate w1:p2 ok",
+			"gjc-herdr-critic w1:p3 ok",
+			"lock none",
+			"layout-watch stopped 상태=없음 시각=-",
+		]);
+		expect(fs.existsSync(watchLockPath)).toBe(false);
+		expect(fs.existsSync(watchStatePath)).toBe(false);
+		assertReadOnlyHerdrCalls(readAndClearHerdrCalls());
+
+		// (6-b) 상태 파일 ok·limit·relayout_timeout·깨진 JSON 각 사례 + 시험이 잠금을 쥐면 running + 잠금·상태 파일 내용과 mtime 불변 + rc 불변
+		const fixedMtimeSec = 1_700_000_000;
+		const testAtOk = 1_761_096_000;
+		const testAtLimit = 1_761_099_600;
+		const expectedOkTime = formatExpectedLocalTime(testAtOk);
+		const expectedLimitTime = formatExpectedLocalTime(testAtLimit);
+
+		fs.writeFileSync(watchLockPath, "lock-file-bytes\n", "utf8");
+		fs.utimesSync(watchLockPath, fixedMtimeSec, fixedMtimeSec);
+		const lockStatBefore = fs.statSync(watchLockPath);
+
+		// 상태 ok + 잠금 안 잡힘(파일만 존재) → stopped, 상태=ok, 파일 내용·mtime 불변
+		const okStatePayload = `${JSON.stringify({
+			status: "ok",
+			tab: "w1:t1",
+			at: testAtOk,
+			last_rc: 0,
+		})}\n`;
+		fs.writeFileSync(watchStatePath, okStatePayload, "utf8");
+		fs.utimesSync(watchStatePath, fixedMtimeSec, fixedMtimeSec);
+		const stateStatBeforeOk = fs.statSync(watchStatePath);
+
+		const checkOkState = runTeamUp(["--check"], {
+			...insideEnv,
+			GJCH_LAYOUT_WATCH: "0", // GJCH_LAYOUT_WATCH=0이어도 상태 줄 출력
+		});
+		expect(checkOkState.status).toBe(0);
+		expect(checkOkState.stdout.trim().split("\n")).toEqual([
+			"gjc-herdr-mate w1:p2 ok",
+			"gjc-herdr-critic w1:p3 ok",
+			"lock none",
+			`layout-watch stopped 상태=ok 시각=${expectedOkTime}`,
+		]);
+		expect(fs.readFileSync(watchLockPath, "utf8")).toBe("lock-file-bytes\n");
+		expect(fs.statSync(watchLockPath).mtimeMs).toBe(lockStatBefore.mtimeMs);
+		expect(fs.readFileSync(watchStatePath, "utf8")).toBe(okStatePayload);
+		expect(fs.statSync(watchStatePath).mtimeMs).toBe(stateStatBeforeOk.mtimeMs);
+		assertReadOnlyHerdrCalls(readAndClearHerdrCalls());
+
+		// 시험이 잠금을 쥐면 → running, 잠금·상태 파일 내용과 mtime 불변
+		withHeldWatchLock(watchLockPath, () => {
+			const checkRunning = runTeamUp(["--check"], insideEnv);
+			expect(checkRunning.status).toBe(0);
+			expect(checkRunning.stdout.trim().split("\n")).toEqual([
+				"gjc-herdr-mate w1:p2 ok",
+				"gjc-herdr-critic w1:p3 ok",
+				"lock none",
+				`layout-watch running 상태=ok 시각=${expectedOkTime}`,
+			]);
+			expect(fs.readFileSync(watchLockPath, "utf8")).toBe("lock-file-bytes\n");
+			expect(fs.statSync(watchLockPath).mtimeMs).toBe(lockStatBefore.mtimeMs);
+			expect(fs.readFileSync(watchStatePath, "utf8")).toBe(okStatePayload);
+			expect(fs.statSync(watchStatePath).mtimeMs).toBe(stateStatBeforeOk.mtimeMs);
+			assertReadOnlyHerdrCalls(readAndClearHerdrCalls());
+		});
+
+		// 상태 limit + 팀원 mismatch(rc 1 불변 확인)
+		const limitStatePayload = `${JSON.stringify({
+			status: "limit",
+			tab: "w1:t1",
+			at: testAtLimit,
+			last_rc: 0,
+		})}\n`;
+		fs.writeFileSync(watchStatePath, limitStatePayload, "utf8");
+		fs.utimesSync(watchStatePath, fixedMtimeSec, fixedMtimeSec);
+		const stateStatBeforeLimit = fs.statSync(watchStatePath);
+		fs.writeFileSync(path.join(stateDir, "agent-mate-absent"), "1", "utf8");
+
+		const checkLimitMismatch = runTeamUp(["--check"], insideEnv);
+		expect(checkLimitMismatch.status).toBe(1);
+		expect(checkLimitMismatch.stdout.trim().split("\n")).toEqual([
+			"gjc-herdr-mate - mismatch 실제=없음 기대=실행 중",
+			"gjc-herdr-critic w1:p3 ok",
+			"lock none",
+			`layout-watch stopped 상태=limit 시각=${expectedLimitTime}`,
+		]);
+		expect(fs.readFileSync(watchStatePath, "utf8")).toBe(limitStatePayload);
+		expect(fs.statSync(watchStatePath).mtimeMs).toBe(stateStatBeforeLimit.mtimeMs);
+		assertReadOnlyHerdrCalls(readAndClearHerdrCalls());
+		fs.rmSync(path.join(stateDir, "agent-mate-absent"), { force: true });
+
+		// 표 꼴 사례: relayout_timeout, 알 수 없는 status("weird"), at이 bool·문자열·"NaN"·raw NaN·깨진 JSON
+		const testAtTimeout = 1_761_103_200;
+		const expectedTimeoutTime = formatExpectedLocalTime(testAtTimeout);
+		const stateTableCases: Array<{ payload: string; expectedWatchLine: string }> = [
+			{
+				payload: `${JSON.stringify({
+					status: "relayout_timeout",
+					tab: "w1:t1",
+					at: testAtTimeout,
+					last_rc: null,
+				})}\n`,
+				expectedWatchLine: `layout-watch stopped 상태=relayout_timeout 시각=${expectedTimeoutTime}`,
+			},
+			{
+				payload: `${JSON.stringify({
+					status: "weird",
+					tab: "w1:t1",
+					at: testAtOk,
+					last_rc: 0,
+				})}\n`,
+				expectedWatchLine: "layout-watch stopped 상태=모름 시각=-",
+			},
+			{
+				payload: `${JSON.stringify({
+					status: "ok",
+					tab: "w1:t1",
+					at: true,
+					last_rc: 0,
+				})}\n`,
+				expectedWatchLine: "layout-watch stopped 상태=모름 시각=-",
+			},
+			{
+				payload: `${JSON.stringify({
+					status: "ok",
+					tab: "w1:t1",
+					at: String(testAtOk),
+					last_rc: 0,
+				})}\n`,
+				expectedWatchLine: "layout-watch stopped 상태=모름 시각=-",
+			},
+			{
+				payload: `${JSON.stringify({
+					status: "ok",
+					tab: "w1:t1",
+					at: "NaN",
+					last_rc: 0,
+				})}\n`,
+				expectedWatchLine: "layout-watch stopped 상태=모름 시각=-",
+			},
+			{
+				payload: '{"status":"ok","tab":"w1:t1","at":NaN,"last_rc":0}\n',
+				expectedWatchLine: "layout-watch stopped 상태=모름 시각=-",
+			},
+			{
+				payload: "{broken-json\n",
+				expectedWatchLine: "layout-watch stopped 상태=모름 시각=-",
+			},
+		];
+
+		for (const tc of stateTableCases) {
+			fs.writeFileSync(watchStatePath, tc.payload, "utf8");
+			fs.utimesSync(watchStatePath, fixedMtimeSec, fixedMtimeSec);
+			const stateStatBefore = fs.statSync(watchStatePath);
+
+			const checkCase = runTeamUp(["--check"], insideEnv);
+			expect(checkCase.status).toBe(0);
+			expect(checkCase.stdout.trim().split("\n")).toEqual([
+				"gjc-herdr-mate w1:p2 ok",
+				"gjc-herdr-critic w1:p3 ok",
+				"lock none",
+				tc.expectedWatchLine,
+			]);
+			expect(fs.readFileSync(watchStatePath, "utf8")).toBe(tc.payload);
+			expect(fs.statSync(watchStatePath).mtimeMs).toBe(stateStatBefore.mtimeMs);
+			assertReadOnlyHerdrCalls(readAndClearHerdrCalls());
+		}
+
+		// (7) --check 외부 모드 → 감시 줄 없음(기존 기대 줄 수 3줄 그대로)
+		const checkExt = runTeamUp(["--check"], extEnv);
+		expect(checkExt.status).toBe(0);
+		expect(checkExt.stdout.trim().split("\n")).toEqual([
+			"gjc-herdr-mate w1:p2 ok",
+			"gjc-herdr-critic w1:p3 ok",
+			"lock none",
+		]);
+		assertReadOnlyHerdrCalls(readAndClearHerdrCalls());
+
+		// (8) --up Herdr 안 끝 요약에 감시 줄 포함 + 자동 기동 1회 호출
+		fs.writeFileSync(watchStatePath, okStatePayload, "utf8");
+		const upInside = runTeamUp(["--up"], insideEnv);
+		expect(upInside.status).toBe(0);
+		expect(upInside.stderr.trim()).toBe(
+			"layout-watch started (log: .local/team/layout-watch.log)",
+		);
+		expect(upInside.stdout.trim().split("\n").slice(-4)).toEqual([
+			"gjc-herdr-mate w1:p2 ok",
+			"gjc-herdr-critic w1:p3 ok",
+			"lock mine",
+			`layout-watch stopped 상태=ok 시각=${expectedOkTime}`,
+		]);
+		expect(readAndClearWatchCalls(1).length).toBe(1);
+		assertAllowedUpHerdrCalls(readAndClearHerdrCalls());
 	}, 60_000);
 });
