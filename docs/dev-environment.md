@@ -185,6 +185,8 @@ Claude 데스크톱 앱의 Code 탭(로컬 세션)이나 Herdr 밖 터미널의 
 
 **재개**
 
+컴퓨터를 재부팅한 뒤라면 `/tmp`에 둔 동결 사본·우편함은 없다고 보고 시작한다(팀장 잠금은 `/tmp` 밖 `.local/team/`에 있다).
+
 1. 먼저 `scripts/team-lead.sh claim` 또는 `scripts/team-up.sh --lock claim`으로 잠금을 확보하고 `mine`을 확인한 뒤(Herdr 안 호환 예외 rc `4`는 §2 앞 "원칙" 줄을 참조하며, 외부 팀장 모드의 `GJCH_EXTERNAL_LEAD=1`은 §2.1 환경 전제를 참조한다), `scripts/team-up.sh --status`로 우리 팀원·작업공간·pane을 확인한다. 다른 소유자(`other live`)이거나 판정 불가이면 팀원에게 입력하지 않고 사용자에게 알린다.
 2. 팀원이 없으면 `/quit` 없이 `GJCH_EXTERNAL_LEAD=1 scripts/team-up.sh --up`으로 구성한다. 옵션 불일치(`--check` mismatch)면 불일치가 확인된 그 팀원만 `idle`·빈 입력란·진행 중인 일 없음을 확인한 뒤 `/quit` → `GJCH_EXTERNAL_LEAD=1 scripts/team-up.sh --up`으로 다시 띄운다. 판정 불가면 다시 점검하고 보고한다. 보고해 둔 팀원이 옵션대로 되살아났으면(`--check` ok) `/quit` 없이 넘어간다.
 3. `python3 scripts/dialog-watch.py --once`로 확인창을 본다. 폴더 신뢰 창 등은 사용자가 답하고, `agy` 명령·편집 확인창의 한정 위임은 `AGENTS.md` "agy 운용 조건"을 따른다. `--once`의 `none`만으로 안전하다고 단정하지 않는다(조회 실패는 stderr에 남으며 현재 화면도 함께 본다).
