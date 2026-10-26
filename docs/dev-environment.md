@@ -199,7 +199,7 @@ herdr `[session] resume_agents_on_restore`는 네 팀 공용 설정이라 GJCH�
 6. 배정할 때 감시를 다시 띄운다.
 7. 재개 사실을 요청한 곳에 알리고 이어서 진행한다.
 
-herdr 서버 재시작이 끼면 재개 2가 거의 늘 필요하다(2026-10-16·2026-10-21 실측, §6 표와 같은 사실).
+herdr 서버 재시작 뒤, 재개 명령을 보고해 둔 팀원(`--report-resume`, #71)은 옵션대로 되살아나 재개 2가 필요 없다(2026-10-22 실측). 보고하지 않은 팀원(첫 턴 전이라 세션 id가 없는 경우 등)은 native 복구가 옵션 없이 띄우므로 재개 2가 필요하다(2026-10-16·2026-10-21 실측, §6 표와 같은 사실). 어느 쪽이든 `--check`로 확인한다.
 
 ## 3. 새 컴퓨터에서 AI가 따를 환경 구축 절차
 
@@ -337,7 +337,7 @@ GJC는 상시 팀원이 아니며, 플러그인 로드·token 표시·`/herdr-se
 | `잠금 파일 읽기 실패` / `잠금 파일 형식 오류` / `잠금 파일 필수 필드 오류` (rc `1`) | 팀장 잠금 파일(`.local/team/lead.json`)이 손상되었거나 필수 필드가 잘못되어 `team-up.sh`와 `critic-send.sh`가 모두 막힌다(fail-closed). 일반 `release`와 세션 재시작으로는 풀리지 않는다. 실제 팀장 세션을 확인한 뒤 **사용자 승인**을 받아 `scripts/team-lead.sh release --force`로 파일을 삭제하고, 팀장 세션에서 `scripts/team-lead.sh claim`과 `scripts/team-lead.sh status`(`mine ...`)를 확인한다 |
 | GJC → agy `/herdr-call`·`--raw`가 막 띄운 agy에서 `target_typing` | `--mode accept-edits`(또는 `auto`·`plan`)로 띄운 빈 agy 입력란의 모드 안내 문구(전경색 `38;2;131;148;150`, 좁은 pane `...` 잘림 포함)가 흐림(SGR 2)이 아니라 입력된 글로 판정된 #47 증상이다. #47 이후는 이 안내 문구를 빈 입력란으로 본다. GJC의 플러그인을 #47 이후 버전으로 다시 설치하고 GJC를 재시작한다 |
 | `GJCH: 이 세션은 연결 worktree(...)에서 실행 중이라 팀장으로 동작하지 않습니다.` / `연결 worktree(...)에서 실행 중입니다.` | 데스크톱 Code 탭의 worktree 옵션 등으로 `<저장소>/.claude/worktrees/<이름>` 사본이나 Git 연결 worktree에서 실행되어 `ROOT`가 원래 저장소와 어긋난 상태다(#43). 네 진입점(`team-lead.sh`·`team-up.sh`·`critic-send.sh`·`check-env.sh`)은 잠금이나 Herdr 작업공간을 건드리지 않고 거절(또는 `check-env.sh`에서 `FAIL` 표시)하며, 경로에 `/.claude/worktrees/`가 있으면 일반 저장소여도 거절한다(우편 스크립트 `mail-*.sh`는 이 검사를 하지 않으며 후속은 별도 이슈다). 데스크톱 세션의 worktree 옵션을 끄고 원래 저장소 루트 폴더에서 새 세션을 연다 |
-| `↳ <이름> 옵션 불일치: ...` / `↳ <이름> 옵션 판정 불가: ...` (`team-up.sh`·`check-env.sh`) | Herdr 서버 재시작 뒤 native 세션 복구가 팀원을 시작 옵션 없이(`agy --conversation <id>`, `codex resume <id>`) 다시 띄워 `--sandbox`·모델·상태 줄 설정 등이 빠진 상태이거나, 작업 중 자식 프로세스 등으로 foreground argv를 판정할 수 없는 상태다(#42, `--model=x` 같은 `=` 결합형 옵션은 지원하지 않으며 분리형 `--model x`만 비교하므로 결합형은 `없음`으로 판정). 스크립트는 자동 `/quit`·재시작을 하지 않고 안내 후 비0(hook 문맥은 3초 공통 기한 안에서 동기 점검하며 `GJCH: ` 접두사로 stdout 안내 후 0, 기한 초과 시 `GJCH: ↳ 팀원 옵션 점검 시간 초과 — scripts/check-env.sh로 다시 점검`)으로 끝난다. 판정 불가 뒤에 `(작업 중 — 다시 점검)`이 붙으면 팀원이 `idle`/`done`이 된 뒤 `scripts/check-env.sh`나 `scripts/team-up.sh --spawn`으로 다시 점검하고, 옵션 불일치이면 해당 팀원의 `idle`·빈 입력란 확인 → 그 pane에서 `/quit`으로 정상 종료 → `scripts/team-up.sh --spawn`(외부 팀장 모드는 `GJCH_EXTERNAL_LEAD=1 scripts/team-up.sh --spawn`)으로 다시 띄운다 |
+| `↳ <이름> 옵션 불일치: ...` / `↳ <이름> 옵션 판정 불가: ...` (`team-up.sh`·`check-env.sh`) | Herdr 서버 재시작 뒤 native 세션 복구가 재개 명령을 보고하지 않은 팀원을 시작 옵션 없이(`agy --conversation <id>`, `codex resume <id>`) 다시 띄워 `--sandbox`·모델·상태 줄 설정 등이 빠진 상태이거나, 작업 중 자식 프로세스 등으로 foreground argv를 판정할 수 없는 상태다(#42, `--model=x` 같은 `=` 결합형 옵션은 지원하지 않으며 분리형 `--model x`만 비교하므로 결합형은 `없음`으로 판정). 스크립트는 자동 `/quit`·재시작을 하지 않고 안내 후 비0(hook 문맥은 3초 공통 기한 안에서 동기 점검하며 `GJCH: ` 접두사로 stdout 안내 후 0, 기한 초과 시 `GJCH: ↳ 팀원 옵션 점검 시간 초과 — scripts/check-env.sh로 다시 점검`)으로 끝난다. 판정 불가 뒤에 `(작업 중 — 다시 점검)`이 붙으면 팀원이 `idle`/`done`이 된 뒤 `scripts/check-env.sh`나 `scripts/team-up.sh --spawn`으로 다시 점검하고, 옵션 불일치이면 해당 팀원의 `idle`·빈 입력란 확인 → 그 pane에서 `/quit`으로 정상 종료 → `scripts/team-up.sh --spawn`(외부 팀장 모드는 `GJCH_EXTERNAL_LEAD=1 scripts/team-up.sh --spawn`)으로 다시 띄운다 |
 | Codex가 "This conversation is open in another app"에서 멈춤 | 기본 복원(옵션 없음)을 거친 대화에 나중에 `--report-resume`로 보고했을 때 관측됨(원인 추정). 그 pane에서 `/quit`으로 정상 종료한 뒤 `scripts/team-up.sh --up`(외부 팀장은 `GJCH_EXTERNAL_LEAD=1 scripts/team-up.sh --up`)으로 다시 띄운다 |
 
 더 자세한 사용법은 [README](../README.md)를 참조한다.
