@@ -1499,4 +1499,158 @@ print(json.dumps({
 
 		h.assertReadOnlyHerdrCalls();
 	});
+
+	test("18. (#80) docs/dev-environment.md '알려진 확인창 글자' 표의 화면 글자 열이 scripts/dialog-watch.py 판정 정규식 상수와 양방향 일치(거짓 통과 방지 검증 포함)", () => {
+		const docPath = path.join(REPO_ROOT, "docs", "dev-environment.md");
+		const docText = fs.readFileSync(docPath, "utf8");
+
+		// 확인용 사본 1: 표 글자를 바꾼 메모리 내 문자열 사본
+		const mutatedPhraseDoc = docText.replace(
+			"`Run this command?`",
+			"`Execute this shell line?`",
+		);
+		expect(mutatedPhraseDoc).not.toBe(docText);
+
+		// 확인용 사본 2: 두 종류(agy-trust와 codex-trust)의 화면 글자를 서로 바꾼 메모리 내 문자열 사본
+		const agyTrustCell = "`Do you trust the contents of this project?`";
+		const codexTrustCell = "`Trust this folder?` · `Trust and continue`";
+		const swappedKindsDoc = docText
+			.replace(agyTrustCell, "__SWAP_PLACEHOLDER__")
+			.replace(codexTrustCell, agyTrustCell)
+			.replace("__SWAP_PLACEHOLDER__", codexTrustCell);
+		expect(swappedKindsDoc).not.toBe(docText);
+
+		const pyVerify = spawnSync(
+			REAL_PYTHON3,
+			[
+				"-c",
+				`import importlib.util, json, re, sys
+
+mod_path = sys.argv[1]
+payload = json.loads(sys.stdin.read())
+
+spec = importlib.util.spec_from_file_location("dialog_watch", mod_path)
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+
+EXPECTED_KINDS = [
+    "agy-trust",
+    "agy-command",
+    "agy-editor",
+    "agy-confirm",
+    "codex-trust",
+    "codex-worktree",
+    "codex-menu",
+    "auth-error",
+    "question",
+]
+
+KIND_CONSTS = {
+    "agy-trust": ["AGY_TRUST_RE"],
+    "agy-command": ["REQ_PERM_RE", "RUN_THIS_CMD_RE", "NO_CANCEL_RE", "NAVIGATE_RE"],
+    "agy-editor": ["FULL_COMMAND_RE", "ENTER_CONFIRM_RE", "CTRL_G_EXPAND_RE"],
+    "agy-confirm": ["NO_CANCEL_RE", "NAVIGATE_RE"],
+    "codex-trust": ["TRUST_FOLDER_RE", "TRUST_CONTINUE_RE"],
+    "codex-worktree": ["WHERE_SHOULD_RE"],
+    "auth-error": ["AUTH_ERROR_RE"],
+}
+
+NON_LITERAL_KINDS = {
+    "codex-menu": "마지막 입력란 줄이 \`› 1. …\` 꼴",
+    "question": "(blocked일 때만)",
+}
+
+def verify_doc_table(doc_text: str):
+    m = re.search(r"### 알려진 확인창 글자\\s*\\n([\\s\\S]*?)(?=\\n## |\\n### |$)", doc_text)
+    if not m:
+        return {"ok": False, "reason": "missing_section"}
+    body = m.group(1)
+    if "판정은 \`scripts/dialog-watch.py\`이며, 판정 글자를 바꾸면 이 표도 함께 고친다." not in body:
+        return {"ok": False, "reason": "missing_note"}
+
+    table_lines = [
+        ln.strip()
+        for ln in body.splitlines()
+        if ln.strip().startswith("|") and ln.strip().endswith("|")
+    ]
+    if len(table_lines) < 3:
+        return {"ok": False, "reason": "no_table_rows"}
+
+    header_cols = [c.strip() for c in table_lines[0][1:-1].split("|")]
+    if header_cols != ["종류", "도구", "화면 글자", "누가 답하는가"]:
+        return {"ok": False, "reason": f"bad_header:{header_cols}"}
+
+    rows = [
+        [c.strip() for c in ln[1:-1].split("|")]
+        for ln in table_lines[2:]
+    ]
+    if any(len(r) != 4 for r in rows):
+        return {"ok": False, "reason": "bad_col_count"}
+
+    seen_kinds = [r[0].strip("\`") for r in rows]
+    if seen_kinds != EXPECTED_KINDS:
+        return {"ok": False, "reason": f"kinds_mismatch:{seen_kinds}"}
+
+    for cols in rows:
+        kind = cols[0].strip("\`")
+        screen_cell = cols[2]
+        if kind in NON_LITERAL_KINDS:
+            if screen_cell != NON_LITERAL_KINDS[kind]:
+                return {"ok": False, "reason": f"non_literal_mismatch:{kind}:{screen_cell}"}
+            continue
+
+        const_names = KIND_CONSTS.get(kind)
+        if not const_names:
+            return {"ok": False, "reason": f"unknown_kind:{kind}"}
+
+        phrases = re.findall(r"\`([^\`]+)\`", screen_cell)
+        if not phrases:
+            return {"ok": False, "reason": f"empty_phrases:{kind}"}
+
+        consts = [(cname, getattr(mod, cname)) for cname in const_names]
+
+        # 방향 1: 표의 각 글자가 그 종류의 상수 가운데 하나에 search로 맞아야 함
+        for p in phrases:
+            if not any(cre.search(p) is not None for _, cre in consts):
+                return {"ok": False, "reason": f"phrase_unmatched:{kind}:{p}"}
+
+        # 방향 2: 각 상수는 표의 그 종류 글자 가운데 적어도 하나에 search로 맞아야 함
+        for cname, cre in consts:
+            if not any(cre.search(p) is not None for p in phrases):
+                return {"ok": False, "reason": f"const_unmatched:{kind}:{cname}"}
+
+    return {"ok": True}
+
+print(json.dumps({
+    "real": verify_doc_table(payload["real"]),
+    "mutated_phrase": verify_doc_table(payload["mutated_phrase"]),
+    "swapped_kinds": verify_doc_table(payload["swapped_kinds"]),
+}))
+`,
+				DIALOG_WATCH_PY,
+			],
+			{
+				cwd: REPO_ROOT,
+				input: JSON.stringify({
+					real: docText,
+					mutated_phrase: mutatedPhraseDoc,
+					swapped_kinds: swappedKindsDoc,
+				}),
+				encoding: "utf8",
+				env: { ...process.env, PYTHONDONTWRITEBYTECODE: "1" },
+				timeout: 10_000,
+			},
+		);
+
+		expect(pyVerify.status).toBe(0);
+		const result = JSON.parse(pyVerify.stdout.trim()) as {
+			real: { ok: boolean; reason?: string };
+			mutated_phrase: { ok: boolean; reason?: string };
+			swapped_kinds: { ok: boolean; reason?: string };
+		};
+		expect(result.real).toEqual({ ok: true });
+		expect(result.mutated_phrase.ok).toBe(false);
+		expect(result.mutated_phrase.reason).toContain("agy-command");
+		expect(result.swapped_kinds.ok).toBe(false);
+	});
 });

@@ -310,6 +310,22 @@ GJC는 상시 팀원이 아니며, 플러그인 로드·token 표시·`/herdr-se
 - 세션의 백그라운드 작업 출력은 하네스가 지우거나 바꿀 수 있다. 근거로 쓸 감시 출력은 처음부터 이슈 폴더에 쓰거나 바로 복사한다.
 - 이관 기록 예: `../gjch-work/issues/56/`(`migrate.py`, `manifest-src.tsv`·`manifest-dst.tsv`)
 
+### 알려진 확인창 글자
+
+| 종류 | 도구 | 화면 글자 | 누가 답하는가 |
+|---|---|---|---|
+| `agy-trust` | `agy` | `Do you trust the contents of this project?` | 사용자 |
+| `agy-command` | `agy` | `Requesting permission for:` · `Run this command?` · `No, cancel` · `↑/↓ Navigate` | 배정 범위 안의 명령이면 팀장이 전문 확인 뒤 「이번만」(AGENTS.md 「agy 운용 조건」), 그 밖은 사용자 |
+| `agy-editor` | `agy` | `Full Command` · `enter confirm` · `ctrl+g edit/expand` | 답하지 않는 화면 — 팀장이 전문을 읽고 `esc`로 확인창에 돌아간다(AGENTS.md 「agy 운용 조건」) |
+| `agy-confirm` | `agy` | `No, cancel` · `↑/↓ Navigate` | 배정 범위 안의 명령·편집 확인이면 팀장이 「이번만」. MCP 도구는 도구·인자 전체 확인 뒤(Context7 읽기 도구 둘은 영구 허용됨, 그 밖은 「이번만」만). 그 밖 질문은 사용자 |
+| `codex-trust` | `Codex` | `Trust this folder?` · `Trust and continue` | 사용자 |
+| `codex-worktree` | `Codex` | `Where should the new conversation run?` | `critic-send.sh`가 화면에서 1번(현재 worktree) 선택을 확인한 경우에만 Enter(기존 절차, §6 표). 그 밖은 사용자 |
+| `codex-menu` | `Codex` | 마지막 입력란 줄이 `› 1. …` 꼴 | 사용자 |
+| `auth-error` | `agy` · `Codex` | `refresh token was already used` · `sign in again` | 사람이 다시 로그인 |
+| `question` | `agy` · `Codex` | (blocked일 때만) | 사용자 |
+
+판정은 `scripts/dialog-watch.py`이며, 판정 글자를 바꾸면 이 표도 함께 고친다.
+
 ## 6. 자주 있는 문제
 
 | 증상 | 원인·조치 |
