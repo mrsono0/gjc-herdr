@@ -59,6 +59,18 @@ const UNPARSEABLE_SCREEN = [
 	"  \x1b[0m\x1b[1m\x1b[38;2;131;148;150m?\x1b[0m\x1b[38;2;124;145;148m for shortcuts\x1b[0m",
 ].join("\n");
 
+const SCREEN_CODEX_TRUST = `  Folder access
+  /Users/test-secret-owner/private-project-path
+
+  Trust this folder? Codex can read, edit, and run files here, subject to your
+  permission settings. ...
+
+› 1. Trust and continue
+  2. Back to Agent Command Center
+
+  enter continue · esc back
+`;
+
 interface RunCriticSendOptions {
 	focused: boolean;
 	screen: string;
@@ -70,6 +82,11 @@ interface RunCriticSendOptions {
 	agentSession?: { kind: string; value: string; source?: string };
 	reportSessionFail?: boolean;
 	externalMode?: boolean;
+	waitWorkingPolls?: number;
+	keepWorkingAfterPrompt?: boolean;
+	postPromptDialogScreen?: string;
+	dialogIntervalSec?: number | string;
+	timeoutMs?: number;
 }
 
 function makeAgentJson(params: {
@@ -110,11 +127,14 @@ function runCriticSend(options: RunCriticSendOptions): {
 	stderr: string;
 	calls: string[];
 	reportArgvCalls: string[][];
+	readStatuses: string[];
 } {
 	const tmpDir = fs.mkdtempSync("/tmp/gjch-t-critic-send-");
 	try {
 		const logPath = path.join(tmpDir, "herdr-calls.log");
 		const reportArgvPath = path.join(tmpDir, "report-argv.jsonl");
+		const lastStatusPath = path.join(tmpDir, "last-agent-status");
+		const readStatusesPath = path.join(tmpDir, "read-statuses.log");
 		const screenPath = path.join(tmpDir, "screen.ansi");
 		const newTypedScreenPath = path.join(tmpDir, "screen-new-typed.ansi");
 		const freshScreenPath = path.join(tmpDir, "screen-fresh.ansi");
@@ -124,6 +144,9 @@ function runCriticSend(options: RunCriticSendOptions): {
 		const enterSentPath = path.join(tmpDir, "enter-sent");
 		const postEnterGetsPath = path.join(tmpDir, "post-enter-gets");
 		const prePromptWorkingUsedPath = path.join(tmpDir, "pre-prompt-working-used");
+		const promptSentPath = path.join(tmpDir, "prompt-sent");
+		const postPromptGetsPath = path.join(tmpDir, "post-prompt-gets");
+		const postPromptDialogPath = path.join(tmpDir, "screen-post-prompt-dialog.ansi");
 		const briefPath = path.join(tmpDir, "brief.md");
 		const resultPath = path.join(tmpDir, "critic-result.md");
 		const procCriticPath = path.join(tmpDir, "proc-critic.json");
@@ -142,6 +165,9 @@ function runCriticSend(options: RunCriticSendOptions): {
 		fs.writeFileSync(screenPath, options.screen, "utf8");
 		fs.writeFileSync(newTypedScreenPath, NEW_TYPED_SCREEN, "utf8");
 		fs.writeFileSync(freshScreenPath, FRESH_SCREEN, "utf8");
+		if (options.postPromptDialogScreen !== undefined) {
+			fs.writeFileSync(postPromptDialogPath, options.postPromptDialogScreen, "utf8");
+		}
 		fs.writeFileSync(briefPath, "# 검토 지시서\n내용 확인\n", "utf8");
 		fs.writeFileSync(
 			procCriticPath,
@@ -242,6 +268,13 @@ ENTER_SENT=${JSON.stringify(enterSentPath)}
 POST_GETS=${JSON.stringify(postEnterGetsPath)}
 PRE_WORK_ONCE=${JSON.stringify(options.prePromptWorkingOnce ? "1" : "0")}
 PRE_WORK_USED=${JSON.stringify(prePromptWorkingUsedPath)}
+PROMPT_SENT=${JSON.stringify(promptSentPath)}
+POST_PROMPT_GETS=${JSON.stringify(postPromptGetsPath)}
+POST_DIALOG_PATH=${JSON.stringify(postPromptDialogPath)}
+WAIT_WORK_POLLS=${JSON.stringify(String(options.waitWorkingPolls ?? 0))}
+KEEP_WORKING=${JSON.stringify(options.keepWorkingAfterPrompt ? "1" : "0")}
+LAST_STATUS=${JSON.stringify(lastStatusPath)}
+READ_STATUSES=${JSON.stringify(readStatusesPath)}
 PROC_CRITIC=${JSON.stringify(procCriticPath)}
 RESULT_PATH=${JSON.stringify(resultPath)}
 RESULT_MODE=${JSON.stringify(options.resultMode ?? "none")}
@@ -258,6 +291,27 @@ case "$1 $2" in
 			printf 'unexpected agent get target: %s\\n' "$target" >&2
 			exit 1
 		fi
+		if [ -f "$PROMPT_SENT" ]; then
+			if [ "$KEEP_WORKING" = "1" ]; then
+				printf 'working' > "$LAST_STATUS"
+				cat "$AGENT_WORK"
+				exit 0
+			fi
+			if [ "$WAIT_WORK_POLLS" -gt 0 ]; then
+				pcount=0
+				[ -f "$POST_PROMPT_GETS" ] && pcount="$(cat "$POST_PROMPT_GETS")"
+				pcount=$((pcount + 1))
+				printf '%s' "$pcount" > "$POST_PROMPT_GETS"
+				if [ "$pcount" -le "$WAIT_WORK_POLLS" ]; then
+					printf 'working' > "$LAST_STATUS"
+					cat "$AGENT_WORK"
+					exit 0
+				fi
+			fi
+			printf 'idle' > "$LAST_STATUS"
+			cat "$AGENT_READY"
+			exit 0
+		fi
 		if [ -f "$ENTER_SENT" ]; then
 			if [ "$target" = "$CRITIC_PANE" ]; then
 				count=0
@@ -265,20 +319,25 @@ case "$1 $2" in
 				count=$((count + 1))
 				printf '%s' "$count" > "$POST_GETS"
 				if [ "$count" -eq 1 ]; then
+					printf 'working' > "$LAST_STATUS"
 					cat "$AGENT_WORK"
 				else
+					printf 'idle' > "$LAST_STATUS"
 					cat "$AGENT_READY"
 				fi
 				exit 0
 			fi
 			if [ "$PRE_WORK_ONCE" = "1" ] && [ ! -f "$PRE_WORK_USED" ]; then
 				: > "$PRE_WORK_USED"
+				printf 'working' > "$LAST_STATUS"
 				cat "$AGENT_WORK"
 				exit 0
 			fi
+			printf 'idle' > "$LAST_STATUS"
 			cat "$AGENT_READY"
 			exit 0
 		fi
+		printf 'idle' > "$LAST_STATUS"
 		cat "$AGENT_INIT"
 		exit 0
 		;;
@@ -296,6 +355,21 @@ case "$1 $2" in
 		if [ "\${3:-}" != "$CRITIC_PANE" ]; then
 			printf 'unexpected pane read target: %s\\n' "\${3:-}" >&2
 			exit 1
+		fi
+		cat "$SCREEN_PATH"
+		exit 0
+		;;
+	"agent read")
+		if [ "\${3:-}" != "$CRITIC_NAME" ]; then
+			printf 'unexpected agent read target: %s\\n' "\${3:-}" >&2
+			exit 1
+		fi
+		st="unknown"
+		[ -f "$LAST_STATUS" ] && st="$(cat "$LAST_STATUS")"
+		printf '%s\\n' "$st" >> "$READ_STATUSES"
+		if [ -f "$PROMPT_SENT" ] && [ -f "$POST_DIALOG_PATH" ]; then
+			cat "$POST_DIALOG_PATH"
+			exit 0
 		fi
 		cat "$SCREEN_PATH"
 		exit 0
@@ -328,6 +402,7 @@ case "$1 $2" in
 			printf 'unexpected agent prompt args: %s\\n' "$*" >&2
 			exit 1
 		fi
+		: > "$PROMPT_SENT"
 		if [ "$RESULT_MODE" = "written" ]; then
 			printf '# 검토 결과\\n완료\\n' > "$RESULT_PATH"
 		fi
@@ -380,6 +455,9 @@ exit 1
 		}
 
 		const cliArgs: string[] = [];
+		if (options.timeoutMs !== undefined) {
+			cliArgs.push("--timeout", String(options.timeoutMs));
+		}
 		if (options.noWait ?? true) {
 			cliArgs.push("--no-wait");
 		} else if (options.resultMode && options.resultMode !== "none") {
@@ -390,10 +468,14 @@ exit 1
 		const runEnv: NodeJS.ProcessEnv = {
 			...process.env,
 			PATH: `${tmpDir}:${process.env.PATH ?? ""}`,
+			PYTHONDONTWRITEBYTECODE: "1",
 			PYTHONNOUSERSITE: "1",
 			CLAUDE_PROJECT_DIR: REPO_ROOT,
 			GJCH_LEAD_LOCK: lockPath,
 			GJCH_CRITIC_NAME: criticName,
+			...(options.dialogIntervalSec !== undefined
+				? { GJCH_CRITIC_DIALOG_INTERVAL: String(options.dialogIntervalSec) }
+				: {}),
 		};
 		if (options.externalMode) {
 			delete runEnv.HERDR_ENV;
@@ -432,6 +514,13 @@ exit 1
 					.filter(Boolean)
 					.map((line) => JSON.parse(line) as string[])
 			: [];
+		const readStatuses = fs.existsSync(readStatusesPath)
+			? fs
+					.readFileSync(readStatusesPath, "utf8")
+					.trim()
+					.split("\n")
+					.filter(Boolean)
+			: [];
 
 		return {
 			status: proc.status,
@@ -439,6 +528,7 @@ exit 1
 			stderr: proc.stderr ?? "",
 			calls,
 			reportArgvCalls,
+			readStatuses,
 		};
 	} finally {
 		fs.rmSync(tmpDir, { recursive: true, force: true });
@@ -691,6 +781,104 @@ describe("scripts/critic-send.sh focus & input box checks (#46)", () => {
 			expect(failRc4Res.status).toBe(4);
 			expect(failRc4Res.stderr).toContain("gjc-herdr-critic fail 1");
 			expect(failRc4Res.stderr).not.toContain("SENTINEL_CRITIC_REPORT_ERR");
+		},
+		60_000,
+	);
+
+	test(
+		"8. #79 완료 대기 중 확인창 감지: (e) 작업 중 확인창 → rc 5·보고 0회, (f) idle인데 확인창 → rc 5(rc 4 아님)·보고 0회, (g) 확인창 없는 정상 흐름은 기존 기대값 그대로",
+		() => {
+			const fullSid = "critic-dialog-sess-11223344-full-secret";
+
+			// (e) 작업 중(working) 확인창 감지: 끝까지 working을 유지(idle로 바꾸지 않음)하여 working 주기 검사만으로 rc 5·보고 0회가 되는지 확인
+			const workingDialogRes = runCriticSend({
+				focused: false,
+				screen: FRESH_SCREEN,
+				noWait: false,
+				resultMode: "unwritten",
+				keepWorkingAfterPrompt: true,
+				timeoutMs: 10000,
+				postPromptDialogScreen: SCREEN_CODEX_TRUST,
+				dialogIntervalSec: 1,
+				agentSession: {
+					kind: "id",
+					value: fullSid,
+					source: "herdr:codex",
+				},
+			});
+			expect(workingDialogRes.status).toBe(5);
+			expect(workingDialogRes.stderr).toContain(
+				"DIALOG gjc-herdr-critic w-test:p-critic codex-trust Trust this folder? (1. Trust and continue / 2. Back to Agent Command Center)",
+			);
+			expect(workingDialogRes.stderr).toContain(
+				"확인창 감지. 대화상자에 응답하지 않습니다.",
+			);
+			expect(workingDialogRes.reportArgvCalls).toHaveLength(0);
+			expect(workingDialogRes.calls).toContain(
+				"agent read gjc-herdr-critic --source visible",
+			);
+			expect(workingDialogRes.readStatuses).toEqual(["working"]);
+
+			// (f) idle인데 확인창 감지 -> 결과 파일 없음(rc 4)이 아니라 rc 5, 보고 0회
+			const idleDialogRes = runCriticSend({
+				focused: false,
+				screen: FRESH_SCREEN,
+				noWait: false,
+				resultMode: "unwritten",
+				postPromptDialogScreen: SCREEN_CODEX_TRUST,
+				dialogIntervalSec: 1,
+				agentSession: {
+					kind: "id",
+					value: fullSid,
+					source: "herdr:codex",
+				},
+			});
+			expect(idleDialogRes.status).toBe(5);
+			expect(idleDialogRes.stderr).toContain(
+				"DIALOG gjc-herdr-critic w-test:p-critic codex-trust Trust this folder? (1. Trust and continue / 2. Back to Agent Command Center)",
+			);
+			expect(idleDialogRes.stderr).toContain(
+				"확인창 감지. 대화상자에 응답하지 않습니다.",
+			);
+			expect(idleDialogRes.reportArgvCalls).toHaveLength(0);
+			expect(idleDialogRes.readStatuses).toEqual(["idle"]);
+
+			// (g) 확인창 없는 정상 흐름 및 범위 밖 간격(0, 3601, 아주 긴 수 -> 기본값 15) -> 기존 기대값(rc 0, reported 1회) 그대로
+			for (const intervalVal of [1, "0", "3601", "9999999999999999999999999"]) {
+				const normalRes = runCriticSend({
+					focused: false,
+					screen: FRESH_SCREEN,
+					noWait: false,
+					resultMode: "written",
+					waitWorkingPolls: 4,
+					dialogIntervalSec: intervalVal,
+					agentSession: {
+						kind: "id",
+						value: fullSid,
+						source: "herdr:codex",
+					},
+				});
+				expect(normalRes.status).toBe(0);
+				expect(normalRes.stderr.trim()).toBe("gjc-herdr-critic reported critic-d");
+				expect(normalRes.reportArgvCalls).toHaveLength(1);
+			}
+
+			// 범위 밖 간격(아주 긴 수)일 때 기본값(15초)으로 폴백되어, 1초 working 구간에서는 agent read를 부르지 않고 idle 직전에만 1회 부름
+			const fallbackIntervalRes = runCriticSend({
+				focused: false,
+				screen: FRESH_SCREEN,
+				noWait: false,
+				resultMode: "written",
+				waitWorkingPolls: 4,
+				dialogIntervalSec: "9999999999999999999999999",
+				agentSession: {
+					kind: "id",
+					value: fullSid,
+					source: "herdr:codex",
+				},
+			});
+			expect(fallbackIntervalRes.status).toBe(0);
+			expect(fallbackIntervalRes.readStatuses).toEqual(["idle"]);
 		},
 		60_000,
 	);

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Codex 검토 전송: 저장소 루트의 검토 pane에서 새 대화 준비·전송 수락·완료를 관측한다.
 # timeout·전송 불확실 뒤에는 재전송하지 않는다. 저장소 전후 비교·스냅숏은 만들지 않는다.
-# --result를 주면 idle/done 뒤 그 결과 파일이 전송 전보다 새로 쓰였는지로 완료를 판정한다(아니면 rc 4).
+# --result를 주면 idle/done 뒤 그 결과 파일이 전송 전보다 새로 쓰였는지로 완료를 판정한다(아니면 rc 4, 완료 대기 중 확인창 감지는 rc 5).
 set -eu
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
@@ -412,15 +412,53 @@ named="$(herdr agent get "$CRITIC_NAME")" || fail '전송 뒤 이름 확인 실�
 validate_agent "$named" 0 0 || exit 1
 echo "전송 수락(working) 확인: $CRITIC_NAME ($pane)"
 [ "$no_wait" -eq 0 ] || { echo '완료 대기 생략. 공개 상태와 결과 파일에서 완료 여부를 확인하세요.'; exit 0; }
+dialog_interval="${GJCH_CRITIC_DIALOG_INTERVAL:-15}"
+case "$dialog_interval" in
+	''|*[!0-9]*) dialog_interval=15 ;;
+	*)
+		if [ "${#dialog_interval}" -gt 4 ]; then
+			dialog_interval=15
+		else
+			dialog_interval=$((10#$dialog_interval))
+			if [ "$dialog_interval" -lt 1 ] || [ "$dialog_interval" -gt 3600 ]; then
+				dialog_interval=15
+			fi
+		fi
+		;;
+esac
+check_critic_dialog() {
+	local dw_out dw_rc=0
+	dw_out="$(PYTHONDONTWRITEBYTECODE=1 python3 "$ROOT/scripts/dialog-watch.py" --names "$CRITIC_NAME" --once)" || dw_rc=$?
+	case "$dw_rc" in
+		0) return 0 ;;
+		10)
+			[ -z "$dw_out" ] || printf '%s\n' "$dw_out" >&2
+			echo '확인창 감지. 대화상자에 응답하지 않습니다.' >&2
+			exit 5
+			;;
+		*)
+			echo "dialog-watch 확인 실패(rc=$dw_rc). 완료 대기를 계속합니다." >&2
+			return 0
+			;;
+	esac
+}
+last_dialog_check="$SECONDS"
 while :; do
 	agent="$(herdr agent get "$pane")" || fail '완료 상태 확인 실패. 공개 상태와 결과 파일을 확인하세요.'
 	validate_agent "$agent" 0 0 || exit 1
 	status="$(printf '%s' "$agent" | jget result.agent.agent_status)"
 	# 완료를 관측하면 늦게 반환됐어도 인정한다. 아직 미완료일 때만 아래 한도를 적용한다.
 	case "$status" in
-		idle|done) break ;;
+		idle|done)
+			check_critic_dialog
+			break
+			;;
 		blocked|unknown) fail "완료 대기 중 상태=$status. 대화상자에 응답하지 않습니다." ;;
 	esac
+	if [ "$status" = working ] && [ "$((SECONDS - last_dialog_check))" -ge "$dialog_interval" ]; then
+		check_critic_dialog
+		last_dialog_check="$SECONDS"
+	fi
 	[ "$(now_ms)" -lt "$deadline" ] || { echo '완료 대기 timeout. 원격 작업은 중단하지 않았습니다. 공개 상태와 결과 파일을 확인하세요.' >&2; exit 2; }
 	sleep 1
 done
