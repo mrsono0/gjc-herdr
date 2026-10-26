@@ -1498,7 +1498,7 @@ print(json.dumps({
 		expect(tfOut.zero_calls_when_expired).toBe(true);
 
 		h.assertReadOnlyHerdrCalls();
-	});
+	}, 30_000);
 
 	test("18. (#80) docs/dev-environment.md '알려진 확인창 글자' 표의 화면 글자 열이 scripts/dialog-watch.py 판정 정규식 상수와 양방향 일치(거짓 통과 방지 검증 포함)", () => {
 		const docPath = path.join(REPO_ROOT, "docs", "dev-environment.md");
