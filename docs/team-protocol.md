@@ -16,6 +16,7 @@
   - GJC 전용 보조: `/herdr-send`의 SDK 모드
   - 저장소 파일 보조: 파일 우편함. Herdr로 닿지 않는 상대(외부 팀장)와 작업 중에 넣기 위험한 보고를 위해 둔다.
 - 원격 목표 환경(`docs/dev-environment.md` §0)에서도 GJC 팀원은 Herdr pane 안의 대화형 GJC로 띄우는 것을 기준으로 한다. Herdr 밖 헤드리스 GJC(`gjc sdk` 세션)는 Herdr 표준으로 다룰 수 없으므로 기준으로 삼지 않는다.
+- Core(`herdr-core`, `hc`) 전환 뒤에도 GJC는 `hc`에서 세션 토큰·화면 읽기를 쓰지 않으므로 보조 경로(GJC 공개 SDK `gjc sdk session send`, 파일 우편함 `.gjc-herdr/mailbox`)의 위치와 양방향 호출 목표는 바뀌지 않는다.
 
 ### 범용 에이전트 간 호출·답변 회수 (2026-10-07 사용자 확정)
 
@@ -27,8 +28,8 @@
 ## 프로젝트 구조 요약
 
 - 제품: GJC 확장 플러그인 `gjc-herdr`(Bun 1.4.3 고정, TypeScript, MIT). 진입점 `dist/extension.js`는 빌드 산출물이며 `src/`와 version이 일치할 때만 commit한다.
-- `src/extension.ts` 등록·수명 주기, `src/metadata.ts` model/session/session_id 표시 token, `src/send.ts` `/herdr-send`·`herdr_send`(pane→GJC 프롬프트 전달), `src/input.ts` 입력란 판정, `src/call.ts` `/herdr-call`·`herdr_agent_call`(감지 agent 호출·답변 회수). 테스트는 `test/*.test.ts`, 빌드는 `scripts/build.ts`.
-- 팀 운영 스크립트: `scripts/team-up.sh`(팀 이름·label·팀원 pane 구성), `scripts/team-lead.sh`(팀장 잠금), `scripts/critic-send.sh`(Codex 검토 전송), `scripts/check-env.sh`(읽기 전용 환경 점검).
+- `src/extension.ts` 등록·수명 주기, `src/metadata.ts` model/session/session_id 표시 token, `src/send.ts` `/herdr-send`·`herdr_send`(pane→GJC 프롬프트 전달), `src/input.ts` 입력란 판정, `src/call.ts` `/herdr-call`·`herdr_agent_call`(감지 agent 호출·답변 회수), `src/hc.ts` `herdr-core`(`hc`) CLI 백엔드 어댑터. 테스트는 `test/*.test.ts`, 빌드는 `scripts/build.ts`.
+- 팀 운영 스크립트: `scripts/team-up.sh`(팀 이름·label·팀원 pane 구성, `GJCH_CORE=1`이면 `scripts/core-team.sh`로 위임), `scripts/team-lead.sh`(팀장 잠금), `scripts/critic-send.sh`(Codex 검토 전송, `GJCH_CORE=1`이면 `scripts/core-critic-send.sh`로 위임), `scripts/mate-watch.sh`(구현 팀원 감시, `GJCH_CORE=1`이면 `scripts/core-mate-watch.sh`로 위임), `scripts/dialog-watch.py`(확인창 감시, `GJCH_CORE=1`이면 `scripts/core-dialog-check.py`로 위임), `scripts/core-lib.sh`(Core 공통 보조), `scripts/check-env.sh`(읽기 전용 환경 점검).
 - 검증: `npm run check`(tsc), `npm test`, `bun scripts/build.ts`.
 - 배포는 `mrsono0/gjc-herdr` main + version tag이며 push·재설치는 사용자 명시 승인 후에만 한다. 작업은 GitHub 이슈로 관리하고 브랜치 이름은 `i<이슈번호>`로 짧게 만든다([CLAUDE.md](../CLAUDE.md)).
 
@@ -72,6 +73,13 @@
 6. **반려·수정:** 팀원은 팀장의 지적을 근거로 반박할 수 있다. 사실 충돌은 실제 실행·source로 해결한다. 합의 불가는 사용자에게 선택지와 권고를 함께 올린다.
 7. **종결:** 팀장이 사실/가설, 완료/대기, 검증 통과/미실행을 구분해 사용자에게 보고한다.
 
+**Core(`herdr-core`, `GJCH_CORE=1`) 한 라운드의 표준 흐름:**
+
+- Core 모드(`GJCH_CORE=1`, 외부 팀장 `GJCH_EXTERNAL_LEAD=1`)에서는 터미널 이름 `gjch-lead`·`gjch-mate`·`gjch-critic`과 라벨 `team=gjch`·`role=lead|mate|critic`을 쓰며, 화면 읽기(`hc read`/`attach`)와 키 응답(`hc keys`/`--force`)은 절대 실행하지 않는다([docs/dev-environment.md](dev-environment.md) §2.4).
+1. **배정(팀장 → `agy`):** 상세 지시서를 파일(`.local/agy/<이슈>-brief.md`)에 쓰고, `gjch-mate`가 `idle`이면 `hc send --json --if idle <mate 주소> "<짧은 지시>"`, 직전 과제 뒤 `status.state=done`에 머물러 있으면 팀장이 `hc get --json`으로 `state=live`·`reported=true`·`status.state=done`(`blocked`·`working`·`error` 아님)과 사용자 입력 없음을 확인한 뒤 `--if` 없이 `hc send --json <mate 주소> "<짧은 지시>"`를 1회 보내고 수락(`started`·`turn`)을 확인한다(`done` 뒤 다음 배정은 **미실측**; `timeout`·불확실 뒤 무조건 재전송 금지).
+2. **감시(`scripts/mate-watch.sh` → `scripts/core-mate-watch.sh`):** `GJCH_CORE=1 GJCH_EXTERNAL_LEAD=1 scripts/mate-watch.sh <결과 파일> "<완료 줄>"`을 백그라운드로 하나만 띄운다. 종료 코드는 `0`(`DONE`, 결과 파일에 완료 줄 확인), `10`(`DIALOG mate <kind> msglen=<n>`, `blocked` 감지), `11`(`NO_RESULT`, `working` 뒤 결과 없이 `idle`/`done` 정체), `12`(`UNKNOWN mate <이유>`, 대상 부재·중복·`finished`·`reported=false`·연속 조회 실패), `1`(`TIMEOUT`), `2`(인자·가드 오류)이다. 완료는 `done` 상태가 아니라 **결과 파일의 완료 줄**로 판단한다.
+3. **검토(`scripts/critic-send.sh` → `scripts/core-critic-send.sh`):** `GJCH_CORE=1 GJCH_EXTERNAL_LEAD=1 scripts/critic-send.sh --result <결과 파일> <지시서 파일>`을 실행한다. 화면 읽기·`/new` 대신 기존 소유 `critic`이 `live`·`reported=true`·`idle`/`done`임을 확인한 뒤 `hc kill` → `state=finished` 확인 → `hc rm` → `hc run`으로 **회차마다 교체 기동**한 뒤, 새 터미널의 `state=live`·`reported=true`·`status.state=idle` 준비를 확인하고 `hc send --json --if idle --wait`로 자체 완결 지시서를 1회 전송한다. 완료 뒤 `--result` 파일이 전송 전 `lstat` 대비 새로 쓰인 비어 있지 않은 일반 파일인지(freshness) 판정하며, 종료 코드는 `0`(완료), `4`(결과 파일 미작성), `5`(대기 중 `blocked` 감지), `2`(대기 timeout, 재전송 금지), `1`(전제·교체·전송 실패)이다.
+
 **역할 분담 기준 (중복 방지):**
 
 - 팀장: 계획, 문서·규칙 파일([AGENTS.md](../AGENTS.md) 및 상세 문서), 통합 검증, 승인 필요한 외부 작업 요청, 필요 시 임시 탭에서 GJC 런타임 관측(플러그인 로드, `/herdr-send`·`/herdr-call` 실동작, token 표시), 사용자 소통.
@@ -109,7 +117,7 @@ LFAI 합본 보고서와 GJCH 시범(#21·#23)에서 확인된 조건에, 같은
 - 실행 옵션을 `--mode accept-edits --sandbox`로 두는 이유는 공통 설정이 `proceed-in-sandbox`라서, sandbox 안의 셸·편집은 무확인이고 sandbox 밖 실행만 확인하기 때문이다.
 - sandbox 안에서는 홈 설정 파일을 읽는 `git`·`gh`가 실패하므로(`~/.gitconfig`·`~/.config/gh` 접근 거부) diff·이슈 확인은 팀장이 하고, 필요한 배경은 지시서에 싣는다.
 - 확인창 응답 규칙: 폴더 신뢰 창은 사용자가 답한다. 명령·편집 확인창은 팀장이 명령 원문을 확인한 뒤 "이번만"(1번)으로만 답한다. 대화 한정·영구 저장(`settings.json`) 선택지는 사용자 승인으로만 쓴다. 이미 승인된 예외는 Context7 읽기 전용 도구 두 개뿐이다("문서 확인(Context7)" 참조).
-- 확인창의 명령이 잘려 보이면 `herdr pane zoom <agy pane>`으로 키우고, 확인창에서 `ctrl+g`(Full Command 보기)로 전문을 읽은 뒤 `esc`로 확인창에 돌아오고, `herdr pane zoom`으로 원래 크기로 되돌린다. 전문을 다 읽을 수 없으면 확인창의 취소 선택지(4번 "No, cancel")를 고르고, 짧은 명령이나 편집 도구로 나눠서 다시 하게 한다. 이 절차는 CF 팀 관측에서 가져왔고 이 저장소에서 독립 재현하지 않았다.
+- 확인창의 명령이 잘려 보이면 `herdr pane zoom <agy pane>`으로 키우고, 확인창에서 `ctrl+g`(Full Command 보기)로 전문을 읽은 뒤 `esc`로 확인창에 돌아오고, `herdr pane zoom`으로 원래 크기로 되돌린다. 전문을 다 읽을 수 없으면 확인창의 취소 선택지(4번 "No, cancel")를 고르고, 짧은 명령이나 편집 도구로 나눠서 다시 하게 한다. 이 절차는 CF 팀 관측에서 가져왔고 이 저장소에서 독립 재현하지 않았다. 이 확인창 전문 확인(`zoom`·`ctrl+g`)과 「이번만」 팀장 한정 위임은 **Herdr 전용**이며, 화면 읽기(`hc read`/`attach`)와 키 응답(`hc keys`/`--force`)을 쓰지 않는 Core(`GJCH_CORE=1`)에서는 불가하고 위임도 없으므로 모든 `DIALOG`는 사용자에게 알리고 대기한다.
 - `~/.gemini/antigravity-cli/settings.json`은 이 머신의 모든 agy가 함께 쓰는 사용자 설정이다. 이 저장소 작업에서는 직접 편집하지 않는다. 예외로 사용자 승인(#41)에 따른 `context7/query-docs`·`context7/resolve-library-id`의 영구 허용만 확인창에서 저장할 수 있다. 다른 설정은 바꾸지 않는다.
 
 **협업 중에도 절대 하지 않는 일:**
@@ -139,6 +147,20 @@ LFAI 합본 보고서와 GJCH 시범(#21·#23)에서 확인된 조건에, 같은
 - 호출: `herdr agent prompt <대상> "<질문>" --wait --timeout <ms>` → 응답은 `agent read <대상> --source recent-unwrapped --lines N`. `agent_prompt_stalled`/`timeout`은 미전달 증거가 아니므로 맹목 재전송 금지.
 - 일반 명령: `pane split --current --direction right|down --cwd "$PWD" --no-focus` → `pane run <id> "<cmd>"` → `pane wait-output --match|--regex` → `pane read`. 사용자 포커스는 항상 `--no-focus`로 보존.
 - 금지: 만들지 않은 workspace/tab/pane 닫기, `herdr server stop`, 메인 Herdr 프로세스 종료, 인자 없이 변경성 하위 명령 탐색, 맨 `herdr`(TUI 실행). 실험은 이름 있는 격리 session에서.
+
+**Core (`herdr-core` / `hc`, `GJCH_CORE=1` + `GJCH_EXTERNAL_LEAD=1` — [docs/dev-environment.md](dev-environment.md) §1·§2.4):**
+- 전환 스위치 `GJCH_CORE=1`을 켜면 기존 다섯 진입점이 Core 전용 스크립트로 분기한다:
+
+| 진입점 | `GJCH_CORE=1` 위임 대상 | 주요 동작·종료 코드 |
+|---|---|---|
+| `scripts/team-up.sh` | `scripts/core-team.sh` | `--hook`, `--up`, `--spawn`, `--check`(`0` ok / `1` mismatch / `2` unknown), `--status`, `--lock <status\|claim\|release>`, `--down`(`kill` → `finished` 확인 → `rm`), `--print-expected-units` (`--layout`·`--report-resume`는 미지원 rc `2`) |
+| `scripts/mate-watch.sh` | `scripts/core-mate-watch.sh` | 결과 파일 완료 줄 + `hc get --json` 상태 감시(`0` DONE / `1` TIMEOUT / `2` 인자·가드 / `10` DIALOG / `11` NO_RESULT / `12` UNKNOWN) |
+| `scripts/critic-send.sh` | `scripts/core-critic-send.sh` | 소유 `critic` 교체 기동(`kill` → `finished` → `rm` → `run`) 후 `idle` 준비 확인·지시서 1회 전송·결과 파일 freshness 확인(`0` 완료 / `1` 실패 / `2` timeout / `4` 결과 미작성 / `5` blocked) |
+| `scripts/dialog-watch.py` | `scripts/core-dialog-check.py` | `hc ls --json`·`hc get --json`으로 `blocked` 감시(`--once`: `none`=`0` / `DIALOG`=`10` / `UNKNOWN`=`2`; 상시: `UNKNOWN` 줄 출력 후 계속 감시, 새 `DIALOG`=`10`, `--timeout` 도달=`0`; 인자·가드: `GJCH_TEAM_ROLE` 설정·연결 worktree는 `0`, `GJCH_CORE != 1`·잘못된 인자는 `2`, `GJCH_EXTERNAL_LEAD != 1`·경로 오류는 `--once`만 `2`이고 상시는 `0`) |
+| `scripts/check-env.sh` | 내부 Core 분기(`scripts/core-lib.sh`·`core-team.sh --check`) | `hc --version`, `hc server status --json`, `core_lock_class`, 팀원 `--check` 점검 |
+
+- 환경변수: `GJCH_CORE=1`(Core 분기 활성화), `GJCH_CORE_TEAM`(팀 라벨 `team=<값>` 및 터미널 이름 접두어, 기본 `gjch`, 시험 격리 시 `gjch-test-<이슈>`), `GJCH_HC_BIN`(`hc` 실행 파일 이름·경로, 기본 `hc`), 시험·대기 조정용 변수(`GJCH_CORE_DOWN_INTERVAL`(`3`), `GJCH_CORE_DOWN_RETRIES`(`10`, `--down` 및 `core-critic-send.sh` 교체 종료 공용), `GJCH_MATE_WATCH_INTERVAL`(`3`), `GJCH_MATE_WATCH_STALL`(`60`), `GJCH_CRITIC_READY_INTERVAL`(`3`), `GJCH_CRITIC_READY_RETRIES`(`20`), `GJCH_CRITIC_WATCH_INTERVAL`(`3`) — 단위 테스트의 폴링 간격·재시도 횟수 조정 목적; `core-critic-send.sh`의 준비 대기 60초 상한은 환경변수가 아니라 전체 deadline과 함께 적용되는 코드 고정 상한).
+- 금지: `hc read`·`hc attach`(화면 읽기), `hc keys`·`hc send --force`(강제·키 입력), 다른 머신(`machine/tN`) 터미널 제어, `working`/`blocked` 중인 팀원 종료, `timeout`·불확실 뒤 자동 재전송.
 
 **GJC (`gjc`):**
 - 실행: `gjc` 대화형, `gjc -p "..."` 비대화형 1회, `-c/--continue`, `-r/--resume`, `--model`, `--no-session`, `-w` worktree. 테스트·관측용 실행은 격리 `GJC_CONFIG_DIR`/HOME을 쓰고 자동 credential import를 막는다(사용자 설정·credentials 불변).

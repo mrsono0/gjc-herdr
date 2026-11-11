@@ -9,6 +9,7 @@
 - **원격 서버:** 원격 서버에서 Herdr 서버가 돌고, GJC·agy·Codex 같은 세션은 그 Herdr의 pane 안에 떠 있다.
 - **화면 없음:** 대부분의 시간에는 그 화면을 보는 Herdr TUI 클라이언트가 붙어 있지 않다. 사람은 가끔 접속해서 보거나, 아예 보지 않는다.
 - **팀장도 화면 밖:** 팀장도 Herdr 화면을 늘 보지 않는다. 지금의 외부 팀장(§2.1)처럼 세션 간 메시지(`SendMessage`/`ListAgents`)나 Herdr CLI(`herdr agent …`, `herdr pane read` 등)로만 다룬다.
+- **Core(`herdr-core`, `hc`) 동거 실행 범위:** Core 길(§2.4)에서는 팀장·구현 팀원(`agy`)·검토 팀원(`Codex`) 터미널과 저장소·결과 파일·팀장 잠금 파일이 모두 **같은 Core 호스트**에 놓이는 동거 실행을 기준으로 한다. 팀 운영 스크립트는 다른 머신(`machine/tN`)의 터미널을 제어하지 않으며, 화면 읽기(`hc read`/`attach`)와 키·강제 입력(`hc keys`/`--force`)을 전혀 쓰지 않고 `hc ls --json`·`hc get --json`·결과 파일만으로 상태를 판정한다.
 
 ### 0.1 설계 기준
 - **사람이 화면을 보고 있다고 가정하지 않는다.** 화면에만 뜨는 알림(토스트, 상태 줄, 잠깐 떴다 사라지는 안내)은 보고 경로로 쓰지 않는다. 결과·보고·진단은 파일, 우편함(`.gjc-herdr/mailbox`), 세션 간 메시지, 로그처럼 나중에 읽을 수 있는 곳에 남긴다.
@@ -47,6 +48,13 @@
 - 클라이언트가 없을 때 Herdr 화면 읽기(`herdr pane read`, `agent read`)가 지금과 같은 내용을 주는지: 로컬 detach 실측에서 `herdr pane read --source visible`(2026-10-17)과 `herdr agent read`(2026-10-18)는 같은 내용을 줬다. 진짜 원격 서버의 agent pane은 미측정이다.
 - 클라이언트 없이 새로 만든 좁은 pane(예: 57칸)에서 플러그인 입력란 판정이 되는지(이미 있던 pane은 줄지 않아 해당 없음, §0.1), `headless_cols`·`headless_rows`를 바꾸면 실제로 적용되는지, lf-prod(Herdr 0.9.3)에도 이 설정이 있는지
 - 원격에서 팀장(Claude Code)을 어디에 둘지: Herdr pane 안인지, 원격 밖 세션인지. 그리고 세션 간 메시지가 닿는지
+- **Core(`herdr-core`, `hc`) 길에서 아직 실측하지 않은 것(미실측):**
+  - 재부팅 뒤 Core 서버·터미널 수명과 잔류 정리 동작(**미실측**)
+  - Core에서 팀원 `status.state=blocked` 확인창 실제 발생과 사용자 해소 뒤 복귀(**미실측**)
+  - 원격 호스트에서의 Core 동거 운용(**미실측**)
+  - 탑주가 기동한 Core 팀장(`gjch-lead`)과 기존 팀장 사이의 잠금 인계(**미실측**)
+  - `agy`(`gjch-mate`)가 첫 과제 뒤 `status.state=done`에 머문 상태에서 `--if` 없이 보낸 다음 배정이 실제로 새 과제를 시작하는지(**미실측**, §2.4 (e))
+  - `hc` 터미널 안에서의 대화형 GJC 실사용 및 플러그인 `hc` 백엔드 라이브 연동(**미실측**, 별도 이슈)
 
 ## 1. 구성 요약
 
@@ -74,6 +82,23 @@
 | `GJCH_CODEX_MODEL` | `gpt-6.1-sol` |
 | `GJCH_CODEX_DOC_MAX_BYTES` | `65536`(양의 정수가 아니면 `65536`). Codex 시작 옵션 끝에 `-c project_doc_max_bytes=<값>`을 붙여 사용자 설정을 바꾸지 않고 `AGENTS.md`를 끝까지 읽게 한다(#64) |
 | `GJCH_RETRIES` | `30`; 팀장 이름 확보 등을 2초 간격으로 재확인 |
+
+**Core(`herdr-core`, `hc`) 구성 요약:**
+
+- **전환 스위치와 이름·라벨:** `GJCH_CORE=1`(외부 팀장 `GJCH_EXTERNAL_LEAD=1` 함께 사용)을 켜면 기존 진입점(`scripts/team-up.sh`, `scripts/check-env.sh`, `scripts/mate-watch.sh`, `scripts/critic-send.sh`, `scripts/dialog-watch.py`)이 Core 전용 스크립트로 분기한다. 운영 터미널 이름은 팀장 `gjch-lead`(`team=gjch`, `role=lead`), 구현 팀원 `gjch-mate`(`team=gjch`, `role=mate`), 검토 팀원 `gjch-critic`(`team=gjch`, `role=critic`)이다. 시험용 격리 실행은 터미널 이름 `gjch-test-<이슈>-<용도>`와 라벨 `team=gjch-test-<이슈>`(`GJCH_CORE_TEAM=gjch-test-<이슈>`)를 써서 운영 터미널과 섞이지 않게 한다.
+- **Core 스크립트와 환경변수:**
+
+| 스크립트 / 환경변수 | 역할·기본값 |
+|---|---|
+| `scripts/core-lib.sh` | Core 공통 보조(`core_hc`, `core_json`, `core_find`, `core_get`, `core_guard`, `core_lock_class`, `core_redact`; `source` 전용) |
+| `scripts/core-team.sh` | Core 팀 구성·점검·정리(`--hook`, `--up`, `--spawn`, `--check`, `--status`, `--lock <status\|claim\|release>`, `--down`, `--print-expected-units`) |
+| `scripts/core-mate-watch.sh` | Core 구현 팀원(`agy`) 결과 파일 완료 줄·`hc get --json` 상태 감시(화면 읽기 없음) |
+| `scripts/core-dialog-check.py` | Core 팀원 `status.state=blocked` 확인창 읽기 전용 감시(`--once` 및 상시 감시) |
+| `scripts/core-critic-send.sh` | Core 검토 팀원(`Codex`) 교체 기동(`kill` → `finished` 확인 → `rm` → `run`) 후 지시서 1회 전송·완료/결과 파일 확인 |
+| `GJCH_CORE` | 미설정; `1`이면 모든 팀 진입점을 Core(`hc`) 경로로 전환 |
+| `GJCH_CORE_TEAM` | `gjch`; 대상 팀 라벨(`team=<값>`) 및 터미널 이름 접두어(`<값>-mate`, `<값>-critic`) |
+| `GJCH_HC_BIN` | `hc`; 호출할 `hc` 실행 파일 이름 또는 경로 |
+| 시험·대기 조정 변수 | `GJCH_CORE_DOWN_INTERVAL`(`3`), `GJCH_CORE_DOWN_RETRIES`(`10`, `--down` 및 `core-critic-send.sh` 교체 종료 공용), `GJCH_MATE_WATCH_INTERVAL`(`3`), `GJCH_MATE_WATCH_STALL`(`60`), `GJCH_CRITIC_READY_INTERVAL`(`3`), `GJCH_CRITIC_READY_RETRIES`(`20`), `GJCH_CRITIC_WATCH_INTERVAL`(`3`) — 폴링 간격·재시도 횟수 조정(주로 단위 테스트 시간 단축용; `core-critic-send.sh`의 준비 대기 60초 상한은 환경변수가 아니라 전체 deadline과 함께 적용되는 코드 고정 상한) |
 
 **Codex는 사용자 지시로 `--yolo`를 사용하며 샌드박스가 없다.** Codex는 저장소 루트에서 실행되며, **제1원칙은 "파일 수정이 필요하면 먼저 팀장 허락을 받는다"**이다(루트 `AGENTS.md`와 매 지시서에 적는다). 검토·조사 결과 파일은 지시서가 지정한 gitignore 경로(예: `.local/critic/`)에만 쓰며, 이 지정이 팀장의 허락이다. commit·적용은 하지 않는다. Codex가 없으면 WARN과 함께 생략하며, 기존 `gjc-herdr-critic` pane은 다시 시작하거나 변경하지 않는다.
 
@@ -203,6 +228,39 @@ herdr `[session] resume_agents_on_restore`는 네 팀 공용 설정이라 GJCH�
 
 2026-10-27부터 `resume_agents_on_restore`가 꺼져 있어, herdr 서버가 재시작돼도 팀원을 자동으로 되살리지 않는다. 재개 명령을 보고해 둔 팀원(`--report-resume`, #71)도 같다. 재시작 뒤에는 재개 2대로 `--up`으로 다시 띄우고 `--check`로 확인한다. 켜져 있던 때의 관측은 기록으로 남긴다. 보고해 둔 팀원은 옵션대로 되살아났고(2026-10-22), 보고하지 않은 팀원은 옵션 없이 되살아났다(2026-10-16·2026-10-21, §6 표). 끈 뒤의 첫 재시작은 아직 관측하지 않았다(#81).
 
+Core(`GJCH_CORE=1`, §2.4)에서도 중지·재개 원칙은 같다: 작업 중인 팀원에게 STOP을 입력하지 않고 결과 파일의 완료 줄과 `hc get --json` 상태로 판단하며, 재개 순서는 잠금 확보(`GJCH_CORE=1 GJCH_EXTERNAL_LEAD=1 scripts/team-up.sh --lock claim`) → 팀원 상태·옵션 점검(`--status`/`--check`: 단순 부재는 `--down` 없이 `--up`으로 없는 역할만 보충한다; 옵션 불일치 등으로 `--down` 후 `--up`이 필요할 때 `scripts/core-team.sh --down`은 `mate`·`critic` 두 역할을 모두 돌며 스크립트가 자동 보호하는 것은 `status.state == "working"`뿐이고 `blocked` 등은 막지 않으므로, 실행 전에 **먼저 `mate`·`critic` 모두의 상태(`hc get --json`: `status.state`)·진행 중 과제·사용자 입력 유무를 확인**하고 `working`·`blocked`·상태 미확인 팀원은 종료하지 않고 대기하거나 사용자에게 보고한다) → 확인창 점검(`GJCH_CORE=1 python3 scripts/dialog-watch.py --once`) → 우편함 확인(`scripts/mail-watch.sh <받는이> --timeout 0`)이다. Core의 `scripts/mate-watch.sh`(`scripts/core-mate-watch.sh`)는 대상 부재·라벨 중복·`state=finished`·미보고(`reported=false`)·연속 조회 실패 시 `UNKNOWN mate <이유>`를 출력하고 종료 코드 `12`로 끝난다(재부팅 뒤 Core 터미널 수명은 **미실측**).
+
+### 2.4 Core 길(herdr-core)
+
+기존 Herdr 서버 대신 `herdr-core`(`hc`) 터미널에서 팀장(`gjch-lead`)·구현 팀원(`gjch-mate`)·검토 팀원(`gjch-critic`)을 운용하는 경로다(2026-11-11 사용자 결정: 팀원+팀장 자리 이주, 기동 손 탑주, 화면 읽기 없음). 이주 전 운용과 되돌리기(§2.4 (d))를 위해 앞의 Herdr 절은 그대로 유지한다.
+
+- **(a) 팀장 띄우는 명령 (탑주 명부용, 글자 그대로):**
+  ```sh
+  hc run --bg --json --no-notify --no-parent --name gjch-lead --cwd <저장소 루트> --label team=gjch --label role=lead --label herdr.space=gjch -- env GJCH_EXTERNAL_LEAD=1 GJCH_CORE=1 claude --permission-mode auto --name "GJCH 팀장"
+  ```
+  `--label herdr.space=gjch`는 사용자 결정(2026-11-11)으로 포함한다: App이 이 터미널을 받아들이면 그 id의 공간을 만들고 keep을 켜므로 재부팅 뒤 터미널이 남을 수 있다. 팀원(mate·critic) 터미널에는 붙이지 않는다.
+  `--keep`은 붙이지 않는다. 기동 손은 탑주이며, Core 팀장의 권한 모드 `--permission-mode auto` 출처는 사용자 결정 194이다.
+- **(b) 잠금 인계 순서:**
+  1. 옛 팀장이 진행 중인 배정이 없는 것을 확인한 뒤 `scripts/team-lead.sh release`로 팀장 잠금을 놓는다.
+  2. 새로 뜬 Core 팀장(`gjch-lead`)이 시작할 때 SessionStart hook(`scripts/team-up.sh --hook` → `scripts/core-team.sh --hook`) 또는 수동 `GJCH_CORE=1 GJCH_EXTERNAL_LEAD=1 scripts/team-up.sh --lock claim`으로 잠금을 확보하고 `mine`을 확인한다.
+  3. 잠금 확보에 실패하면(`other-live` rc `3` 또는 `unknown` rc `4`/`1`) 팀원 구성을 즉시 중단하고 사용자에게 보고한다(탑주가 기동한 팀장의 실제 잠금 인계는 **미실측**).
+- **(c) 팀원 구성과 준비 미확인(rc `2`) 처리:**
+  - Core 팀장에서 `GJCH_CORE=1 GJCH_EXTERNAL_LEAD=1 scripts/team-up.sh --up`(또는 `--spawn`)을 실행하면 `gjch-mate`(`team=gjch`, `role=mate`, `agy`)와 `gjch-critic`(`team=gjch`, `role=critic`, `codex`)을 `hc run --bg --json --no-notify --no-parent`로 띄우고 끝에 `--check` 요약을 출력한다.
+  - `--up` 직후 끝 요약이 종료 코드 `2`(`unknown`, 예: 막 뜬 `mate`의 `reported=false` 또는 `critic`의 foreground 미관측)로 나오는 것은 **준비 미확인** 상태이므로 그 이유가 초기 준비 지연으로 확인된 경우에 한해 정상 기동 과정으로 다루고(라벨 중복·조회 오류·잠금 unknown 등 다른 이유의 `2`는 그대로 확인한다), 잠시 뒤 후속 `GJCH_CORE=1 GJCH_EXTERNAL_LEAD=1 scripts/team-up.sh --check`(및 `--status`)를 실행해 `0`(`ok`)이 되는지로 판단한다(특정 대기 초수를 고정 규칙으로 두지 않는다; 로컬 1회 실측에서 기동 후 약 50초 뒤 `--check` `0` 확인).
+- **(d) 되돌리기 (Core → Herdr):**
+  1. Core 팀원이 진행 중인 작업이 없음을 확인한 뒤 `GJCH_CORE=1 GJCH_EXTERNAL_LEAD=1 scripts/team-up.sh --down`으로 `gjch-mate`·`gjch-critic` 터미널을 종료·제거(`hc kill` → `state=finished` 확인 → `hc rm`)한다.
+  2. Core 팀장이 `GJCH_CORE=1 GJCH_EXTERNAL_LEAD=1 scripts/team-up.sh --lock release`(또는 `scripts/team-lead.sh release`)로 잠금을 놓는다.
+  3. 돌아갈 옛 팀장(Herdr 안 또는 외부 팀장)이 `scripts/team-lead.sh claim`으로 잠금을 확보하고 `mine`을 확인한 뒤, `GJCH_CORE`를 비우고 기존 Herdr 경로(`GJCH_EXTERNAL_LEAD=1 scripts/team-up.sh --up` 또는 Herdr 안 `scripts/team-up.sh --up`)로 팀원을 복구한다([work-records.md](work-records.md) 이주 요청 ⑤와 같이 팀원 복구만으로 전체 되돌리기 완료로 보고하지 않는다).
+- **(e) 운용 사실 (`agy` 과제 뒤 `done`과 다음 배정):**
+  - 로컬 Core 1회 실측에서 `agy`(`gjch-mate`)는 첫 과제를 마친 뒤 `status.state=done`(`reported=true`)에 머물렀다(`foreground`는 그대로 유지).
+  - `hc send --if idle`은 `done` 대상을 `status_mismatch`로 거부하므로, `done`에 머문 `gjch-mate`에 다음 과제를 배정할 때는 팀장이 먼저 `hc get --json <주소>`로 `state=live`·`reported=true`·`status.state=done`(`blocked`·`working`·`error` 아님)과 사용자 직접 입력이 없음을 확인한 뒤, `--if` 없이 `hc send --json <주소> "<짧은 지시>"`를 **1회** 보내고 응답 JSON의 수락(`started`·`turn`)을 확인한다.
+  - `timeout`이나 불확실 응답 뒤에는 미전달로 단정해 무조건 재전송하지 않고 `hc get --json` 상태와 결과 파일부터 확인한다(`done` 상태 대상에 `--if` 없이 보낸 다음 배정이 실제로 새 과제를 시작하는지는 **미실측**).
+- **(f) 확인창 (`blocked`):**
+  - Core에서는 화면 읽기(`hc read`/`attach`)를 쓰지 않으므로 `scripts/mate-watch.sh`(`core-mate-watch.sh`)와 `python3 scripts/dialog-watch.py`(`core-dialog-check.py`)는 `status.state == "blocked"`일 때 `DIALOG <role> <kind> msglen=<n>`(종료 코드 `10`, `status.msg` 원문 미출력)만 알리고 멈춘다.
+  - 화면에서 명령 전문을 읽을 수 없으므로 Herdr의 `agy` 명령·편집 확인창 「이번만」 팀장 위임은 Core에서 적용하지 않는다. 모든 `DIALOG`는 사용자에게 알리고 사용자 조치를 기다리며, `hc keys`나 `hc send --force`로 응답하지 않는다(Core에서 실제 `blocked` 발생은 **미실측**).
+- **(g) `scripts/check-env.sh` Core 분기:**
+  - `GJCH_CORE=1`로 실행하면 `herdr`·Sidebar 설정·`herdr pane process-info` 점검 대신 `hc --version`, `hc server status --json`(`core.name`·`live`·`finished` 확인 및 민감 문자열 가림), `Core 외부 팀장 모드(GJCH_CORE=1, GJCH_EXTERNAL_LEAD=1)`, 팀장 잠금(`core_lock_class`: `mine`·`none`·`other-live`·`stale`·`unknown`), `scripts/core-team.sh --check` 요약(`rc 0`은 `OK`, `rc 1`은 `FAIL`, `rc 2`는 `WARN`)을 점검한다.
+
 ## 3. 새 컴퓨터에서 AI가 따를 환경 구축 절차
 
 사용자가 저장소 주소(`https://github.com/mrsono0/gjc-herdr.git`)만 줬을 때 순서대로 진행한다.
@@ -257,6 +315,16 @@ herdr `[session] resume_agents_on_restore`는 네 팀 공용 설정이라 GJCH�
   지시서 첫머리에 제1원칙(파일 수정이 필요하면 먼저 팀장 허락)을 적고, 결과는 **지정한 gitignore 경로의 파일**(예: `.local/critic/<이슈>-r<회차>.md`)로 쓰고 경로를 회신하도록 적는다. pane 출력은 접혀 보일 수 있고 working 중에는 read가 불가하므로, 완료·idle/done을 확인한 뒤 그 파일을 읽어 본문을 받는다. Codex → 팀장 직접 호출은 기대하지 않는다(샌드박스는 없지만 직접 호출 경로는 미확인이다). timeout이면 자동 재전송·`/new` 입력을 하지 말고 공개 상태와 결과 파일의 완료 여부부터 확인한다.
 - 큰 근거·로그는 채팅에 붙이지 말고 파일 경로와 sha256으로 공유한다.
 
+**Core(`herdr-core`, `GJCH_CORE=1`) 대화 방법 대응표:**
+
+| 작업 | Herdr 경로 | Core(`GJCH_CORE=1`) 경로 |
+|---|---|---|
+| 팀 구성·점검·정리 | `scripts/team-up.sh --up \| --check \| --status \| --lock …` | `GJCH_CORE=1 GJCH_EXTERNAL_LEAD=1 scripts/team-up.sh --up \| --check \| --status \| --lock … \| --down` (`scripts/core-team.sh` 실행; `--layout`·`--report-resume`는 미지원 rc `2`) |
+| 팀장 → 구현 팀원(`agy`) 배정 | `herdr agent prompt gjc-herdr-mate "<지시>"` | 첫 배정(`idle`): `hc send --json --if idle <mate 주소> "<지시>"` / 직전 과제 뒤 `done`: §2.4 (e) 절차대로 `state=live`·`reported=true`·`status.state=done` 확인 후 `hc send --json <mate 주소> "<지시>"` 1회(**미실측**) |
+| 구현 팀원 감시 | `scripts/mate-watch.sh <결과 파일> "<완료 줄>"` | `GJCH_CORE=1 GJCH_EXTERNAL_LEAD=1 scripts/mate-watch.sh <결과 파일> "<완료 줄>"` (`scripts/core-mate-watch.sh`; `0` DONE / `1` TIMEOUT / `2` 인자·가드 / `10` DIALOG / `11` NO_RESULT / `12` UNKNOWN) |
+| 확인창 감시 | `python3 scripts/dialog-watch.py [--once]` | `GJCH_CORE=1 python3 scripts/dialog-watch.py [--once]` (`scripts/core-dialog-check.py`; `--once`: `none`=`0` / `DIALOG`=`10` / `UNKNOWN`=`2`; 상시: `UNKNOWN` 줄 출력 후 계속 감시, 새 `DIALOG`=`10`, `--timeout` 도달=`0`; 인자·가드: `GJCH_TEAM_ROLE` 설정·연결 worktree는 `0`, `GJCH_CORE != 1`·잘못된 인자는 `2`, `GJCH_EXTERNAL_LEAD != 1`·경로 오류는 `--once`만 `2`이고 상시는 `0`) |
+| 팀장 → 검토(`Codex`) 전송 | `scripts/critic-send.sh --result <결과 파일> <지시서>` (화면 확인 후 `/new`) | `GJCH_CORE=1 GJCH_EXTERNAL_LEAD=1 scripts/critic-send.sh --result <결과 파일> <지시서>` (`scripts/core-critic-send.sh`: 화면 읽기·`/new` 대신 기존 소유 `critic`이 `live`·`reported=true`·`idle`/`done`임을 확인한 뒤 `hc kill` → `state=finished` 확인 → `hc rm` → `hc run`으로 **회차마다 교체 기동** 후 `reported=true`·`status.state=idle` 확인 뒤 `hc send --json --if idle --wait` 1회 전송; `0` 완료 / `1` 전제·교체·전송 실패 / `2` 대기 timeout / `4` 결과 파일 미작성 / `5` `blocked` 감지) |
+
 ### GJC 관측 절차 (필요할 때만 임시 실행)
 
 GJC는 상시 팀원이 아니며, 플러그인 로드·token 표시·`/herdr-send`·`/herdr-call` 실동작 관측이 필요할 때만 팀장이 임시 탭을 만들어 띄우고 관측한 뒤 닫는다.
@@ -267,6 +335,7 @@ GJC는 상시 팀원이 아니며, 플러그인 로드·token 표시·`/herdr-se
    - **GJC 관측 세션 → 팀장 등 감지 에이전트:** 이 플러그인의 `/herdr-call` 또는 `herdr_agent_call`(대상 `gjc-herdr-lead` 등)을 써서 호출·회수한다(외부 팀장 모드에서는 팀장에게 Herdr pane이 없어 `gjc-herdr-lead` 호출이 `No Herdr agent is named gjc-herdr-lead`(delivery `not_sent`)로 실패한다 — 2026-10-16 실측, 구조상의 결과이며 플러그인 결함이 아니다. 팀장은 `send --wait` 응답 JSON의 `result.statusDetail.content.text`로 답을 받고, 지난 출력은 `gjc sdk session tail <session_id> --json`으로 다시 읽는다). 입력 보호를 거치지 않는 bash의 `herdr agent prompt`·`herdr pane send-text`/`send-keys` 직접 호출은 하지 않는다.
    - **슬래시 명령:** `/rename` 등은 SDK 텍스트로 실행되지 않는다. 필요하면 사용자 승인 후 대상 pane의 idle·비포커스·빈 입력란을 먼저 확인하고 `herdr pane send-text <pane-id> "/명령"` + `herdr pane send-keys <pane-id> enter`를 쓴다(`pane` 명령은 pane ID만 받는다).
 3. **종료·정리:** 관측과 근거 수집이 끝나면 임시 GJC를 `/exit`로 정상 종료하고 팀장이 만든 임시 탭을 닫는다.
+- **Core(`hc`) 환경에서의 GJC 관측:** `hc` 터미널 안에서의 대화형 GJC 실행·관측은 현재 지원하지 않으며 별도 이슈로 다룬다(**미실측**).
 
 ### 우편 받기(팀장)
 
@@ -326,7 +395,7 @@ GJC는 상시 팀원이 아니며, 플러그인 로드·token 표시·`/herdr-se
 | `auth-error` | `agy` · `Codex` | `refresh token was already used` · `sign in again` | 사람이 다시 로그인 |
 | `question` | `agy` · `Codex` | (blocked일 때만) | 사용자 |
 
-판정은 `scripts/dialog-watch.py`이며, 판정 글자를 바꾸면 이 표도 함께 고친다.
+판정은 `scripts/dialog-watch.py`이며, 판정 글자를 바꾸면 이 표도 함께 고친다. Core(`GJCH_CORE=1`, `scripts/core-dialog-check.py`·`scripts/core-mate-watch.sh`)는 화면 글자를 읽지 않고 `hc get --json`의 `status.state == "blocked"`와 `status.kind`(`permission` / `question` / `auth`, 그 밖은 `null` 또는 `other`) 및 `status.msg` 길이(`msglen=<n>`, 원문 미출력)만으로 판정한다.
 
 ## 6. 자주 있는 문제
 
@@ -359,5 +428,10 @@ GJC는 상시 팀원이 아니며, 플러그인 로드·token 표시·`/herdr-se
 | `GJCH: 이 세션은 연결 worktree(...)에서 실행 중이라 팀장으로 동작하지 않습니다.` / `연결 worktree(...)에서 실행 중입니다.` | 데스크톱 Code 탭의 worktree 옵션 등으로 `<저장소>/.claude/worktrees/<이름>` 사본이나 Git 연결 worktree에서 실행되어 `ROOT`가 원래 저장소와 어긋난 상태다(#43). 네 진입점(`team-lead.sh`·`team-up.sh`·`critic-send.sh`·`check-env.sh`)은 잠금이나 Herdr 작업공간을 건드리지 않고 거절(또는 `check-env.sh`에서 `FAIL` 표시)하며, 경로에 `/.claude/worktrees/`가 있으면 일반 저장소여도 거절한다(우편 스크립트 `mail-*.sh`는 이 검사를 하지 않으며 후속은 별도 이슈다). 데스크톱 세션의 worktree 옵션을 끄고 원래 저장소 루트 폴더에서 새 세션을 연다 |
 | `↳ <이름> 옵션 불일치: ...` / `↳ <이름> 옵션 판정 불가: ...` (`team-up.sh`·`check-env.sh`) | 팀원이 시작 옵션 없이(`agy --conversation <id>`, `codex resume <id>` 등) 떠서 `--sandbox`·모델·상태 줄 설정 등이 빠진 상태이거나(복원이 켜져 있던 2026-10-27 전에는 Herdr 서버 재시작 뒤 native 세션 복구가 재개 명령을 보고하지 않은 팀원을 이렇게 띄웠다), 작업 중 자식 프로세스 등으로 foreground argv를 판정할 수 없는 상태다(#42, `--model=x` 같은 `=` 결합형 옵션은 지원하지 않으며 분리형 `--model x`만 비교하므로 결합형은 `없음`으로 판정). 스크립트는 자동 `/quit`·재시작을 하지 않고 안내 후 비0(hook 문맥은 3초 공통 기한 안에서 동기 점검하며 `GJCH: ` 접두사로 stdout 안내 후 0, 기한 초과 시 `GJCH: ↳ 팀원 옵션 점검 시간 초과 — scripts/check-env.sh로 다시 점검`)으로 끝난다. 판정 불가 뒤에 `(작업 중 — 다시 점검)`이 붙으면 팀원이 `idle`/`done`이 된 뒤 `scripts/check-env.sh`나 `scripts/team-up.sh --spawn`으로 다시 점검하고, 옵션 불일치이면 해당 팀원의 `idle`·빈 입력란 확인 → 그 pane에서 `/quit`으로 정상 종료 → `scripts/team-up.sh --spawn`(외부 팀장 모드는 `GJCH_EXTERNAL_LEAD=1 scripts/team-up.sh --spawn`)으로 다시 띄운다 |
 | Codex가 "This conversation is open in another app"에서 멈춤 | 복원이 켜져 있던 2026-10-27 전, 기본 복원(옵션 없음)을 거친 대화에 나중에 `--report-resume`로 보고했을 때 관측됨(원인 추정). 그 pane에서 `/quit`으로 정상 종료한 뒤 `scripts/team-up.sh --up`(외부 팀장은 `GJCH_EXTERNAL_LEAD=1 scripts/team-up.sh --up`)으로 다시 띄운다 |
+| Core에서 `<team>-mate 기동 실패: name_taken` (또는 `<team>-critic`) | 같은 이름의 터미널(이전에 끝나고 `state=finished`로 남은 터미널 또는 라벨 없는 동명 터미널)이 남아 있다. `hc ls --all --json`으로 확인하고, 우리 팀 라벨(`team=gjch`)의 종료된 팀원이면 `GJCH_CORE=1 GJCH_EXTERNAL_LEAD=1 scripts/team-up.sh --down`으로 정리한 뒤 다시 `--up`한다 |
+| Core에서 `오류 duplicate_label (2개 이상, 기동 안 함)` / `라벨 중복(2개 이상), 중지 안 함` | 같은 `team=<팀>`·`role=<역할>` 라벨을 가진 터미널이 둘 이상이다. 스크립트는 임의로 하나를 고르지 않고 멈추므로 `hc ls --all --json --label team=<팀> --label role=<역할>`로 확인해 중복 터미널을 정리한 뒤 다시 실행한다 |
+| Core에서 종료된(`state=finished`) 터미널이 남아 이름·라벨을 차지함 | `hc kill`이나 프로세스 종료 뒤 터미널이 `finished` 상태로 남으면 `hc rm` 전까지 이름과 라벨이 유지된다. `GJCH_CORE=1 GJCH_EXTERNAL_LEAD=1 scripts/team-up.sh --down`(`--all` 조회로 `finished` 터미널까지 `hc rm` 수행)으로 정리한다 |
+| Core에서 `--up` 직후 `--check` 요약이 종료 코드 `2`(`unknown`) | 이유 줄이 막 기동한 `mate`의 `reported=false`이거나 `critic`의 foreground 프로세스 미관측이면 **준비 미확인** 상태다(로컬 1회 실측; 라벨 중복·조회 오류·잠금 unknown 등 다른 이유의 `2`는 별개). 그 경우 기동 실패가 아니므로 잠시 뒤 `GJCH_CORE=1 GJCH_EXTERNAL_LEAD=1 scripts/team-up.sh --check`를 다시 실행해 `0`(`ok`)을 확인한다 |
+| Core에서 `done` 상태인 대상에 `hc send --if idle`이 `status_mismatch`로 거부됨 | `agy`(`gjch-mate`)가 직전 과제를 마친 뒤 `status.state=done`에 머물러 있으면 `--if idle` 조건과 맞지 않는다. 플러그인 `hc` 백엔드(`/herdr-send`, `/herdr-call`)는 안전 계약상 `--if idle` 고정이라 `done` 대상을 거부하며, 팀장이 `gjch-mate`에 다음 배정을 보낼 때는 §2.4 (e) 절차를 따른다 |
 
 더 자세한 사용법은 [README](../README.md)를 참조한다.

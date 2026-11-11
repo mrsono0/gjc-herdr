@@ -36,6 +36,19 @@ Herdr 안에서 Claude Code(팀장)가 agy(구현 팀원)와 선택 Codex(독립
 
 Herdr 밖에서 실행하면 기본 모드에서는 팀 자동 구성과 표시 token이 동작하지 않는다(정상). Herdr 밖(데스크톱 앱 Code 탭 등)에서 팀장을 맡는 외부 팀장 모드와 팀장 이관 절차는 [docs/dev-environment.md](docs/dev-environment.md) §2.1–§2.2를 참조한다. 설치 상태는 언제든 `scripts/check-env.sh`로 다시 점검할 수 있다. 자세한 구성·대화 방법·문제 해결은 [docs/dev-environment.md](docs/dev-environment.md).
 
+**Core(`herdr-core`, `hc`) 변형**
+
+Herdr 서버 대신 `herdr-core`(`hc`) 데몬에서 팀장(`gjch-lead`)·구현 팀원(`gjch-mate`)·검토 팀원(`gjch-critic`)을 운용할 때는 `GJCH_CORE=1`(외부 팀장 `GJCH_EXTERNAL_LEAD=1` 함께 사용) 스위치를 켠다.
+
+```sh
+hc --version && hc server status --json
+GJCH_CORE=1 GJCH_EXTERNAL_LEAD=1 scripts/check-env.sh
+GJCH_CORE=1 GJCH_EXTERNAL_LEAD=1 scripts/team-up.sh --up
+```
+
+- `--up` 직후 끝의 `--check` 요약이 종료 코드 `2`(`unknown`)로 나오고 그 이유가 초기 준비 지연(`reported=false`·foreground 미관측)으로 확인되면, 잠시 뒤 `GJCH_CORE=1 GJCH_EXTERNAL_LEAD=1 scripts/team-up.sh --check`를 다시 실행해 `0`(`ok`)을 확인한다.
+- 팀장 기동 명령, 잠금 인계, 팀원 정리(`--down`) 및 Herdr로의 되돌리기 절차는 [docs/dev-environment.md](docs/dev-environment.md) §2.4를 참조한다.
+
 ## 설치 (한 줄)
 
 ```sh
@@ -186,6 +199,18 @@ gjc sdk session send <session-id> --text "요청" --wait --timeout-ms 150000
 
 GJC가 다른 에이전트에 보낼 때는 위 플러그인 명령·도구만 쓰고, 이 규칙을 팀 규칙 파일(`AGENTS.md` 등)에도 적는다. 사람이나 스크립트가 CLI를 직접 써야 하면 전송 전에 idle·비포커스·빈 입력란을 직접 확인한다. 이 저장소의 `scripts/critic-send.sh`가 이런 확인을 하는 예시다.
 
+### hc 백엔드 (herdr-core)
+
+- **백엔드 선택과 caller 조건:** `GJC_HERDR_BACKEND=herdr|hc`가 설정되면 그 백엔드를 강제 선택하고(그 밖의 값은 경고를 남기고 자동 선택으로 폴백), 미설정이면 공개 Herdr pane 환경이 감지될 때 `herdr`, 없고 `HC_TERMINAL_ID`가 비어 있지 않을 때 `hc`를 자동 선택한다(`GJC_HERDR_HC_BIN`으로 `hc` 바이너리 경로·이름 지정 가능, 기본 `hc`). `hc` 전용 환경에서는 Herdr 메타데이터 token 발행기·타이머를 등록하지 않는다. 보내는 쪽 프로세스에 유효한 터미널 주소 형식의 `HC_TERMINAL_ID`가 없으면 입력 0회 `not_sent`(`hc caller unknown`)로 거부하고, 자기 자신(주소 일치 또는 이름으로 해석된 주소 일치)으로의 전송도 입력 0회 `not_sent`로 거부한다.
+- **텍스트 전용·세션 토큰 없음·화면 읽기 없음:** `hc` 백엔드는 `hc send --json --if idle [--wait --timeout <초>] <대상> <텍스트>`를 단 1회 호출해 **텍스트만 전달**한다(`hc: text delivery only; no GJC session token; idle targets only`). GJC 세션 ID 토큰(`gjc_herdr_session_id`)이나 `gjc sdk session send`를 사용하지 않으며, 화면 읽기(`hc read`/`attach`)나 별도 Enter 키 전송(`hc keys`)을 수행하지 않는다. `-`로 시작하는 텍스트는 CLI 옵션 오인을 막기 위해 전송 전 `not_sent`(`text starting with '-' unsupported on hc`)로 거부하며 `--`를 끼워 넣지 않는다.
+- **원격 주소 및 `--raw`·`--raw --wait` 허용:** 대상은 로컬 주소(`t2`), 원격 주소(`machine/t2`), 또는 `hc ls --json`에서 유일하게 해석되는 터미널 이름이다(원격 주소 허용은 텍스트 전달에 한하며 원격 답변 파일 회수는 지원하지 않는다). `--raw`와 `--raw --wait`도 별도 저수준 키 입력 없이 동일한 `hc send --json --if idle` 경로를 1회 실행하며 함께 쓸 수 있다.
+- **`idle` 전용·무인 전제 미검증·`done` 뒤 자동 후속 불가:** 항상 `--if idle`을 붙여 보내므로 대상이 `idle`이 아니면(`working`·`done`·`blocked` 등) 입력 전에 `not_sent`(`status_mismatch` 등)로 거부된다. `idle`은 빈 입력란이나 사람 부재의 증거가 아니며 플러그인은 무인(unattended) 전제를 검증하거나 사람 draft 보호를 보장하지 않는다. 한 턴이 끝난 뒤 `done` 상태에 머무는 대상에는 자동으로 후속 프롬프트를 보낼 수 없다.
+- **`status: "sent"`(전달 확인)와 완료 확인(`ok: true`)의 차이 및 재전송 금지:**
+  - (1) **상위 `SendResult` 손상 또는 전송 단계 불확실 실패:** `hc send`가 종료 코드 `0`이라도 JSON이 아니거나 상위 `SendResult` 필드 타입(`turn` 음이 아닌 안전 정수, `started` 불리언/null/생략, `status` 문자열/null/생략)이 유효하지 않으면 전달 여부를 알 수 없는 `ok: false, status: "uncertain"`으로 분류한다(`unavailable`·`cancelled`·`needs_target`·미인식 오류 봉투·프로세스 timeout/abort도 같음). 반면 `hc send` 실패 중 입력 전 거부가 확인된 7종(`status_mismatch`, `blocked`, `finished`, `not_found`, `machine_unknown`, `invalid_params`, `config`)만 `status: "not_sent"`이다.
+  - (2) **정상 제출 확인 뒤 중첩 `wait` 파싱 실패:** `hc send`가 종료 코드 `0`이고 상위 `SendResult` 필드 타입(`turn`·`started`·`status`)이 모두 유효하면 텍스트 제출이 확인된 `mode: "hc", status: "sent"`가 된다(`--wait` 없이 보냈을 때 중첩 `wait`가 없거나 유효하면 `ok: true, status: "sent"`이며 턴 완료 대기는 하지 않음). 이 상태에서 중첩 `wait` 객체 파싱만 실패한 경우(`!waitValid`)에는 텍스트는 이미 제출됐으므로 `status: "uncertain"`이 아니라 `ok: false, status: "sent"`로 보고한다.
+  - (3) **`--wait` 시 `wait` 결과 부재(`null`/`undefined`)와 `started: false`:** `--wait`(및 `--raw --wait`)를 요청했는데 중첩 `wait` 결과가 없을 때만 `started === false`(`start was not observed; no wait result; completion unconfirmed`)와 일반 `wait` 누락을 별도 완료 미확인(`ok: false, status: "sent"`) 분기로 나눈다.
+  - (4) **유효한 `WaitResult` 상관 판정:** 유효한 `WaitResult`가 있으면 상위 `started` 값과 무관하게 `waited: { reason, status, ended, turn }`을 담고 대상 터미널 일치(`terminal === addr`)·`ended`·`reason`·`status`·`turn` 상관으로 판정한다. 같은 대상에서 `ended === true && reason === "status" && (status === "idle" || status === "done") && turn >= send.turn + 1`일 때만 `ok: true, status: "sent"`이고, `terminal` 불일치·`reason`이 `timeout`/`message`/`not_started`/`exit`·`status`가 `blocked`/`error`·완료 응답에서 `turn < send.turn + 1`·그 밖의 미완료 상태는 모두 `ok: false, status: "sent"`이다. `status: "sent"`와 `status: "uncertain"`은 어떤 경우에도 **재전송하지 않는다**.
+
 ## 감지 agent 호출 (v0.3.0)
 
 Herdr가 **감지한** 다른 pane의 에이전트(Claude Code, Codex 등 Herdr 0.9.3이 알아본 종류)에게 프롬프트를 보내고, 그 답변 본문을 되돌려받는다. 전달·대기·회수 모두 Herdr 공개 CLI(`herdr agent prompt --wait` / `herdr agent read`)를 쓰며 스크래핑이나 `--raw` 입력은 사용하지 않는다.
@@ -211,6 +236,18 @@ Herdr가 **감지한** 다른 pane의 에이전트(Claude Code, Codex 등 Herdr 
 - 감지 종류가 아니어도 Herdr가 프롬프트를 받아들이는 관리 대상이라면 호출될 수 있다. GJC 대상은 `herdr_send`를 쓴다(Herdr가 `gjc`를 감지 종류로 취급하지 않음).
 - `agent_prompt_stalled`·전송 후 `blocked`의 실측 재현은 하지 못했다(단위 계약 매핑만 존재). 실제 환경에서 관측되면 상태 표기 그대로 보고된다.
 - Claude Code는 답변 첫 줄에 `⏺ ` 불릿을 붙이고 본문을 들여쓰기해 표시한다. 회수는 이런 터미널 장식(불릿·인용·들여쓰기)을 허용·정리하며, 문장 중간의 표식 언급(프롬프트 에코)은 표식으로 치지 않는다. Claude Code 대상은 화면 높이를 넘는 답의 시작 표지를 `--source recent`로 다시 읽으며(접힌 프롬프트 에코는 제외), 긴 답에는 `result_file` 모드를 권한다.
+
+### hc 백엔드 (herdr-core)
+
+- **백엔드 선택과 caller 조건:** 위 "프롬프트 전달 — hc 백엔드"와 같이 `GJC_HERDR_BACKEND` 또는 `HC_TERMINAL_ID`로 `hc` 백엔드가 선택되며, 유효한 터미널 주소 형식(`isValidHcAddress`)의 `HC_TERMINAL_ID`가 없으면 입력 0회 `status: "not_sent"`, `delivery: "not_sent"`, `error.code: "invalid_request"`(`hc caller unknown`)로 거부한다. 자기 자신(주소 또는 이름 해석 결과) 호출도 입력 0회 `status: "not_sent"`, `delivery: "not_sent"`, `error.code: "self_target"`으로 거부한다.
+- **필수 로컬 결과 파일(`--result-file` / `result_file`)과 원격 주소 거부:** `hc` 백엔드는 화면 읽기(`hc read`/`attach`)를 전혀 하지 않으므로 `--result-file <절대 경로>`(도구는 `result_file`)가 **필수**이며, 생략하거나 유효하지 않은 경로·이미 존재하는 경로이면 입력 0회 `status: "not_sent"`, `delivery: "not_sent"`, `error.code: "invalid_request"`로 거부한다. 같은 로컬 파일시스템에서 결과 파일을 직접 열어 검증·회수해야 하므로 원격 대상(`machine/t2` 또는 원격 주소로 해석되는 이름)은 입력 0회 `status: "not_sent"`, `delivery: "not_sent"`, `error.code: "invalid_request"`(`remote result file recovery unsupported`)로 거부한다. 회수된 답변의 `markerVerified`는 항상 `false`이며 화면 `capture`는 포함하지 않는다.
+- **`idle` 전용·무인 전제 미검증·`done` 뒤 자동 후속 불가:** 이 플러그인 인스턴스에서 같은 대상에 이미 호출이 진행 중(`inFlight`)이면 `status: "not_sent"`, `error.code: "target_busy"`로 거부한다. 사전 `hc get --json`에서는 대상이 `state === "live" && reported === true && status.state === "idle"`일 때만 전송하며, 그 밖의 상태는 모두 입력 0회 `status: "not_sent"`, `delivery: "not_sent"`로 거부한다(`state === "finished"` → `error.code: "terminal_finished"`, `reported !== true` → `error.code: "not_reported"`, `status.state === "done"` → `error.code: "agent_done"`, `status.state === "working"` → `error.code: "agent_busy"`, `status.state === "blocked"` → `error.code: "agent_blocked"`, 그 밖의 비-`idle` 상태 → `error.code: "agent_state_unknown"`). 전송도 `hc send --json --if idle --wait`로만 수행한다. Herdr 모드와 달리 준비 대기 루프(`GJC_HERDR_INPUT_WAIT_SEC`)나 화면 입력란 검사를 하지 않으므로 무인(unattended) 전제는 검증되지 않으며, 한 턴 뒤 `done`에 남는 대상의 반복 자동 호출은 지원하지 않는다.
+- **제출 확인(`delivery: "submitted"`)과 완료·답변 회수(`status: "answered"`)의 차이 및 재전송 금지:**
+  - **호출 예산과 후속 `hc wait` 조건:** 총 호출 예산은 60초 고정이며, 파일 회수 여유(5초)를 뺀 대기 예산 안에서 `hc send --json --if idle --wait --timeout <초>`를 1회 실행한다. 반환된 `WaitResult`가 같은 대상(`terminal === addr` 및 단조 `turn`)이고 `ended === false`, `reason === "timeout"` 또는 `"message"`, `status === null` 또는 `"working"`이며 대기 예산이 남아 있을 때만 **재전송 없이** `hc wait --json <주소> --timeout <초>`로 완료 대기를 이어간다(대상·`turn` 확인과 `not_started`·`exit`·`blocked`·`error`의 개별 처리를 거친 나머지 `ended === false` 응답에서 `reason`이 `timeout`/`message`가 아니거나 `status`가 `null`/`working`이 아니면 재대기하지 않고 `status: "uncertain", delivery: "submitted", error.code: "protocol"`로 종료한다).
+  - (1) **상위 `SendResult` 손상 또는 전송 단계 불확실 실패:** `hc send` 단계에서 입력 전 거부가 확인된 7종만 `status: "not_sent", delivery: "not_sent"`이고, `unavailable`·`cancelled`·`needs_target`·미인식 오류·프로세스 timeout/abort와, 종료 코드 `0`이라도 상위 `SendResult` 필드 타입(`turn` 음이 아닌 안전 정수, `started` 불리언/null/생략, `status` 문자열/null/생략)이 손상된 경우는 모두 `status: "uncertain", delivery: "unknown"`(`error.code: "protocol_error"` 등)이다.
+  - (2) **정상 제출 확인 뒤 중첩 `wait` 손상:** `hc send`가 종료 코드 `0`이고 상위 `SendResult` 필드 타입이 모두 유효하면 `delivery: "submitted"`가 확정된다. 이 상태에서 `send.turn < preflight.turn`이거나 중첩 `wait` 파싱이 실패한 경우(`!waitValid`, 또는 후속 `hc wait`의 `WaitResult` 파싱 실패)에는 `delivery: "unknown"`이 아니라 `status: "uncertain", delivery: "submitted", error.code: "protocol"`로 보고한다.
+  - (3) **`wait` 결과 부재(`null`/`undefined`)와 `started: false`:** 유효한 제출 뒤 중첩 `wait`가 없을 때(`null`/`undefined`)만 `started === false`를 별도 분기(`status: "stalled", delivery: "submitted", error.code: "stalled"`)로 처리하고, 그 밖의 `wait` 누락은 `status: "uncertain", delivery: "submitted", error.code: "protocol"`로 처리한다.
+  - (4) **유효한 `WaitResult` 상관 판정:** 유효한 `WaitResult`가 있으면 상위 `started` 값과 무관하게 대상 일치·`ended`·`reason`·`status`·`turn` 상관으로 판정한다(모두 `delivery: "submitted"`): `reason === "not_started"` → `status: "stalled", error.code: "stalled"`; `reason === "exit"`(`ended === true`) → `status: "response_unverified", error.code: "terminal_finished"`(`ended !== true`이면 `status: "uncertain", error.code: "protocol"`); 제출 뒤 `status === "blocked"` → `status: "response_unverified", error.code: "agent_blocked"`; 제출 뒤 `status === "error"` → `status: "response_unverified", error.code: "agent_error"`; 완료 응답(`ended === true`)에서 `terminal` 불일치·`reason !== "status"`·`status`가 `idle`/`done` 아님·`turn < send.turn + 1`(`turn` 미진행) → `status: "uncertain", error.code: "protocol"`; 대기 예산 소진 → `status: "uncertain", error.code: "timeout"`. 정상 settle(`ended === true && reason === "status" && (status === "idle" || status === "done") && turn >= send.turn + 1`) 뒤 결과 파일 검증이 통과하면 `ok: true, status: "answered", delivery: "submitted"`를 반환하고, 결과 파일 미생성(`result_file_missing`)·무효(`result_file_invalid`)는 `status: "response_unverified"`, 파일 I/O 시간 초과는 `status: "uncertain", error.code: "timeout"`, 파일 읽기 abort는 `status: "read_failed", error.code: "aborted"`를 반환한다. `delivery: "submitted"`와 `delivery: "unknown"`은 어떤 경우에도 **재전송하지 않는다**.
 
 ### Herdr agent skill 안내
 
@@ -254,7 +291,8 @@ gjc
 | 최신 설치·업데이트 | 격리 registry에서 tag 없는 명령이 `main`(= `v0.2.0` commit)을 설치함을 확인. 이전 commit에 고정된 설치는 같은 명령 재실행·`--force`로 바뀌지 않고, 제거 후 설치하면 최신으로 바뀜을 확인(다른 plugin 유지) |
 | marketplace 설치 (미지원) | GJC 0.18.7에서 실험됨: `.claude-plugin/marketplace.json` catalog로 `marketplace add`·`discover`·`install`·`uninstall`은 동작하지만, marketplace 설치는 `plugins/cache/plugins/…` 복사본으로만 존재하고 session의 extension loader는 `plugins/package.json` + `plugins/node_modules`만 읽어서 `gjc.extensions`가 로드되지 않음(같은 격리 root에서 git 설치 대조군은 token 발행). catalog는 되돌림(22d8076). 근거 `.local/verification/marketplace-20261006/`
 | 감지 agent 호출 (0.3.0) | GJC 0.18.7·Herdr 0.9.3, 로컬 build로 실제 감지 Claude Code(v2.1.292) 대상 실증: 도구·명령 두 경로 모두 표식 답변 본문 회수(`answered`), reported-only·미존재 대상 `not_sent`(입력 0회), 사전 `blocked` 무전송, 장문 과제 `timeout`→원격 계속 실행, 파일 fallback 실측 — 문서화된 **호출자 2단 절차**(제품 코드 아님): 경로만 답변받아 회수한 뒤 호출자가 파일을 구간별로 읽어 1–170행 누락 없이 확인. stalled·전송 후 blocked는 실측 미재현(단위 매핑만). 감지 제품 1종(Claude Code) 실측. 근거 `.local/`(비공개) |
-| 개발 검증 | typecheck·Bun 1.4.3 고정 build·단위 테스트 33개(metadata 5, 전달 11, 호출 17) |
+| Core(`hc`) 스크립트·플러그인 `hc` 백엔드 | 모의(stub) 단위·경계 테스트로 Core 팀 운영 스크립트(`core-team.sh`, `core-mate-watch.sh`, `core-dialog-check.py`, `core-critic-send.sh`)와 플러그인 `hc` 백엔드(`src/hc.ts`, `send.ts`, `call.ts`, `extension.ts`) 검증. 로컬 `hc` 1회 정상 경로에서 팀원 기동(`--up` 직후 준비 미확인 rc `2` → 후속 `--check` `ok`)·`check-env` Core 분기·`dialog --once`·`agy` 1회 과제 완료(과제 뒤 `done`)·`Codex` 교체 기동 후 검토 회수·`--down` 정리를 관측. **실제 `hc` 터미널 안 GJC 실사용(플러그인 로드·`/herdr-send`·`/herdr-call` 라이브 실행), `done` 상태 대상 다음 배정, 실제 `blocked` 발생, 재부팅 뒤 수명, 원격 호스트 동거 운용, 탑주 기동 팀장 잠금 인계는 미검증(미실측)** |
+| 개발 검증 | typecheck·Bun 1.4.3 고정 build·단위 테스트(Herdr 및 Core/`hc` 모의 테스트 포함) |
 
 화면 검증은 최종 screenshot 기준이며 모든 UI 전환의 자동 녹화가 아니다. Provider 검증은 위 경로 2개에 한정하며 모든 provider·OAuth 계정이나 다른 runtime 환경의 성공을 보장하지 않는다. Native reporter 대체·권한 위임, 플러그인 주도 fixed-file cold resume, cwd/context 통계, pane layout 제어는 제공하지 않는다. `이름@마켓플레이스` 형태의 marketplace 설치도 지원하지 않는다(위 표 참고).
 
@@ -268,7 +306,9 @@ cd gjc-herdr
 npm ci --ignore-scripts --no-audit --no-fund
 bun scripts/build.ts   # dist/extension.js 재생성 (source 변경 시 반드시 commit)
 npm run check
-npm test               # mock 기반 단위 테스트; 실제 Herdr E2E가 아님
+npm test               # mock 기반 단위 테스트; 실제 Herdr/hc E2E가 아님
 ```
+
+Core(`hc`) 관련 모의 테스트는 `test/hc.test.ts`(플러그인 `hc` 어댑터·백엔드 선택), `test/core-team.test.ts`, `test/core-mate-watch.test.ts`, `test/core-dialog-check.test.ts`, `test/core-critic-send.test.ts` 및 `test/send.test.ts`·`test/call.test.ts`·`test/metadata.test.ts`의 `hc` 경계 테스트에 있다.
 
 `dist/extension.js`는 Git에서 설치될 때 그대로 사용되므로 source와 함께 commit한다. Bun은 의존성 설치 시 build script를 실행하지 않는다. 번들 바이트는 Bun 버전에 따라 달라지므로 build는 `package.json`의 `engines.bun`(1.4.3)으로 고정되며, 다른 버전이면 `scripts/build.ts`가 중단한다. `npm run build`/`bun run build`는 상위 디렉터리의 `node_modules/.bin/bun`을 먼저 잡을 수 있으므로 `bun scripts/build.ts`로 직접 실행한다. tag 없는 설치가 `main`을 가져오므로 `main`에는 source·`dist`·version이 일치하는 release commit만 push하고, 미완성 작업은 별도 branch에서 한다. 각 release는 `package.json` version과 같은 tag(예: `v0.2.0`)도 함께 push한다. 라이선스는 MIT(`LICENSE`)다. 로컬 검증 기록·screenshot·workflow 원장·credentials·환경 의존 통합 검증 도구는 공개하지 않는다.
