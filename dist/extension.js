@@ -19322,6 +19322,708 @@ function createReporter(exec, pane, binPath) {
   };
 }
 
+// src/hc.ts
+var HC_ADDRESS_RE = /^(?:[a-z0-9_.-]+\/)?t[a-z0-9]+$/;
+var HC_NAME_RE = /^[a-z0-9_.-]{1,32}$/;
+var HC_SEND_NOT_SENT_KINDS = new Set([
+  "status_mismatch",
+  "blocked",
+  "finished",
+  "not_found",
+  "machine_unknown",
+  "invalid_params",
+  "config"
+]);
+var HC_SEND_ERROR_KINDS = new Set([
+  ...HC_SEND_NOT_SENT_KINDS,
+  "unavailable",
+  "cancelled"
+]);
+var HC_PRE_SEND_ERROR_KINDS = HC_SEND_ERROR_KINDS;
+var HC_WAIT_ERROR_KINDS = new Set([
+  ...HC_SEND_ERROR_KINDS,
+  "needs_target"
+]);
+var HC_ERROR_SPECS = {
+  status_mismatch: {
+    kind: "status_mismatch",
+    sendCertainty: "not_sent",
+    callCode: "status_mismatch",
+    message: "hc rejected the prompt before input (kind: status_mismatch): target status did not match --if idle.",
+    preSendMessage: "hc rejected the request before delivery (kind: status_mismatch); no input was sent."
+  },
+  blocked: {
+    kind: "blocked",
+    sendCertainty: "not_sent",
+    callCode: "agent_blocked",
+    message: "Target is blocked waiting for a user decision (kind: blocked); no input was sent.",
+    preSendMessage: "Target is blocked waiting for a user decision (kind: blocked); no input was sent."
+  },
+  finished: {
+    kind: "finished",
+    sendCertainty: "not_sent",
+    callCode: "terminal_finished",
+    message: "Target terminal has already finished (kind: finished); no input was sent.",
+    preSendMessage: "Target terminal has already finished (kind: finished); no input was sent."
+  },
+  not_found: {
+    kind: "not_found",
+    sendCertainty: "not_sent",
+    callCode: "target_not_found",
+    message: "hc target terminal was not found (kind: not_found); no input was sent.",
+    preSendMessage: "hc target terminal was not found (kind: not_found); no input was sent."
+  },
+  machine_unknown: {
+    kind: "machine_unknown",
+    sendCertainty: "not_sent",
+    callCode: "machine_unknown",
+    message: "hc target machine is unknown (kind: machine_unknown); no input was sent.",
+    preSendMessage: "hc target machine is unknown (kind: machine_unknown); no input was sent."
+  },
+  invalid_params: {
+    kind: "invalid_params",
+    sendCertainty: "not_sent",
+    callCode: "invalid_params",
+    message: "hc rejected the request parameters (kind: invalid_params); no input was sent.",
+    preSendMessage: "hc rejected the request parameters (kind: invalid_params); no input was sent."
+  },
+  config: {
+    kind: "config",
+    sendCertainty: "not_sent",
+    callCode: "hc_config",
+    message: "hc configuration error prevented the operation (kind: config); no input was sent.",
+    preSendMessage: "hc configuration error prevented the operation (kind: config); no input was sent."
+  },
+  unavailable: {
+    kind: "unavailable",
+    sendCertainty: "unknown",
+    callCode: "hc_unavailable",
+    message: "hc core or target was unavailable during send (kind: unavailable); delivery state is unknown. Do not resend.",
+    preSendMessage: "hc core or target was unavailable before delivery (kind: unavailable); no input was sent."
+  },
+  cancelled: {
+    kind: "cancelled",
+    sendCertainty: "unknown",
+    callCode: "hc_cancelled",
+    message: "hc send was cancelled (kind: cancelled); delivery state is unknown. Do not resend.",
+    preSendMessage: "hc request was cancelled before delivery (kind: cancelled); no input was sent."
+  },
+  needs_target: {
+    kind: "needs_target",
+    sendCertainty: "unknown",
+    callCode: "invalid_params",
+    message: "hc send failed with an unexpected error kind (needs_target); delivery state is unknown. Do not resend.",
+    preSendMessage: "hc rejected the request parameters before delivery (kind: needs_target); no input was sent."
+  }
+};
+function record(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value) ? value : undefined;
+}
+function parseJson(text) {
+  try {
+    return record(JSON.parse(text));
+  } catch {
+    return;
+  }
+}
+function isMissingExecutable(error) {
+  return error?.code === "ENOENT";
+}
+function isValidHcAddress(value) {
+  return HC_ADDRESS_RE.test(value);
+}
+function isRemoteHcAddress(address) {
+  return address.includes("/");
+}
+function isSelf(address, callerId) {
+  if (!callerId)
+    return false;
+  const normAddr = address.trim();
+  const normCaller = callerId.trim();
+  if (!isValidHcAddress(normAddr) || !isValidHcAddress(normCaller)) {
+    return false;
+  }
+  return normAddr === normCaller;
+}
+function isAllowedKindForPhase(value, phase) {
+  if (!value)
+    return false;
+  if (phase === "wait") {
+    return HC_WAIT_ERROR_KINDS.has(value);
+  }
+  if (phase === "send") {
+    return HC_SEND_ERROR_KINDS.has(value);
+  }
+  return HC_PRE_SEND_ERROR_KINDS.has(value);
+}
+function extractHcErrorKind(stderr, phase = "send") {
+  const parsed = parseJson(stderr);
+  if (!parsed)
+    return;
+  const errObj = record(parsed.error);
+  if (!errObj)
+    return;
+  const directKind = typeof errObj.kind === "string" ? errObj.kind : undefined;
+  if (isAllowedKindForPhase(directKind, phase)) {
+    return directKind;
+  }
+  const dataObj = record(errObj.data);
+  const nestedKind = typeof dataObj?.kind === "string" ? dataObj.kind : undefined;
+  if (isAllowedKindForPhase(nestedKind, phase)) {
+    return nestedKind;
+  }
+  return;
+}
+function inferPhase(args) {
+  const sub = args[0];
+  if (sub === "get")
+    return "get";
+  if (sub === "send")
+    return "send";
+  if (sub === "wait")
+    return "wait";
+  return "lookup";
+}
+function classifyHcFailure(phase, failureReason, code, errorKind, spawned = true) {
+  if (phase === "wait") {
+    let errorCode = "hc_unavailable";
+    let message = "hc wait is unavailable after prompt submission; the prompt was already submitted. Do not resend.";
+    switch (failureReason) {
+      case "aborted":
+        errorCode = "aborted";
+        message = "Local wait aborted after prompt submission; the target may still be running. Do not resend.";
+        break;
+      case "budget_exhausted":
+      case "timeout":
+        errorCode = "timeout";
+        message = "Call wait budget exhausted after prompt submission; the target may still be running. Do not resend.";
+        break;
+      case "invalid_json":
+        errorCode = "protocol";
+        message = "hc wait returned a malformed response after prompt submission; answer recovery skipped.";
+        break;
+      case "nonzero_exit":
+        if (errorKind) {
+          errorCode = HC_ERROR_SPECS[errorKind].callCode;
+          message = `hc wait failed after prompt submission (kind: ${errorKind}); the prompt was already submitted. Do not resend.`;
+        } else {
+          errorCode = "hc_unavailable";
+          message = "hc wait failed after prompt submission; the prompt was already submitted. Do not resend.";
+        }
+        break;
+    }
+    return {
+      ok: false,
+      phase,
+      code,
+      ...errorKind ? { errorKind } : {},
+      errorCode,
+      message,
+      certainty: "submitted",
+      failureReason
+    };
+  }
+  if (phase === "send") {
+    if (!spawned && failureReason === "aborted") {
+      return {
+        ok: false,
+        phase,
+        code,
+        errorCode: "aborted",
+        message: "Call aborted before delivery.",
+        certainty: "not_sent",
+        failureReason
+      };
+    }
+    if (failureReason === "budget_exhausted") {
+      return {
+        ok: false,
+        phase,
+        code,
+        errorCode: "timeout",
+        message: "Call budget exhausted before hc send.",
+        certainty: "not_sent",
+        failureReason
+      };
+    }
+    if (failureReason === "hc_missing") {
+      return {
+        ok: false,
+        phase,
+        code,
+        errorCode: "hc_unavailable",
+        message: "hc CLI executable is not available; no input was sent.",
+        certainty: "not_sent",
+        failureReason
+      };
+    }
+    if (failureReason === "aborted") {
+      return {
+        ok: false,
+        phase,
+        code,
+        errorCode: "aborted",
+        message: "Local wait aborted during hc send; delivery state is unknown and the target may still be running. Do not resend.",
+        certainty: "unknown",
+        failureReason
+      };
+    }
+    if (failureReason === "timeout") {
+      return {
+        ok: false,
+        phase,
+        code,
+        errorCode: "timeout",
+        message: "hc send timed out; delivery state is unknown and the target may still be running. Do not resend.",
+        certainty: "unknown",
+        failureReason
+      };
+    }
+    if (failureReason === "invalid_json") {
+      return {
+        ok: false,
+        phase,
+        code,
+        errorCode: "protocol_error",
+        message: "hc send returned a malformed response; delivery state is unknown. Do not resend.",
+        certainty: "unknown",
+        failureReason
+      };
+    }
+    if (failureReason === "nonzero_exit") {
+      if (errorKind && HC_SEND_ERROR_KINDS.has(errorKind)) {
+        const spec = HC_ERROR_SPECS[errorKind];
+        const certainty = HC_SEND_NOT_SENT_KINDS.has(errorKind) ? "not_sent" : "unknown";
+        return {
+          ok: false,
+          phase,
+          code,
+          errorKind,
+          errorCode: spec.callCode,
+          message: spec.message,
+          certainty,
+          failureReason
+        };
+      }
+      return {
+        ok: false,
+        phase,
+        code,
+        errorCode: "prompt_failed",
+        message: "hc send failed with an unrecognized error; delivery state is unknown. Do not resend.",
+        certainty: "unknown",
+        failureReason
+      };
+    }
+    return {
+      ok: false,
+      phase,
+      code,
+      errorCode: "hc_unavailable",
+      message: "hc send failed during execution; delivery state is unknown. Do not resend.",
+      certainty: "unknown",
+      failureReason
+    };
+  }
+  const op = phase === "lookup" ? "ls" : "get";
+  let errorCode = "hc_unavailable";
+  let message = `hc ${op} is unavailable; no input was sent.`;
+  switch (failureReason) {
+    case "aborted":
+      errorCode = "aborted";
+      message = "Call aborted before delivery.";
+      break;
+    case "budget_exhausted":
+    case "timeout":
+      errorCode = "timeout";
+      message = `hc ${op} timed out before delivery; no input was sent.`;
+      break;
+    case "hc_missing":
+      errorCode = "hc_unavailable";
+      message = "hc CLI executable is not available; no input was sent.";
+      break;
+    case "invalid_json":
+      errorCode = "protocol_error";
+      message = `hc ${op} returned an invalid JSON response; no input was sent.`;
+      break;
+    case "nonzero_exit":
+      if (errorKind) {
+        const spec = HC_ERROR_SPECS[errorKind];
+        errorCode = spec.callCode;
+        message = spec.preSendMessage;
+      } else {
+        errorCode = "hc_unavailable";
+        message = `hc ${op} failed before delivery; no input was sent.`;
+      }
+      break;
+  }
+  return {
+    ok: false,
+    phase,
+    code,
+    ...errorKind ? { errorKind } : {},
+    errorCode,
+    message,
+    certainty: "not_sent",
+    failureReason
+  };
+}
+async function runHc(deps, args, timeoutMs, signal, phase = inferPhase(args)) {
+  if (signal?.aborted) {
+    return classifyHcFailure(phase, "aborted", null, undefined, false);
+  }
+  const timeout = Math.floor(timeoutMs);
+  if (!Number.isFinite(timeoutMs) || timeout < 1) {
+    return classifyHcFailure(phase, "budget_exhausted", null, undefined, false);
+  }
+  const hcBin = deps.hcBin?.trim() || "hc";
+  let result;
+  try {
+    result = await deps.exec(hcBin, args, {
+      timeout,
+      signal
+    });
+  } catch (error) {
+    const missing = isMissingExecutable(error);
+    const reason = signal?.aborted ? "aborted" : missing ? "hc_missing" : "exec_error";
+    return classifyHcFailure(phase, reason, null, undefined, true);
+  }
+  if (result.killed) {
+    const reason = signal?.aborted ? "aborted" : "timeout";
+    return classifyHcFailure(phase, reason, result.code, undefined, true);
+  }
+  if (result.code !== 0) {
+    if (signal?.aborted) {
+      return classifyHcFailure(phase, "aborted", result.code, undefined, true);
+    }
+    const errorKind = extractHcErrorKind(result.stderr, phase);
+    return classifyHcFailure(phase, "nonzero_exit", result.code, errorKind, true);
+  }
+  const json = parseJson(result.stdout);
+  if (!json) {
+    return classifyHcFailure(phase, "invalid_json", result.code, undefined, true);
+  }
+  if (phase === "send") {
+    if (typeof json.turn !== "number" || !Number.isSafeInteger(json.turn) || json.turn < 0) {
+      return {
+        ...classifyHcFailure(phase, "invalid_json", result.code, undefined, true),
+        json
+      };
+    }
+    return {
+      ok: true,
+      phase,
+      code: result.code,
+      json,
+      certainty: "submitted"
+    };
+  }
+  return {
+    ok: true,
+    phase,
+    code: result.code,
+    json,
+    certainty: phase === "wait" ? "submitted" : "not_sent"
+  };
+}
+async function hcResolveTarget(deps, target, timeoutMs, signal) {
+  const normalized = target.trim();
+  if (!normalized) {
+    return {
+      ok: false,
+      certainty: "not_sent",
+      code: "invalid_request",
+      message: "Target is required."
+    };
+  }
+  if (normalized.startsWith("-")) {
+    return {
+      ok: false,
+      certainty: "not_sent",
+      code: "invalid_request",
+      message: "Target must be an hc terminal address or name, not an option."
+    };
+  }
+  if (isValidHcAddress(normalized)) {
+    return {
+      ok: true,
+      address: normalized,
+      remote: isRemoteHcAddress(normalized)
+    };
+  }
+  if (normalized.includes("/") || !HC_NAME_RE.test(normalized)) {
+    return {
+      ok: false,
+      certainty: "not_sent",
+      code: "invalid_request",
+      message: "Target is neither a valid hc terminal address nor a valid terminal name."
+    };
+  }
+  const outcome = await runHc(deps, ["ls", "--json"], timeoutMs, signal, "lookup");
+  if (!outcome.ok) {
+    return {
+      ok: false,
+      certainty: "not_sent",
+      code: outcome.errorCode ?? "hc_unavailable",
+      ...outcome.errorKind ? { errorKind: outcome.errorKind } : {},
+      ...typeof outcome.code === "number" ? { exitCode: outcome.code } : {},
+      message: outcome.message ?? "hc ls failed before delivery; no input was sent."
+    };
+  }
+  const terminals = outcome.json?.terminals;
+  if (!Array.isArray(terminals)) {
+    return {
+      ok: false,
+      certainty: "not_sent",
+      code: "protocol_error",
+      exitCode: outcome.code ?? undefined,
+      message: "hc ls returned an invalid response."
+    };
+  }
+  const matches = [];
+  for (const item of terminals) {
+    const row = record(item);
+    if (!row || typeof row.address !== "string" || !isValidHcAddress(row.address) || row.name !== undefined && row.name !== null && typeof row.name !== "string") {
+      return {
+        ok: false,
+        certainty: "not_sent",
+        code: "protocol_error",
+        exitCode: outcome.code ?? undefined,
+        message: "hc ls returned a malformed terminal entry."
+      };
+    }
+    if (row.name === normalized) {
+      matches.push(row.address);
+    }
+  }
+  if (matches.length === 0) {
+    return {
+      ok: false,
+      certainty: "not_sent",
+      code: "target_not_found",
+      message: "No live hc terminal matched the requested name in the current list (disconnected machines are not searched); pass an explicit terminal address."
+    };
+  }
+  if (matches.length > 1) {
+    return {
+      ok: false,
+      certainty: "not_sent",
+      code: "target_ambiguous",
+      message: "Multiple hc terminals matched the requested name; pass an explicit terminal address."
+    };
+  }
+  const address = matches[0];
+  return {
+    ok: true,
+    address,
+    remote: isRemoteHcAddress(address)
+  };
+}
+async function hcGet(deps, address, timeoutMs, signal) {
+  const outcome = await runHc(deps, ["get", "--json", address], timeoutMs, signal, "get");
+  if (!outcome.ok) {
+    return {
+      ok: false,
+      certainty: "not_sent",
+      code: outcome.errorCode ?? "hc_unavailable",
+      ...outcome.errorKind ? { errorKind: outcome.errorKind } : {},
+      ...typeof outcome.code === "number" ? { exitCode: outcome.code } : {},
+      message: outcome.message ?? "hc get failed before delivery; no input was sent."
+    };
+  }
+  const d = outcome.json;
+  if (!d || typeof d.address !== "string" || !isValidHcAddress(d.address) || d.address !== address) {
+    return {
+      ok: false,
+      certainty: "not_sent",
+      code: "protocol_error",
+      exitCode: outcome.code ?? undefined,
+      message: "hc get returned an invalid or mismatched terminal address."
+    };
+  }
+  if (d.state !== "live" && d.state !== "finished") {
+    return {
+      ok: false,
+      certainty: "not_sent",
+      code: "protocol_error",
+      exitCode: outcome.code ?? undefined,
+      message: "hc get returned an invalid terminal state."
+    };
+  }
+  if (d.reported !== undefined && typeof d.reported !== "boolean") {
+    return {
+      ok: false,
+      certainty: "not_sent",
+      code: "protocol_error",
+      exitCode: outcome.code ?? undefined,
+      message: "hc get returned an invalid reported field."
+    };
+  }
+  if (d.turn !== undefined && (typeof d.turn !== "number" || !Number.isSafeInteger(d.turn) || d.turn < 0)) {
+    return {
+      ok: false,
+      certainty: "not_sent",
+      code: "protocol_error",
+      exitCode: outcome.code ?? undefined,
+      message: "hc get returned an invalid turn value."
+    };
+  }
+  let statusState = null;
+  if (d.status !== undefined && d.status !== null) {
+    const st = record(d.status);
+    if (!st || typeof st.state !== "string" || !st.state) {
+      return {
+        ok: false,
+        certainty: "not_sent",
+        code: "protocol_error",
+        exitCode: outcome.code ?? undefined,
+        message: "hc get returned a malformed status record."
+      };
+    }
+    if (st.kind !== undefined && st.kind !== null && typeof st.kind !== "string") {
+      return {
+        ok: false,
+        certainty: "not_sent",
+        code: "protocol_error",
+        exitCode: outcome.code ?? undefined,
+        message: "hc get returned a malformed status kind."
+      };
+    }
+    statusState = st.state;
+  }
+  return {
+    ok: true,
+    facts: {
+      address: d.address,
+      state: d.state,
+      reported: d.reported === true,
+      statusState,
+      turn: typeof d.turn === "number" ? d.turn : 0
+    }
+  };
+}
+function parseWaitFacts(raw) {
+  if (raw === undefined)
+    return { wait: undefined, valid: true };
+  if (raw === null)
+    return { wait: null, valid: true };
+  const w = record(raw);
+  if (!w)
+    return { wait: undefined, valid: false };
+  if (typeof w.terminal !== "string" || !w.terminal || typeof w.ended !== "boolean" || typeof w.reason !== "string" || !w.reason || typeof w.turn !== "number" || !Number.isSafeInteger(w.turn) || w.turn < 0 || !Array.isArray(w.children)) {
+    return { wait: undefined, valid: false };
+  }
+  if (w.status !== undefined && w.status !== null && typeof w.status !== "string") {
+    return { wait: undefined, valid: false };
+  }
+  if (w.exit_code !== undefined && w.exit_code !== null && (typeof w.exit_code !== "number" || !Number.isInteger(w.exit_code))) {
+    return { wait: undefined, valid: false };
+  }
+  if (w.signal !== undefined && w.signal !== null && (typeof w.signal !== "number" || !Number.isInteger(w.signal))) {
+    return { wait: undefined, valid: false };
+  }
+  if (w.from !== undefined && w.from !== null && typeof w.from !== "string") {
+    return { wait: undefined, valid: false };
+  }
+  return {
+    valid: true,
+    wait: {
+      terminal: w.terminal,
+      ended: w.ended,
+      reason: w.reason,
+      status: typeof w.status === "string" ? w.status : null,
+      turn: w.turn,
+      exitCode: typeof w.exit_code === "number" ? w.exit_code : null,
+      signal: typeof w.signal === "number" ? w.signal : null
+    }
+  };
+}
+async function hcSend(deps, address, text, options, timeoutMs, signal) {
+  if (text.startsWith("-")) {
+    return {
+      ok: false,
+      certainty: "not_sent",
+      code: "invalid_request",
+      message: "text starting with '-' unsupported on hc"
+    };
+  }
+  const args = ["send", "--json", "--if", "idle"];
+  if (options.wait) {
+    const sec = Math.max(1, Math.ceil(options.timeoutSec ?? 1));
+    args.push("--wait", "--timeout", String(sec));
+  }
+  args.push(address, text);
+  const outcome = await runHc(deps, args, timeoutMs, signal, "send");
+  if (!outcome.ok) {
+    return {
+      ok: false,
+      certainty: outcome.certainty === "not_sent" ? "not_sent" : "unknown",
+      code: outcome.errorCode ?? "hc_unavailable",
+      ...outcome.errorKind ? { errorKind: outcome.errorKind } : {},
+      ...typeof outcome.code === "number" ? { exitCode: outcome.code } : {},
+      message: outcome.message ?? "hc send failed during execution; delivery state is unknown. Do not resend."
+    };
+  }
+  const d = outcome.json;
+  if (d.started !== undefined && d.started !== null && typeof d.started !== "boolean") {
+    return {
+      ok: false,
+      certainty: "unknown",
+      code: "protocol_error",
+      exitCode: outcome.code ?? undefined,
+      message: "hc send returned an invalid started field; delivery state is unknown. Do not resend."
+    };
+  }
+  if (d.status !== undefined && d.status !== null && typeof d.status !== "string") {
+    return {
+      ok: false,
+      certainty: "unknown",
+      code: "protocol_error",
+      exitCode: outcome.code ?? undefined,
+      message: "hc send returned an invalid status field; delivery state is unknown. Do not resend."
+    };
+  }
+  const parsedWait = parseWaitFacts(d.wait);
+  return {
+    ok: true,
+    certainty: "submitted",
+    turn: d.turn,
+    started: typeof d.started === "boolean" ? d.started : null,
+    status: typeof d.status === "string" ? d.status : null,
+    wait: parsedWait.wait,
+    waitValid: parsedWait.valid
+  };
+}
+async function hcWait(deps, address, timeoutSec, timeoutMs, signal) {
+  const sec = Math.max(1, Math.ceil(timeoutSec));
+  const outcome = await runHc(deps, ["wait", "--json", address, "--timeout", String(sec)], timeoutMs, signal, "wait");
+  if (!outcome.ok) {
+    return {
+      ok: false,
+      certainty: "submitted",
+      code: outcome.errorCode ?? "hc_unavailable",
+      ...outcome.errorKind ? { errorKind: outcome.errorKind } : {},
+      ...typeof outcome.code === "number" ? { exitCode: outcome.code } : {},
+      message: outcome.message ?? "hc wait is unavailable after prompt submission; the prompt was already submitted. Do not resend."
+    };
+  }
+  const parsedWait = parseWaitFacts(outcome.json);
+  if (!parsedWait.valid || !parsedWait.wait) {
+    return {
+      ok: false,
+      certainty: "submitted",
+      code: "protocol",
+      exitCode: outcome.code ?? undefined,
+      message: "hc wait returned an invalid WaitResult after prompt submission; answer recovery skipped."
+    };
+  }
+  return {
+    ok: true,
+    certainty: "submitted",
+    wait: parsedWait.wait
+  };
+}
+
 // src/input.ts
 var READ_TIMEOUT_MS = 3000;
 var READ_LINES = "60";
@@ -19573,12 +20275,13 @@ var POLL_INTERVAL_MS2 = 2000;
 var MIN_RECHECK_MS = 1000;
 var USAGE = "Usage: /herdr-send [--wait|--raw] <pane> <text>";
 var GJC_NOT_FOUND = "gjc CLI not found on PATH";
-function record(value) {
+var HC_SEND_NOTE = "hc: text delivery only; no GJC session token; idle targets only";
+function record2(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value) ? value : undefined;
 }
-function parseJson(text) {
+function parseJson2(text) {
   try {
-    return record(JSON.parse(text));
+    return record2(JSON.parse(text));
   } catch {
     return;
   }
@@ -19586,7 +20289,7 @@ function parseJson(text) {
 function errorMessage(error) {
   return error instanceof Error ? error.message : String(error);
 }
-function isMissingExecutable(error) {
+function isMissingExecutable2(error) {
   return error?.code === "ENOENT";
 }
 async function herdrJson(deps, args, target, timeoutMs = HERDR_TIMEOUT_MS) {
@@ -19607,7 +20310,7 @@ async function herdrJson(deps, args, target, timeoutMs = HERDR_TIMEOUT_MS) {
     throw new Error(`Herdr is unavailable: ${operation} timed out`);
   }
   if (result.code !== 0) {
-    const error = record(parseJson(result.stderr)?.error);
+    const error = record2(parseJson2(result.stderr)?.error);
     const reason = typeof error?.message === "string" ? error.message : result.stderr.trim() || `exit ${result.code}`;
     if (error?.code === "pane_not_found" || error?.code === "agent_not_found") {
       throw new Error(`Herdr target not found: ${target}.`);
@@ -19617,7 +20320,7 @@ async function herdrJson(deps, args, target, timeoutMs = HERDR_TIMEOUT_MS) {
     }
     throw new Error(`Herdr is unavailable: ${reason}`);
   }
-  const data = parseJson(result.stdout);
+  const data = parseJson2(result.stdout);
   if (!data)
     throw new Error(`Herdr ${operation} returned an invalid response.`);
   return data;
@@ -19628,19 +20331,19 @@ async function resolveTargetPane(deps, target, timeoutMs) {
   const stepTimeout = () => deadline !== undefined ? Math.min(HERDR_TIMEOUT_MS, deadline - now()) : HERDR_TIMEOUT_MS;
   let paneId = target;
   if (!PANE_ID.test(target)) {
-    const agent = record(record((await herdrJson(deps, ["agent", "get", target], target, stepTimeout())).result)?.agent);
+    const agent = record2(record2((await herdrJson(deps, ["agent", "get", target], target, stepTimeout())).result)?.agent);
     if (typeof agent?.pane_id !== "string" || !agent.pane_id) {
       throw new Error("Herdr agent get returned an invalid response.");
     }
     paneId = agent.pane_id;
   }
-  const pane = record(record((await herdrJson(deps, ["pane", "get", paneId], target, stepTimeout())).result)?.pane);
+  const pane = record2(record2((await herdrJson(deps, ["pane", "get", paneId], target, stepTimeout())).result)?.pane);
   if (typeof pane?.pane_id !== "string" || !pane.pane_id) {
     throw new Error("Herdr pane get returned an invalid response.");
   }
   return {
     paneId: pane.pane_id,
-    tokens: record(pane.tokens) ?? {},
+    tokens: record2(pane.tokens) ?? {},
     agent: typeof pane.agent === "string" ? pane.agent : undefined,
     agentStatus: typeof pane.agent_status === "string" ? pane.agent_status : undefined,
     focused: pane.focused === true
@@ -19650,25 +20353,25 @@ async function resolveTargetSession(deps, pane) {
   const token = pane.tokens[SESSION_ID_KEY];
   if (typeof token === "string" && token)
     return token;
-  const info = record(record((await herdrJson(deps, ["pane", "process-info", "--pane", pane.paneId], pane.paneId)).result)?.process_info);
+  const info = record2(record2((await herdrJson(deps, ["pane", "process-info", "--pane", pane.paneId], pane.paneId)).result)?.process_info);
   const processes = info?.foreground_processes;
   if (!Array.isArray(processes)) {
     throw new Error("Herdr pane process-info returned an invalid response.");
   }
-  const pids = new Set(processes.map((entry) => record(entry)?.pid).filter((pid) => Number.isSafeInteger(pid) && Number(pid) > 0));
+  const pids = new Set(processes.map((entry) => record2(entry)?.pid).filter((pid) => Number.isSafeInteger(pid) && Number(pid) > 0));
   let result;
   try {
     result = await deps.exec("gjc", ["sdk", "session", "list", "--json"], {
       timeout: LIST_TIMEOUT_MS
     });
   } catch (error) {
-    throw new Error(isMissingExecutable(error) ? GJC_NOT_FOUND : `GJC session list failed: ${errorMessage(error)}`);
+    throw new Error(isMissingExecutable2(error) ? GJC_NOT_FOUND : `GJC session list failed: ${errorMessage(error)}`);
   }
   if (result.killed)
     throw new Error("GJC session list failed: timed out");
-  const body = parseJson(result.stdout);
+  const body = parseJson2(result.stdout);
   if (result.code !== 0 || body?.ok === false) {
-    const error = record(body?.error);
+    const error = record2(body?.error);
     if (!error) {
       if (result.code !== 0)
         throw new Error(GJC_NOT_FOUND);
@@ -19676,11 +20379,11 @@ async function resolveTargetSession(deps, pane) {
     }
     throw new Error(`GJC session list failed: ${String(error.message)}`);
   }
-  const sessions = record(body?.result)?.sessions;
+  const sessions = record2(body?.result)?.sessions;
   if (!Array.isArray(sessions)) {
     throw new Error("GJC session list returned an invalid response.");
   }
-  const matches = sessions.map(record).filter((row) => row?.live === true && typeof row.sessionId === "string" && pids.has(row.pid));
+  const matches = sessions.map(record2).filter((row) => row?.live === true && typeof row.sessionId === "string" && pids.has(row.pid));
   if (matches.length === 0) {
     throw new Error(`No live GJC session found for pane ${pane.paneId}.`);
   }
@@ -19701,7 +20404,7 @@ async function sendSessionPrompt(exec, sessionId, text, wait, signal) {
       signal
     });
   } catch (error) {
-    return isMissingExecutable(error) ? { ...base, ok: false, status: "not_sent", error: GJC_NOT_FOUND } : {
+    return isMissingExecutable2(error) ? { ...base, ok: false, status: "not_sent", error: GJC_NOT_FOUND } : {
       ...base,
       ok: false,
       status: "uncertain",
@@ -19716,7 +20419,7 @@ async function sendSessionPrompt(exec, sessionId, text, wait, signal) {
       error: "GJC session send timed out; delivery may already have been accepted."
     };
   }
-  const body = parseJson(result.stdout);
+  const body = parseJson2(result.stdout);
   if (!body) {
     return result.code !== 0 ? { ...base, ok: false, status: "not_sent", error: GJC_NOT_FOUND } : {
       ...base,
@@ -19726,9 +20429,9 @@ async function sendSessionPrompt(exec, sessionId, text, wait, signal) {
     };
   }
   if (body.ok === false) {
-    const error = record(body.error);
+    const error = record2(body.error);
     const references = Array.isArray(error?.references) ? error.references : [];
-    const ref = references.map(record).find((item) => item?.kind === "operationRef")?.value;
+    const ref = references.map(record2).find((item) => item?.kind === "operationRef")?.value;
     const operationRef = typeof ref === "string" ? ref : undefined;
     if (error?.code === "wait_timeout") {
       return {
@@ -19747,7 +20450,7 @@ async function sendSessionPrompt(exec, sessionId, text, wait, signal) {
       error: `GJC session send failed: ${String(error?.message ?? `exit ${result.code}`)}`
     };
   }
-  const payload = record(body.result);
+  const payload = record2(body.result);
   const ref = payload?.operationRef;
   const operationRef = typeof ref === "string" && ref ? ref : undefined;
   const status = payload?.status;
@@ -19784,7 +20487,7 @@ async function sendRawPrompt(deps, pane, text, signal) {
       if (result.killed)
         return "timed out";
       if (result.code !== 0) {
-        const error = record(parseJson(result.stderr)?.error);
+        const error = record2(parseJson2(result.stderr)?.error);
         return typeof error?.message === "string" ? error.message : result.stderr.trim() || `exit ${result.code}`;
       }
       return;
@@ -19813,6 +20516,9 @@ async function sendRawPrompt(deps, pane, text, signal) {
   return { ...base, ok: true, status: "raw_written" };
 }
 async function deliverPrompt(deps, request, sender, signal) {
+  if (deps.backend === "hc") {
+    return deliverViaHc(deps, request, signal);
+  }
   const mode = request.raw ? "raw" : "sdk";
   const fail = (error, pane) => ({
     ok: false,
@@ -19987,7 +20693,124 @@ function parseCommandArgs(args) {
   }
   return request;
 }
+var HC_WAIT_REASONS = new Set([
+  "status",
+  "exit",
+  "timeout",
+  "message",
+  "not_started",
+  "children",
+  "output"
+]);
+var HC_WAIT_STATUSES = new Set([
+  "idle",
+  "working",
+  "done",
+  "blocked",
+  "error"
+]);
+var SAFE_HC_SEND_ERRORS = new Set([
+  USAGE,
+  "Pane is required.",
+  "Target is required.",
+  "Prompt text must not be empty.",
+  "Prompt delivery aborted before sending.",
+  "Call aborted before delivery.",
+  "Target must be an hc terminal address or name, not an option.",
+  "Target is neither a valid hc terminal address nor a valid terminal name.",
+  "text starting with '-' unsupported on hc",
+  "hc caller unknown",
+  "Cannot send a prompt to the current hc terminal.",
+  "Send budget exhausted before hc send.",
+  "Call budget exhausted before hc send.",
+  "hc CLI executable is not available; no input was sent.",
+  "hc ls is unavailable; no input was sent.",
+  "hc ls timed out before delivery; no input was sent.",
+  "hc ls returned an invalid JSON response; no input was sent.",
+  "hc ls failed before delivery; no input was sent.",
+  "hc ls returned an invalid response.",
+  "hc ls returned a malformed terminal entry.",
+  "No live hc terminal matched the requested name in the current list (disconnected machines are not searched); pass an explicit terminal address.",
+  "Multiple hc terminals matched the requested name; pass an explicit terminal address.",
+  "Local wait aborted during hc send; delivery state is unknown and the target may still be running. Do not resend.",
+  "hc send timed out; delivery state is unknown and the target may still be running. Do not resend.",
+  "hc send returned a malformed response; delivery state is unknown. Do not resend.",
+  "hc send failed with an unrecognized error; delivery state is unknown. Do not resend.",
+  "hc send failed during execution; delivery state is unknown. Do not resend.",
+  "hc send returned an invalid started field; delivery state is unknown. Do not resend.",
+  "hc send returned an invalid status field; delivery state is unknown. Do not resend.",
+  "text delivered; wait result invalid; completion unconfirmed; do not resend",
+  "start was not observed; no wait result; completion unconfirmed",
+  "hc send --wait returned no wait result after text delivery; turn completion is not confirmed. Do not resend.",
+  "hc send --wait returned a mismatched terminal in wait result; turn completion is not confirmed. Do not resend.",
+  "hc text delivered, but the target turn did not start (reason=not_started). Turn is not completed; do not resend.",
+  "hc text delivered, but wait returned before turn completion (reason=timeout). Turn is not completed; do not resend.",
+  "hc text delivered, but wait returned before turn completion (reason=message). Turn is not completed; do not resend.",
+  "hc text delivered, but the target terminal exited before turn completion (reason=exit). Do not resend.",
+  "hc text delivered, but the target is blocked waiting for a user decision (status=blocked). Do not resend.",
+  "hc text delivered, but the target reported error status (status=error). Do not resend.",
+  "hc text delivered, but wait did not advance turn past send; turn completion is not confirmed. Do not resend.",
+  "hc text delivered, but wait returned an unexpected state; turn completion is not confirmed. Do not resend.",
+  ...Object.values(HC_ERROR_SPECS).flatMap((spec) => [
+    spec.message,
+    spec.preSendMessage
+  ])
+]);
+function describeHcSendResult(result) {
+  const w = result.waited;
+  if (result.ok && result.status === "sent") {
+    if (w) {
+      const safeStatus = w.status === "idle" || w.status === "done" ? w.status : "done";
+      const safeTurn = typeof w.turn === "number" && Number.isSafeInteger(w.turn) ? w.turn : 0;
+      return `hc text delivered (status: sent) and turn completed (reason=status, status=${safeStatus}, ended=true, turn=${safeTurn}). (${HC_SEND_NOTE})`;
+    }
+    return `hc text delivered (status: sent); completion is not awaited. (${HC_SEND_NOTE})`;
+  }
+  if (result.status === "sent") {
+    if (w) {
+      const reason = HC_WAIT_REASONS.has(w.reason) ? w.reason : "unexpected";
+      const statusLabel = w.status === null ? "none" : typeof w.status === "string" && HC_WAIT_STATUSES.has(w.status) ? w.status : "unknown";
+      const ended = Boolean(w.ended);
+      const turn = typeof w.turn === "number" && Number.isSafeInteger(w.turn) ? w.turn : 0;
+      if (reason === "timeout" || reason === "message") {
+        return `hc text delivered (status: sent), but wait checked in before turn completion (reason=${reason}, status=${statusLabel}, ended=${ended}, turn=${turn}); turn is not completed. Do not resend. (${HC_SEND_NOTE})`;
+      }
+      if (reason === "not_started") {
+        return `hc text delivered (status: sent), but target turn did not start (reason=not_started, status=${statusLabel}, ended=${ended}, turn=${turn}); turn is not completed. Do not resend. (${HC_SEND_NOTE})`;
+      }
+      if (reason === "exit") {
+        const exitParts = [];
+        if (typeof w.exitCode === "number" && Number.isInteger(w.exitCode)) {
+          exitParts.push(`exit_code=${w.exitCode}`);
+        }
+        if (typeof w.signal === "number" && Number.isInteger(w.signal)) {
+          exitParts.push(`signal=${w.signal}`);
+        }
+        const exitExtra = exitParts.length > 0 ? `, ${exitParts.join(", ")}` : "";
+        return `hc text delivered (status: sent), but target terminal exited before turn completion (reason=exit, status=${statusLabel}, ended=${ended}, turn=${turn}${exitExtra}). Do not resend. (${HC_SEND_NOTE})`;
+      }
+      if (statusLabel === "blocked") {
+        return `hc text delivered (status: sent), but target is blocked waiting for a user decision (reason=${reason}, status=blocked, ended=${ended}, turn=${turn}). Do not resend. (${HC_SEND_NOTE})`;
+      }
+      if (statusLabel === "error") {
+        return `hc text delivered (status: sent), but target reported error status (reason=${reason}, status=error, ended=${ended}, turn=${turn}). Do not resend. (${HC_SEND_NOTE})`;
+      }
+      return `hc text delivered (status: sent), but wait did not confirm turn completion (reason=${reason}, status=${statusLabel}, ended=${ended}, turn=${turn}). Do not resend. (${HC_SEND_NOTE})`;
+    }
+    const safeErr = result.error && SAFE_HC_SEND_ERRORS.has(result.error) ? result.error : "hc text delivered, but turn completion was not confirmed. Do not resend.";
+    return `${safeErr} (status: sent) (${HC_SEND_NOTE})`;
+  }
+  if (result.error === USAGE) {
+    return USAGE;
+  }
+  const fallback = result.status === "not_sent" ? "hc delivery refused before input; no input was sent." : "hc delivery state is uncertain. Do not resend.";
+  const safeErr = result.error && SAFE_HC_SEND_ERRORS.has(result.error) ? result.error : fallback;
+  return `${safeErr} (${HC_SEND_NOTE})`;
+}
 function describeResult(result) {
+  if (result.mode === "hc") {
+    return describeHcSendResult(result);
+  }
   const ref = result.operationRef ? ` (operationRef ${result.operationRef})` : "";
   if (!result.ok) {
     const error = result.error ?? "Prompt delivery failed.";
@@ -20001,36 +20824,263 @@ function describeResult(result) {
   }
   return `Prompt accepted by GJC session ${result.sessionId} on pane ${result.pane}${ref}; completion is not awaited.`;
 }
-function registerSendFeatures(api, herdrBin, senderPane) {
-  const deps = { exec: api.exec.bind(api), herdrBin };
+async function deliverViaHc(deps, request, signal) {
+  const now = deps.now ?? (() => performance.now());
+  const startedAt = now();
+  const deadline = startedAt + WAIT_TIMEOUT_MS;
+  const failNotSent = (error, pane) => ({
+    ok: false,
+    mode: "hc",
+    status: "not_sent",
+    ...pane ? { pane } : {},
+    error
+  });
+  const target = request.pane.trim();
+  if (!target)
+    return failNotSent("Pane is required.");
+  if (target.startsWith("-")) {
+    return failNotSent("Target must be an hc terminal address or name, not an option.");
+  }
+  if (!request.text.trim()) {
+    return failNotSent("Prompt text must not be empty.");
+  }
+  if (request.text.startsWith("-")) {
+    return failNotSent("text starting with '-' unsupported on hc");
+  }
+  if (signal?.aborted) {
+    return failNotSent("Prompt delivery aborted before sending.");
+  }
+  if (!isValidHcAddress(target) && (target.includes("/") || !HC_NAME_RE.test(target))) {
+    return failNotSent("Target is neither a valid hc terminal address nor a valid terminal name.");
+  }
+  const callerId = deps.hcCallerId?.trim();
+  if (!callerId || !isValidHcAddress(callerId)) {
+    return failNotSent("hc caller unknown");
+  }
+  const hcDeps = {
+    exec: deps.exec,
+    hcBin: deps.hcBin ?? "hc"
+  };
+  const resolved = await hcResolveTarget(hcDeps, target, Math.min(HERDR_TIMEOUT_MS, deadline - now()), signal);
+  if (!resolved.ok) {
+    return failNotSent(resolved.message);
+  }
+  const addr = resolved.address;
+  if (isSelf(addr, callerId)) {
+    return failNotSent("Cannot send a prompt to the current hc terminal.", addr);
+  }
+  const sendRemMs = deadline - now();
+  if (Math.floor(sendRemMs) < 1) {
+    return failNotSent("Send budget exhausted before hc send.", addr);
+  }
+  const wantWait = request.wait === true;
+  const timeoutSec = wantWait ? Math.max(1, Math.ceil(sendRemMs / 1000)) : undefined;
+  const sent = await hcSend(hcDeps, addr, request.text, wantWait ? { wait: true, timeoutSec } : {}, Math.floor(sendRemMs), signal);
+  if (!sent.ok) {
+    return {
+      ok: false,
+      mode: "hc",
+      status: sent.certainty === "not_sent" ? "not_sent" : "uncertain",
+      pane: addr,
+      error: sent.message
+    };
+  }
+  if (!sent.waitValid) {
+    return {
+      ok: false,
+      mode: "hc",
+      status: "sent",
+      pane: addr,
+      error: "text delivered; wait result invalid; completion unconfirmed; do not resend"
+    };
+  }
+  if (!wantWait) {
+    return {
+      ok: true,
+      mode: "hc",
+      status: "sent",
+      pane: addr
+    };
+  }
+  if (sent.wait === null || sent.wait === undefined) {
+    if (sent.started === false) {
+      return {
+        ok: false,
+        mode: "hc",
+        status: "sent",
+        pane: addr,
+        error: "start was not observed; no wait result; completion unconfirmed"
+      };
+    }
+    return {
+      ok: false,
+      mode: "hc",
+      status: "sent",
+      pane: addr,
+      error: "hc send --wait returned no wait result after text delivery; turn completion is not confirmed. Do not resend."
+    };
+  }
+  const w = sent.wait;
+  const waited = {
+    reason: w.reason,
+    status: w.status,
+    ended: w.ended,
+    turn: w.turn,
+    ...w.exitCode !== null ? { exitCode: w.exitCode } : {},
+    ...w.signal !== null ? { signal: w.signal } : {}
+  };
+  if (w.terminal !== addr) {
+    return {
+      ok: false,
+      mode: "hc",
+      status: "sent",
+      pane: addr,
+      waited,
+      error: "hc send --wait returned a mismatched terminal in wait result; turn completion is not confirmed. Do not resend."
+    };
+  }
+  if (w.reason === "not_started") {
+    return {
+      ok: false,
+      mode: "hc",
+      status: "sent",
+      pane: addr,
+      waited,
+      error: "hc text delivered, but the target turn did not start (reason=not_started). Turn is not completed; do not resend."
+    };
+  }
+  if (w.reason === "timeout") {
+    return {
+      ok: false,
+      mode: "hc",
+      status: "sent",
+      pane: addr,
+      waited,
+      error: "hc text delivered, but wait returned before turn completion (reason=timeout). Turn is not completed; do not resend."
+    };
+  }
+  if (w.reason === "message") {
+    return {
+      ok: false,
+      mode: "hc",
+      status: "sent",
+      pane: addr,
+      waited,
+      error: "hc text delivered, but wait returned before turn completion (reason=message). Turn is not completed; do not resend."
+    };
+  }
+  if (w.reason === "exit") {
+    return {
+      ok: false,
+      mode: "hc",
+      status: "sent",
+      pane: addr,
+      waited,
+      error: "hc text delivered, but the target terminal exited before turn completion (reason=exit). Do not resend."
+    };
+  }
+  if (w.status === "blocked") {
+    return {
+      ok: false,
+      mode: "hc",
+      status: "sent",
+      pane: addr,
+      waited,
+      error: "hc text delivered, but the target is blocked waiting for a user decision (status=blocked). Do not resend."
+    };
+  }
+  if (w.status === "error") {
+    return {
+      ok: false,
+      mode: "hc",
+      status: "sent",
+      pane: addr,
+      waited,
+      error: "hc text delivered, but the target reported error status (status=error). Do not resend."
+    };
+  }
+  if (w.ended === true && w.reason === "status" && (w.status === "idle" || w.status === "done") && w.turn >= sent.turn + 1) {
+    return {
+      ok: true,
+      mode: "hc",
+      status: "sent",
+      pane: addr,
+      waited
+    };
+  }
+  if (w.ended === true && w.turn < sent.turn + 1) {
+    return {
+      ok: false,
+      mode: "hc",
+      status: "sent",
+      pane: addr,
+      waited,
+      error: "hc text delivered, but wait did not advance turn past send; turn completion is not confirmed. Do not resend."
+    };
+  }
+  return {
+    ok: false,
+    mode: "hc",
+    status: "sent",
+    pane: addr,
+    waited,
+    error: "hc text delivered, but wait returned an unexpected state; turn completion is not confirmed. Do not resend."
+  };
+}
+function registerSendFeatures(api, herdrBin, senderPane, options) {
+  const backend = options?.backend ?? "herdr";
+  const isHc = backend === "hc";
+  const deps = {
+    exec: api.exec.bind(api),
+    herdrBin,
+    backend,
+    hcBin: options?.hcBin ?? "hc",
+    hcCallerId: options?.hcCallerId
+  };
   const sender = (ctx) => ({
     sessionId: ctx.sessionManager.getSessionId(),
     pane: senderPane
   });
+  const commandDescription = isHc ? "Send a prompt to another hc terminal via hc send: [--wait|--raw] <terminal-id-or-unique-name> <text> " + `(--raw and --raw --wait use the same hc send --if idle path; ${HC_SEND_NOTE}; hc: text delivery only, no GJC session token, no screen read; result file required for /herdr-call; unattended target assumed, not verified by the plugin; a target left in done cannot take a follow-up automatically)` : "Send a prompt to the GJC session in another Herdr pane: [--wait|--raw] <pane-or-agent-name> <text> " + `(when running on hc: ${HC_SEND_NOTE})`;
+  const toolDescription = isHc ? "Send a prompt to another hc terminal via `hc send --json --if idle`. " + "`pane` is an hc terminal address (`t2` or `machine/t2`) or a unique terminal name. Sending to the current hc terminal is refused. " + "`wait` (and `raw` with `wait`) waits in a single `hc send --wait` call and reports `waited` separately from delivery (`status: sent`). " + "`raw` uses the same `hc send --if idle` transport without separate Enter key presses. " + `(${HC_SEND_NOTE}; hc: text delivery only, no GJC session token, no screen read; result file required for /herdr-call; unattended target assumed, not verified by the plugin; a target left in done cannot take a follow-up automatically)` : "Send a prompt to the GJC session running in another Herdr pane via the official `gjc sdk session send`. " + "`pane` is a Herdr pane ID (e.g. wC:p2) or Herdr agent name. Sending to the current session is refused. " + "`wait` waits for the target turn to finish. `raw` instead types the text into the pane and presses Enter; " + "it works on any pane (including shells), gives no completion signal and cannot be combined with `wait`. " + `(When running on hc: ${HC_SEND_NOTE})`;
   api.registerCommand("herdr-send", {
-    description: "Send a prompt to the GJC session in another Herdr pane: [--wait|--raw] <pane-or-agent-name> <text>",
+    description: commandDescription,
     handler: async (args, ctx) => {
       const request = parseCommandArgs(args);
-      const result = typeof request === "string" ? { ok: false, mode: "sdk", status: "not_sent", error: request } : await deliverPrompt(deps, request, sender(ctx));
+      const result = typeof request === "string" ? {
+        ok: false,
+        mode: isHc ? "hc" : "sdk",
+        status: "not_sent",
+        error: request
+      } : await deliverPrompt(deps, request, sender(ctx));
       const message = describeResult(result);
-      if (ctx.hasUI)
+      if (ctx.hasUI) {
         ctx.ui.notify(message, result.ok ? "info" : "error");
-      else if (result.ok)
+      } else if (isHc) {
+        const phase = result.status === "not_sent" ? "pre_send" : result.status === "uncertain" ? "send" : "post_send";
+        const textLength = typeof request === "string" ? 0 : request.text.length;
+        const logMessage = `${message} [backend=hc, phase=${phase}, status=${result.status}, textLength=${textLength}]`;
+        if (result.ok)
+          api.logger.info(logMessage);
+        else
+          api.logger.warn(logMessage);
+      } else if (result.ok) {
         api.logger.info(message);
-      else
+      } else {
         api.logger.warn(message);
+      }
     }
   });
   const { z } = api.zod;
   api.registerTool({
     name: "herdr_send",
     label: "Herdr Send",
-    description: "Send a prompt to the GJC session running in another Herdr pane via the official `gjc sdk session send`. " + "`pane` is a Herdr pane ID (e.g. wC:p2) or Herdr agent name. Sending to the current session is refused. " + "`wait` waits for the target turn to finish. `raw` instead types the text into the pane and presses Enter; " + "it works on any pane (including shells), gives no completion signal and cannot be combined with `wait`.",
+    description: toolDescription,
     parameters: z.object({
-      pane: z.string().describe("Target Herdr pane ID or agent name"),
-      text: z.string().describe("Prompt text to deliver"),
-      wait: z.boolean().optional().describe("Wait for the target turn to finish (SDK mode only)"),
-      raw: z.boolean().optional().describe("Low-level pane input instead of the GJC SDK")
+      pane: z.string().describe(isHc ? "Target hc terminal address (e.g. t2 or machine/t2) or unique terminal name" : "Target Herdr pane ID or agent name"),
+      text: z.string().describe(isHc ? "Prompt text to deliver (must not start with '-')" : "Prompt text to deliver"),
+      wait: z.boolean().optional().describe(isHc ? "Wait for the target turn in the same hc send call (allowed with raw on hc)" : "Wait for the target turn to finish (SDK mode only)"),
+      raw: z.boolean().optional().describe(isHc ? "Uses the same hc send --if idle transport on hc (allowed with wait)" : "Low-level pane input instead of the GJC SDK")
     }),
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       const result = await deliverPrompt(deps, params, sender(ctx), signal);
@@ -20074,12 +21124,12 @@ class CallFailure extends Error {
     this.partial = partial;
   }
 }
-function record2(value) {
+function record3(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value) ? value : undefined;
 }
-function parseJson2(text) {
+function parseJson3(text) {
   try {
-    return record2(JSON.parse(text));
+    return record3(JSON.parse(text));
   } catch {
     return;
   }
@@ -20087,11 +21137,11 @@ function parseJson2(text) {
 function errorMessage2(error) {
   return error instanceof Error ? error.message : String(error);
 }
-function isMissingExecutable2(error) {
+function isMissingExecutable3(error) {
   return error?.code === "ENOENT";
 }
 function stderrEnvelope(result) {
-  return record2(parseJson2(result.stderr)?.error);
+  return record3(parseJson3(result.stderr)?.error);
 }
 async function runHerdr(deps, args, timeoutMs, signal, phase) {
   if (timeoutMs <= 0 || Math.floor(timeoutMs) < 1) {
@@ -20132,7 +21182,7 @@ async function runHerdr(deps, args, timeoutMs, signal, phase) {
       delivery: "not_sent",
       error: {
         code: "herdr_unavailable",
-        message: isMissingExecutable2(error) ? `Herdr CLI is not available at ${deps.herdrBin}: ${errorMessage2(error)}` : `Herdr CLI is unavailable: ${errorMessage2(error)}`
+        message: isMissingExecutable3(error) ? `Herdr CLI is not available at ${deps.herdrBin}: ${errorMessage2(error)}` : `Herdr CLI is unavailable: ${errorMessage2(error)}`
       }
     });
   }
@@ -20202,7 +21252,7 @@ async function resolveTargetPaneId(deps, target, deadline, signal) {
     throw usageFailure(result, "agent list");
   if (result.code !== 0)
     throw notSentEnvelope(result);
-  const agents = record2(record2(parseJson2(result.stdout))?.result)?.agents;
+  const agents = record3(record3(parseJson3(result.stdout))?.result)?.agents;
   if (!Array.isArray(agents)) {
     throw new CallFailure({
       status: "not_sent",
@@ -20214,7 +21264,7 @@ async function resolveTargetPaneId(deps, target, deadline, signal) {
       }
     });
   }
-  const matches = agents.map(record2).filter((row) => row?.name === target);
+  const matches = agents.map(record3).filter((row) => row?.name === target);
   if (matches.length === 0) {
     throw new CallFailure({
       status: "not_sent",
@@ -20256,8 +21306,8 @@ async function readAgentKind(deps, paneId, budgetMs, deadline, signal) {
   const result = await runHerdr(deps, ["agent", "get", paneId], remaining, signal, "lookup");
   if (result.code !== 0)
     return;
-  const response = record2(record2(parseJson2(result.stdout))?.result);
-  const agent = record2(response?.agent);
+  const response = record3(record3(parseJson3(result.stdout))?.result);
+  const agent = record3(response?.agent);
   if (response?.type !== "agent_info" || agent?.pane_id !== paneId)
     return;
   return typeof agent.agent === "string" ? agent.agent : undefined;
@@ -20275,8 +21325,8 @@ async function getPreflightAgent(deps, paneId, deadline, signal, budgetMs = LOOK
     throw usageFailure(result, "agent get");
   if (result.code !== 0)
     throw notSentEnvelope(result);
-  const response = record2(record2(parseJson2(result.stdout))?.result);
-  const agent = record2(response?.agent);
+  const response = record3(record3(parseJson3(result.stdout))?.result);
+  const agent = record3(response?.agent);
   if (response?.type !== "agent_info" || typeof agent?.pane_id !== "string" || !agent.pane_id || typeof agent.terminal_id !== "string" || !agent.terminal_id || typeof agent.agent_status !== "string" || !AGENT_STATES.has(agent.agent_status)) {
     throw new CallFailure({
       status: "not_sent",
@@ -20320,19 +21370,137 @@ function resultFileInstruction(requestId, resultFile) {
 Write your complete final answer as a new file at ${resultFile}, ` + `and reply on screen with only three lines: the exact token GJC_HERDR_BEGIN_${requestId} ` + `on the first line, ${resultFile} on the second line, and GJC_HERDR_END_${requestId} on the last line.`;
 }
 function isMissingPath(error) {
-  if (isMissingExecutable2(error))
+  if (isMissingExecutable3(error))
     return true;
   return error instanceof Error && /\bENOENT\b/.test(error.message);
 }
-async function checkResultFileAbsent(fsOps, resultFile) {
-  try {
-    await fsOps.lstat(resultFile);
-    return `result_file already exists at ${resultFile}; use a new path for each call.`;
-  } catch (error) {
-    if (isMissingPath(error))
-      return;
-    return `Cannot inspect result_file ${resultFile}: ${errorMessage2(error)}`;
+function isResultFileBudgetExpired(context) {
+  if (context?.deadline === undefined)
+    return false;
+  const now = context.now ?? (() => performance.now());
+  return context.deadline - now() < 1;
+}
+async function raceResultFileOp(startOp, context, onLateSuccess) {
+  const signal = context.signal;
+  if (signal?.aborted)
+    return { status: "aborted" };
+  if (isResultFileBudgetExpired(context))
+    return { status: "timeout" };
+  const now = context.now ?? (() => performance.now());
+  const remMs = context.deadline !== undefined ? context.deadline - now() : undefined;
+  if (remMs !== undefined && remMs < 1) {
+    return { status: "timeout" };
   }
+  let settled = false;
+  let opPromise;
+  try {
+    opPromise = startOp();
+  } catch (error) {
+    if (signal?.aborted)
+      return { status: "aborted" };
+    if (isResultFileBudgetExpired(context))
+      return { status: "timeout" };
+    return { status: "error", error };
+  }
+  const wrappedOp = opPromise.then((value) => {
+    if (settled) {
+      if (onLateSuccess) {
+        try {
+          onLateSuccess(value);
+        } catch {}
+      }
+      return { status: "ok", value };
+    }
+    settled = true;
+    return { status: "ok", value };
+  }, (error) => {
+    settled = true;
+    return { status: "error", error };
+  });
+  let timer;
+  let onAbort;
+  const guardPromise = new Promise((resolve) => {
+    if (signal) {
+      if (signal.aborted) {
+        settled = true;
+        resolve({ status: "aborted" });
+        return;
+      }
+      onAbort = () => {
+        if (!settled) {
+          settled = true;
+          resolve({ status: "aborted" });
+        }
+      };
+      signal.addEventListener("abort", onAbort, { once: true });
+    }
+    if (remMs !== undefined) {
+      const delayMs = Math.max(1, Math.ceil(remMs));
+      timer = setTimeout(() => {
+        if (!settled) {
+          settled = true;
+          resolve({ status: "timeout" });
+        }
+      }, delayMs);
+      timer.unref?.();
+    }
+  });
+  try {
+    const outcome = await Promise.race([wrappedOp, guardPromise]);
+    if (outcome.status === "ok" || outcome.status === "error") {
+      if (signal?.aborted) {
+        if (outcome.status === "ok" && onLateSuccess) {
+          try {
+            onLateSuccess(outcome.value);
+          } catch {}
+        }
+        return { status: "aborted" };
+      }
+      if (isResultFileBudgetExpired(context)) {
+        if (outcome.status === "ok" && onLateSuccess) {
+          try {
+            onLateSuccess(outcome.value);
+          } catch {}
+        }
+        return { status: "timeout" };
+      }
+    }
+    return outcome;
+  } finally {
+    if (timer !== undefined)
+      clearTimeout(timer);
+    if (signal && onAbort)
+      signal.removeEventListener("abort", onAbort);
+  }
+}
+async function checkResultFileAbsent(fsOps, resultFile, context) {
+  if (!context) {
+    try {
+      await fsOps.lstat(resultFile);
+      return `result_file already exists at ${resultFile}; use a new path for each call.`;
+    } catch (error) {
+      if (isMissingPath(error))
+        return;
+      return `Cannot inspect result_file ${resultFile}: ${errorMessage2(error)}`;
+    }
+  }
+  const raced = await raceResultFileOp(() => fsOps.lstat(resultFile), context);
+  if (raced.status === "aborted")
+    return "aborted";
+  if (raced.status === "timeout")
+    return "timeout";
+  if (raced.status === "ok") {
+    if (context.fixedMessages) {
+      return "result file check failed: already exists";
+    }
+    return `result_file already exists at ${resultFile}; use a new path for each call.`;
+  }
+  if (isMissingPath(raced.error))
+    return;
+  if (context.fixedMessages) {
+    return "result file check failed: lstat_failed";
+  }
+  return `Cannot inspect result_file ${resultFile}: ${errorMessage2(raced.error)}`;
 }
 function abortedResultFile() {
   return {
@@ -20341,119 +21509,281 @@ function abortedResultFile() {
     message: "Answer read aborted; the prompt was already delivered."
   };
 }
-async function recoverResultFile(fsOps, resultFile, signal) {
-  if (signal?.aborted)
-    return abortedResultFile();
-  let handle;
-  try {
-    handle = await fsOps.open(resultFile, RESULT_FILE_OPEN_FLAGS);
-  } catch (error) {
+function timeoutResultFile() {
+  return {
+    ok: false,
+    code: "timeout",
+    message: "Result file recovery exceeded the call budget after prompt submission."
+  };
+}
+async function recoverResultFile(fsOps, resultFile, signal, context) {
+  if (!context) {
     if (signal?.aborted)
       return abortedResultFile();
-    if (isMissingPath(error)) {
+    let handle;
+    try {
+      handle = await fsOps.open(resultFile, RESULT_FILE_OPEN_FLAGS);
+    } catch (error) {
+      if (signal?.aborted)
+        return abortedResultFile();
+      if (isMissingPath(error)) {
+        return {
+          ok: false,
+          code: "result_file_missing",
+          message: `Result file was not created at ${resultFile}.`
+        };
+      }
+      return {
+        ok: false,
+        code: "result_file_invalid",
+        message: `Result file at ${resultFile} could not be opened: ${errorMessage2(error)}`
+      };
+    }
+    try {
+      if (signal?.aborted)
+        return abortedResultFile();
+      let stat;
+      try {
+        stat = await handle.stat();
+      } catch (error) {
+        if (signal?.aborted)
+          return abortedResultFile();
+        return {
+          ok: false,
+          code: "result_file_invalid",
+          message: `Result file at ${resultFile} could not be inspected: ${errorMessage2(error)}`
+        };
+      }
+      if (signal?.aborted)
+        return abortedResultFile();
+      if (!stat.isFile()) {
+        return {
+          ok: false,
+          code: "result_file_invalid",
+          message: `Result file at ${resultFile} is not a regular file.`
+        };
+      }
+      if (stat.nlink !== 1) {
+        return {
+          ok: false,
+          code: "result_file_invalid",
+          message: `Result file at ${resultFile} must have link count 1 (got ${stat.nlink}).`
+        };
+      }
+      if (stat.size <= 0 || stat.size > MAX_RESULT_FILE_BYTES) {
+        return {
+          ok: false,
+          code: "result_file_invalid",
+          message: stat.size <= 0 ? `Result file at ${resultFile} is empty.` : `Result file at ${resultFile} exceeds the 1 MiB limit (${stat.size} bytes).`
+        };
+      }
+      const maxReadBytes = MAX_RESULT_FILE_BYTES + 1;
+      const buffer = new Uint8Array(maxReadBytes);
+      let totalBytes = 0;
+      try {
+        while (totalBytes < maxReadBytes) {
+          if (signal?.aborted)
+            return abortedResultFile();
+          const { bytesRead, buffer: chunkBuffer } = await handle.read(buffer, totalBytes, maxReadBytes - totalBytes, totalBytes);
+          if (signal?.aborted)
+            return abortedResultFile();
+          if (bytesRead <= 0)
+            break;
+          if (chunkBuffer && chunkBuffer !== buffer) {
+            const copyLen = Math.min(bytesRead, maxReadBytes - totalBytes);
+            buffer.set(chunkBuffer.subarray(0, copyLen), totalBytes);
+          }
+          totalBytes += bytesRead;
+        }
+      } catch (error) {
+        if (signal?.aborted)
+          return abortedResultFile();
+        return {
+          ok: false,
+          code: "result_file_invalid",
+          message: `Result file at ${resultFile} could not be read: ${errorMessage2(error)}`
+        };
+      }
+      if (signal?.aborted)
+        return abortedResultFile();
+      if (totalBytes <= 0 || totalBytes > MAX_RESULT_FILE_BYTES) {
+        return {
+          ok: false,
+          code: "result_file_invalid",
+          message: totalBytes <= 0 ? `Result file at ${resultFile} is empty.` : `Result file at ${resultFile} exceeds the 1 MiB limit (${totalBytes} bytes).`
+        };
+      }
+      let answer;
+      try {
+        answer = new TextDecoder("utf-8", { fatal: true }).decode(buffer.subarray(0, totalBytes));
+      } catch (error) {
+        if (signal?.aborted)
+          return abortedResultFile();
+        return {
+          ok: false,
+          code: "result_file_invalid",
+          message: `Result file at ${resultFile} is not valid UTF-8: ${errorMessage2(error)}`
+        };
+      }
+      if (signal?.aborted)
+        return abortedResultFile();
+      return { ok: true, answer };
+    } finally {
+      try {
+        await handle.close();
+      } catch {}
+    }
+  }
+  const effSignal = context.signal ?? signal;
+  const effContext = {
+    ...context,
+    signal: effSignal
+  };
+  const fixed = effContext.fixedMessages === true;
+  const opened = await raceResultFileOp(() => fsOps.open(resultFile, RESULT_FILE_OPEN_FLAGS), effContext, (lateHandle) => {
+    try {
+      lateHandle.close().catch(() => {});
+    } catch {}
+  });
+  if (opened.status === "aborted")
+    return abortedResultFile();
+  if (opened.status === "timeout")
+    return timeoutResultFile();
+  if (opened.status === "error") {
+    if (isMissingPath(opened.error)) {
       return {
         ok: false,
         code: "result_file_missing",
-        message: `Result file was not created at ${resultFile}.`
+        message: fixed ? "result file check failed: result_file_missing" : `Result file was not created at ${resultFile}.`
       };
     }
     return {
       ok: false,
       code: "result_file_invalid",
-      message: `Result file at ${resultFile} could not be opened: ${errorMessage2(error)}`
+      message: fixed ? "result file check failed: result_file_invalid" : `Result file at ${resultFile} could not be opened: ${errorMessage2(opened.error)}`
     };
   }
+  const handle = opened.value;
+  let opInFlight = false;
+  let lastOpPromise;
+  const trackOp = (p) => {
+    opInFlight = true;
+    const tracked = p.then((v) => {
+      opInFlight = false;
+      return v;
+    }, (e) => {
+      opInFlight = false;
+      throw e;
+    });
+    lastOpPromise = tracked.catch(() => {});
+    return tracked;
+  };
   try {
-    if (signal?.aborted)
+    const statted = await raceResultFileOp(() => trackOp(handle.stat()), effContext);
+    if (statted.status === "aborted")
       return abortedResultFile();
-    let stat;
-    try {
-      stat = await handle.stat();
-    } catch (error) {
-      if (signal?.aborted)
-        return abortedResultFile();
+    if (statted.status === "timeout")
+      return timeoutResultFile();
+    if (statted.status === "error") {
       return {
         ok: false,
         code: "result_file_invalid",
-        message: `Result file at ${resultFile} could not be inspected: ${errorMessage2(error)}`
+        message: fixed ? "result file check failed: result_file_invalid" : `Result file at ${resultFile} could not be inspected: ${errorMessage2(statted.error)}`
       };
     }
-    if (signal?.aborted)
-      return abortedResultFile();
+    const stat = statted.value;
     if (!stat.isFile()) {
       return {
         ok: false,
         code: "result_file_invalid",
-        message: `Result file at ${resultFile} is not a regular file.`
+        message: fixed ? "result file check failed: result_file_invalid" : `Result file at ${resultFile} is not a regular file.`
       };
     }
     if (stat.nlink !== 1) {
       return {
         ok: false,
         code: "result_file_invalid",
-        message: `Result file at ${resultFile} must have link count 1 (got ${stat.nlink}).`
+        message: fixed ? "result file check failed: result_file_invalid" : `Result file at ${resultFile} must have link count 1 (got ${stat.nlink}).`
       };
     }
     if (stat.size <= 0 || stat.size > MAX_RESULT_FILE_BYTES) {
       return {
         ok: false,
         code: "result_file_invalid",
-        message: stat.size <= 0 ? `Result file at ${resultFile} is empty.` : `Result file at ${resultFile} exceeds the 1 MiB limit (${stat.size} bytes).`
+        message: fixed ? "result file check failed: result_file_invalid" : stat.size <= 0 ? `Result file at ${resultFile} is empty.` : `Result file at ${resultFile} exceeds the 1 MiB limit (${stat.size} bytes).`
       };
     }
     const maxReadBytes = MAX_RESULT_FILE_BYTES + 1;
     const buffer = new Uint8Array(maxReadBytes);
     let totalBytes = 0;
-    try {
-      while (totalBytes < maxReadBytes) {
-        const { bytesRead, buffer: chunkBuffer } = await handle.read(buffer, totalBytes, maxReadBytes - totalBytes, totalBytes);
-        if (signal?.aborted)
-          return abortedResultFile();
-        if (bytesRead <= 0)
-          break;
-        if (chunkBuffer && chunkBuffer !== buffer) {
-          const copyLen = Math.min(bytesRead, maxReadBytes - totalBytes);
-          buffer.set(chunkBuffer.subarray(0, copyLen), totalBytes);
-        }
-        totalBytes += bytesRead;
-      }
-    } catch (error) {
-      if (signal?.aborted)
+    while (totalBytes < maxReadBytes) {
+      const readStep = await raceResultFileOp(() => trackOp(handle.read(buffer, totalBytes, maxReadBytes - totalBytes, totalBytes)), effContext);
+      if (readStep.status === "aborted")
         return abortedResultFile();
-      return {
-        ok: false,
-        code: "result_file_invalid",
-        message: `Result file at ${resultFile} could not be read: ${errorMessage2(error)}`
-      };
+      if (readStep.status === "timeout")
+        return timeoutResultFile();
+      if (readStep.status === "error") {
+        return {
+          ok: false,
+          code: "result_file_invalid",
+          message: fixed ? "result file check failed: result_file_invalid" : `Result file at ${resultFile} could not be read: ${errorMessage2(readStep.error)}`
+        };
+      }
+      const { bytesRead, buffer: chunkBuffer } = readStep.value;
+      if (bytesRead <= 0)
+        break;
+      if (chunkBuffer && chunkBuffer !== buffer) {
+        const copyLen = Math.min(bytesRead, maxReadBytes - totalBytes);
+        buffer.set(chunkBuffer.subarray(0, copyLen), totalBytes);
+      }
+      totalBytes += bytesRead;
     }
-    if (signal?.aborted)
+    if (effSignal?.aborted)
       return abortedResultFile();
+    if (isResultFileBudgetExpired(effContext))
+      return timeoutResultFile();
     if (totalBytes <= 0 || totalBytes > MAX_RESULT_FILE_BYTES) {
       return {
         ok: false,
         code: "result_file_invalid",
-        message: totalBytes <= 0 ? `Result file at ${resultFile} is empty.` : `Result file at ${resultFile} exceeds the 1 MiB limit (${totalBytes} bytes).`
+        message: fixed ? "result file check failed: result_file_invalid" : totalBytes <= 0 ? `Result file at ${resultFile} is empty.` : `Result file at ${resultFile} exceeds the 1 MiB limit (${totalBytes} bytes).`
       };
     }
     let answer;
     try {
       answer = new TextDecoder("utf-8", { fatal: true }).decode(buffer.subarray(0, totalBytes));
     } catch (error) {
-      if (signal?.aborted)
+      if (effSignal?.aborted)
         return abortedResultFile();
+      if (isResultFileBudgetExpired(effContext))
+        return timeoutResultFile();
       return {
         ok: false,
         code: "result_file_invalid",
-        message: `Result file at ${resultFile} is not valid UTF-8: ${errorMessage2(error)}`
+        message: fixed ? "result file check failed: result_file_invalid" : `Result file at ${resultFile} is not valid UTF-8: ${errorMessage2(error)}`
       };
     }
-    if (signal?.aborted)
+    if (effSignal?.aborted)
       return abortedResultFile();
+    if (isResultFileBudgetExpired(effContext))
+      return timeoutResultFile();
     return { ok: true, answer };
   } finally {
-    try {
-      await handle.close();
-    } catch {}
+    if (opInFlight && lastOpPromise) {
+      lastOpPromise.then(() => {
+        try {
+          handle.close().catch(() => {});
+        } catch {}
+      });
+    } else if (effSignal?.aborted || isResultFileBudgetExpired(effContext)) {
+      try {
+        const closePromise = handle.close();
+        closePromise.catch(() => {});
+        await Promise.race([closePromise, Promise.resolve()]);
+      } catch {}
+    } else {
+      await raceResultFileOp(() => handle.close(), effContext);
+    }
   }
 }
 function hasEndWithoutBegin(capture, requestId) {
@@ -20632,6 +21962,9 @@ function promptFailure(result, agentLabel) {
   }
 }
 async function callRegisteredAgent(deps, request, senderPane, signal) {
+  if (deps.backend === "hc") {
+    return callViaHc(deps, request, signal);
+  }
   const now = deps.now ?? (() => performance.now());
   const startedAt = now();
   let deadline = startedAt + CALL_BUDGET_MS;
@@ -20992,8 +22325,8 @@ async function callRegisteredAgent(deps, request, senderPane, signal) {
         }
         throw promptFailure(prompt, preflight.agentLabel);
       }
-      const response = record2(record2(parseJson2(prompt.stdout))?.result);
-      const agent = record2(response?.agent);
+      const response = record3(record3(parseJson3(prompt.stdout))?.result);
+      const agent = record3(response?.agent);
       if (response?.type !== "agent_prompted" || typeof agent?.agent_status !== "string" || !AGENT_STATES.has(agent.agent_status) || agent.pane_id !== paneId || agent.terminal_id !== preflight.terminalId) {
         return finish({
           status: "uncertain",
@@ -21243,13 +22576,33 @@ ${result.capture}`);
   return parts.join(`
 `);
 }
-function registerCallFeatures(api, herdrBin, senderPane) {
+var HC_CALL_BACKEND_NOTE = "hc: unattended target assumed (not verified by the plugin); a target left in done cannot take a follow-up automatically; text delivery only, no GJC session token";
+function registerCallFeatures(api, herdrBin, senderPane, options) {
+  const resolvedOptions = options ?? {};
+  const isHc = resolvedOptions.backend === "hc";
   const deps = {
     exec: api.exec.bind(api),
     herdrBin,
-    inFlight: new Set
+    inFlight: new Set,
+    ...resolvedOptions.backend !== undefined ? { backend: resolvedOptions.backend } : {},
+    ...resolvedOptions.hcBin !== undefined ? { hcBin: resolvedOptions.hcBin } : {},
+    ...resolvedOptions.hcCallerId !== undefined ? { hcCallerId: resolvedOptions.hcCallerId } : {}
   };
   function summarize(result) {
+    if (deps.backend === "hc") {
+      const phase = result.ok ? "completed" : result.delivery === "not_sent" ? "pre_send" : result.delivery === "unknown" ? "send" : "post_send";
+      api.logger.info("herdr-call finished", {
+        backend: "hc",
+        phase,
+        code: result.error?.code,
+        status: result.status,
+        delivery: result.delivery,
+        elapsedMs: result.elapsedMs,
+        hasResultFile: Boolean(result.resultFile),
+        resultFileLength: result.resultFile?.length ?? 0
+      });
+      return;
+    }
     api.logger.info("herdr-call finished", {
       requestId: result.requestId,
       pane: result.pane,
@@ -21261,8 +22614,10 @@ function registerCallFeatures(api, herdrBin, senderPane) {
       markerVerified: result.markerVerified
     });
   }
+  const commandDescription = isHc ? "Call an hc terminal agent in another local terminal and recover its answer from --result-file: --result-file <abs-path> <terminal-id-or-unique-name> <text> " + `(--result-file required, idle targets only, local address only, no screen read; ${HC_CALL_BACKEND_NOTE})` : "Call a Herdr-registered agent in another pane and get its answer back: [--result-file <abs-path>] <pane-id-or-unique-agent-name> <text> " + `(Herdr backend uses screen markers or optional --result-file; when running on hc: --result-file required, idle targets only, local address only, no screen read; ${HC_CALL_BACKEND_NOTE})`;
+  const toolDescription = isHc ? "Call an hc terminal agent in another local terminal and recover its answer text from `result_file` (60s total budget, 5s reserved for file recovery). " + "`target` must be an explicit local hc terminal ID (e.g. t2) or a name that resolves to exactly one terminal, and `result_file` is required (--result-file required, idle targets only, local address only, no screen read). " + `${HC_CALL_BACKEND_NOTE}. ` + "No remote approvals, key presses, or retries are ever sent." : "Call a Herdr-registered agent (Claude Code, Codex, Copilot, Gemini, ...) in another Herdr pane and get its answer text back. " + "`target` must be an explicit Herdr pane ID or a name that resolves to exactly one agent; the target must be observed idle/done, " + "and Herdr's own known-agent/foreground gate decides finally whether the prompt is sent (zero input on rejection). " + "One prompt with a bounded wait (60s total budget) and bounded 200-line screen reads (initial unwrapped read, at most one --source recent retry if only the end marker is visible, or one confirmation read after a prompt timeout); the answer is recovered from " + "per-request marker lines, or from `result_file` when a new absolute file path is provided (must not already exist before sending; resilient to long answers and folded/truncated terminal output; the target agent must be able to write to that path, e.g. inside the repository for sandboxed agy). " + "Anything less is returned as an unverified capture instead of a success. " + "No remote approvals, key presses, or retries are ever sent. For GJC targets use the existing herdr_send tool instead. " + `(When running on hc instead of Herdr: --result-file required, idle targets only, local address only, no screen read; ${HC_CALL_BACKEND_NOTE})`;
   api.registerCommand("herdr-call", {
-    description: "Call a Herdr-registered agent in another pane and get its answer back: [--result-file <abs-path>] <pane-id-or-unique-agent-name> <text>",
+    description: commandDescription,
     handler: async (args) => {
       const request = parseCallCommandArgs(args);
       const result = typeof request === "string" ? {
@@ -21287,11 +22642,11 @@ function registerCallFeatures(api, herdrBin, senderPane) {
   api.registerTool({
     name: "herdr_agent_call",
     label: "Herdr Agent Call",
-    description: "Call a Herdr-registered agent (Claude Code, Codex, Copilot, Gemini, ...) in another Herdr pane and get its answer text back. " + "`target` must be an explicit Herdr pane ID or a name that resolves to exactly one agent; the target must be observed idle/done, " + "and Herdr's own known-agent/foreground gate decides finally whether the prompt is sent (zero input on rejection). " + "One prompt with a bounded wait (60s total budget) and bounded 200-line screen reads (initial unwrapped read, at most one --source recent retry if only the end marker is visible, or one confirmation read after a prompt timeout); the answer is recovered from " + "per-request marker lines, or from `result_file` when a new absolute file path is provided (must not already exist before sending; resilient to long answers and folded/truncated terminal output; the target agent must be able to write to that path, e.g. inside the repository for sandboxed agy). " + "Anything less is returned as an unverified capture instead of a success. " + "No remote approvals, key presses, or retries are ever sent. For GJC targets use the existing herdr_send tool instead.",
+    description: toolDescription,
     parameters: z.object({
-      target: z.string().describe("Target Herdr pane ID (e.g. wC:p2) or unique agent name"),
-      text: z.string().describe("Prompt text to deliver verbatim"),
-      result_file: z.string().optional().describe("Optional new absolute path (must not exist before sending) where the target agent writes its full answer (resilient to long output or screen folding; target agent must have write access, e.g. inside the workspace for sandboxed agy)")
+      target: z.string().describe(isHc ? "Target local hc terminal ID (e.g. t2) or unique terminal name" : "Target Herdr pane ID (e.g. wC:p2) or unique agent name"),
+      text: z.string().describe(isHc ? "Prompt text to deliver verbatim (must not start with '-')" : "Prompt text to deliver verbatim"),
+      result_file: z.string().optional().describe(isHc ? "Required on hc: new local absolute path (must not exist before sending) where the target agent writes its full answer" : "Optional new absolute path (must not exist before sending) where the target agent writes its full answer (resilient to long output or screen folding; target agent must have write access, e.g. inside the workspace for sandboxed agy)")
     }),
     async execute(_toolCallId, params, signal) {
       const result = await callRegisteredAgent(deps, {
@@ -21307,6 +22662,647 @@ function registerCallFeatures(api, herdrBin, senderPane) {
       };
     }
   });
+}
+var HC_FILE_RESERVE_MS = 5000;
+function isValidResultFilePath(rawResultFile) {
+  return Boolean(rawResultFile && rawResultFile.trim() && rawResultFile === rawResultFile.trim() && !/[\0\r\n]/.test(rawResultFile) && isAbsolute2(rawResultFile));
+}
+async function callViaHc(deps, request, signal) {
+  const now = deps.now ?? (() => performance.now());
+  const startedAt = now();
+  const deadline = startedAt + CALL_BUDGET_MS;
+  const waitDeadline = deadline - HC_FILE_RESERVE_MS;
+  const requestId = randomUUID3();
+  const rawResultFile = request.resultFile ?? request.result_file;
+  const finish = (partial) => ({
+    ok: false,
+    requestId,
+    elapsedMs: now() - startedAt,
+    ...rawResultFile !== undefined ? { resultFile: rawResultFile } : {},
+    ...partial
+  });
+  if (rawResultFile === undefined) {
+    return finish({
+      status: "not_sent",
+      delivery: "not_sent",
+      error: {
+        code: "invalid_request",
+        message: "hc backend requires --result-file"
+      }
+    });
+  }
+  if (!isValidResultFilePath(rawResultFile)) {
+    return finish({
+      status: "not_sent",
+      delivery: "not_sent",
+      error: {
+        code: "invalid_request",
+        message: "result_file must be a non-empty absolute path without NUL or newline characters."
+      }
+    });
+  }
+  const target = request.target.trim();
+  if (!target) {
+    return finish({
+      status: "not_sent",
+      delivery: "not_sent",
+      error: { code: "invalid_request", message: "Target is required." }
+    });
+  }
+  if (target.startsWith("-")) {
+    return finish({
+      status: "not_sent",
+      delivery: "not_sent",
+      error: {
+        code: "invalid_request",
+        message: "Target must be an hc terminal address or name, not an option."
+      }
+    });
+  }
+  if (!request.text.trim()) {
+    return finish({
+      status: "not_sent",
+      delivery: "not_sent",
+      error: {
+        code: "invalid_request",
+        message: "Prompt text must not be empty."
+      }
+    });
+  }
+  if (request.text.startsWith("-")) {
+    return finish({
+      status: "not_sent",
+      delivery: "not_sent",
+      error: {
+        code: "invalid_request",
+        message: "text starting with '-' unsupported on hc"
+      }
+    });
+  }
+  if (signal?.aborted) {
+    return finish({
+      status: "not_sent",
+      delivery: "not_sent",
+      error: { code: "aborted", message: "Call aborted before delivery." }
+    });
+  }
+  const fsOps = deps.fs ?? defaultFs;
+  const preSendFileBudget = {
+    deadline: waitDeadline,
+    signal,
+    now,
+    fixedMessages: true
+  };
+  const initialConflict = await checkResultFileAbsent(fsOps, rawResultFile, preSendFileBudget);
+  if (signal?.aborted || initialConflict === "aborted") {
+    return finish({
+      status: "not_sent",
+      delivery: "not_sent",
+      error: { code: "aborted", message: "Call aborted before delivery." }
+    });
+  }
+  if (initialConflict === "timeout") {
+    return finish({
+      status: "not_sent",
+      delivery: "not_sent",
+      error: {
+        code: "timeout",
+        message: "result file check timed out"
+      }
+    });
+  }
+  if (initialConflict !== undefined) {
+    return finish({
+      status: "not_sent",
+      delivery: "not_sent",
+      error: {
+        code: "invalid_request",
+        message: initialConflict
+      }
+    });
+  }
+  if (isValidHcAddress(target) && isRemoteHcAddress(target)) {
+    return finish({
+      status: "not_sent",
+      delivery: "not_sent",
+      pane: target,
+      error: {
+        code: "invalid_request",
+        message: "remote result file recovery unsupported"
+      }
+    });
+  }
+  if (!isValidHcAddress(target) && (target.includes("/") || !HC_NAME_RE.test(target))) {
+    return finish({
+      status: "not_sent",
+      delivery: "not_sent",
+      error: {
+        code: "invalid_request",
+        message: "Target is neither a valid hc terminal address nor a valid terminal name."
+      }
+    });
+  }
+  const callerId = deps.hcCallerId?.trim();
+  if (!callerId || !isValidHcAddress(callerId)) {
+    return finish({
+      status: "not_sent",
+      delivery: "not_sent",
+      error: {
+        code: "invalid_request",
+        message: "hc caller unknown"
+      }
+    });
+  }
+  const hcDeps = {
+    exec: deps.exec,
+    hcBin: deps.hcBin ?? "hc"
+  };
+  const resolved = await hcResolveTarget(hcDeps, target, Math.min(LOOKUP_TIMEOUT_MS, waitDeadline - now()), signal);
+  if (!resolved.ok) {
+    return finish({
+      status: "not_sent",
+      delivery: "not_sent",
+      error: {
+        code: resolved.code,
+        message: resolved.message,
+        ...resolved.exitCode !== undefined ? { exitCode: resolved.exitCode } : {}
+      }
+    });
+  }
+  const addr = resolved.address;
+  if (resolved.remote) {
+    return finish({
+      status: "not_sent",
+      delivery: "not_sent",
+      pane: addr,
+      error: {
+        code: "invalid_request",
+        message: "remote result file recovery unsupported"
+      }
+    });
+  }
+  if (isSelf(addr, callerId)) {
+    return finish({
+      status: "not_sent",
+      delivery: "not_sent",
+      pane: addr,
+      error: {
+        code: "self_target",
+        message: "Cannot call the current hc terminal."
+      }
+    });
+  }
+  if (deps.inFlight.has(addr)) {
+    return finish({
+      status: "not_sent",
+      delivery: "not_sent",
+      pane: addr,
+      error: {
+        code: "target_busy",
+        message: "Another call to this terminal is already in flight here."
+      }
+    });
+  }
+  deps.inFlight.add(addr);
+  try {
+    const preflight = await hcGet(hcDeps, addr, Math.min(LOOKUP_TIMEOUT_MS, waitDeadline - now()), signal);
+    if (!preflight.ok) {
+      return finish({
+        status: "not_sent",
+        delivery: "not_sent",
+        pane: addr,
+        error: {
+          code: preflight.code,
+          message: preflight.message,
+          ...preflight.exitCode !== undefined ? { exitCode: preflight.exitCode } : {}
+        }
+      });
+    }
+    const facts = preflight.facts;
+    if (facts.state === "finished") {
+      return finish({
+        status: "not_sent",
+        delivery: "not_sent",
+        pane: addr,
+        state: "finished",
+        error: {
+          code: "terminal_finished",
+          message: "Target terminal has finished; no input was sent."
+        }
+      });
+    }
+    if (facts.reported !== true) {
+      return finish({
+        status: "not_sent",
+        delivery: "not_sent",
+        pane: addr,
+        ...facts.statusState ? { state: facts.statusState } : {},
+        error: {
+          code: "not_reported",
+          message: "Target terminal has not reported status (OSC 7501); no input was sent."
+        }
+      });
+    }
+    if (facts.statusState === "done") {
+      return finish({
+        status: "not_sent",
+        delivery: "not_sent",
+        pane: addr,
+        state: "done",
+        error: {
+          code: "agent_done",
+          message: "target finished its last turn; a new turn needs idle"
+        }
+      });
+    }
+    if (facts.statusState === "working") {
+      return finish({
+        status: "not_sent",
+        delivery: "not_sent",
+        pane: addr,
+        state: "working",
+        error: {
+          code: "agent_busy",
+          message: "Target agent is currently working; no input was sent."
+        }
+      });
+    }
+    if (facts.statusState === "blocked") {
+      return finish({
+        status: "not_sent",
+        delivery: "not_sent",
+        pane: addr,
+        state: "blocked",
+        error: {
+          code: "agent_blocked",
+          message: "Target is blocked waiting for a user decision; no input was sent."
+        }
+      });
+    }
+    if (facts.statusState !== "idle") {
+      return finish({
+        status: "not_sent",
+        delivery: "not_sent",
+        pane: addr,
+        ...facts.statusState ? { state: facts.statusState } : {},
+        error: {
+          code: "agent_state_unknown",
+          message: "Target agent state is not idle; no input was sent."
+        }
+      });
+    }
+    const patchedText = request.text + resultFileInstruction(requestId, rawResultFile);
+    const preSendConflict = await checkResultFileAbsent(fsOps, rawResultFile, preSendFileBudget);
+    if (signal?.aborted || preSendConflict === "aborted") {
+      return finish({
+        status: "not_sent",
+        delivery: "not_sent",
+        pane: addr,
+        state: "idle",
+        error: { code: "aborted", message: "Call aborted before delivery." }
+      });
+    }
+    if (preSendConflict === "timeout") {
+      return finish({
+        status: "not_sent",
+        delivery: "not_sent",
+        pane: addr,
+        state: "idle",
+        error: {
+          code: "timeout",
+          message: "result file check timed out"
+        }
+      });
+    }
+    if (preSendConflict !== undefined) {
+      return finish({
+        status: "not_sent",
+        delivery: "not_sent",
+        pane: addr,
+        state: "idle",
+        error: {
+          code: "invalid_request",
+          message: preSendConflict
+        }
+      });
+    }
+    const sendRemMs = waitDeadline - now();
+    if (Math.floor(sendRemMs) < 1) {
+      return finish({
+        status: "not_sent",
+        delivery: "not_sent",
+        pane: addr,
+        state: "idle",
+        error: {
+          code: "timeout",
+          message: "Call budget exhausted before hc send."
+        }
+      });
+    }
+    const sendTimeoutSec = Math.max(1, Math.ceil(sendRemMs / 1000));
+    const sent = await hcSend(hcDeps, addr, patchedText, { wait: true, timeoutSec: sendTimeoutSec }, Math.floor(sendRemMs), signal);
+    if (!sent.ok) {
+      return finish({
+        status: sent.certainty === "not_sent" ? "not_sent" : "uncertain",
+        delivery: sent.certainty,
+        pane: addr,
+        error: {
+          code: sent.code,
+          message: sent.message,
+          ...sent.exitCode !== undefined ? { exitCode: sent.exitCode } : {}
+        }
+      });
+    }
+    if (sent.turn < facts.turn) {
+      return finish({
+        status: "uncertain",
+        delivery: "submitted",
+        pane: addr,
+        error: {
+          code: "protocol",
+          message: "hc send reported a turn earlier than preflight get; answer recovery skipped."
+        }
+      });
+    }
+    if (!sent.waitValid) {
+      return finish({
+        status: "uncertain",
+        delivery: "submitted",
+        pane: addr,
+        error: {
+          code: "protocol",
+          message: "hc send returned a malformed wait object; answer recovery skipped."
+        }
+      });
+    }
+    if (sent.wait === null || sent.wait === undefined) {
+      if (sent.started === false) {
+        return finish({
+          status: "stalled",
+          delivery: "submitted",
+          pane: addr,
+          error: {
+            code: "stalled",
+            message: "Prompt was submitted to hc, but the target did not start working."
+          }
+        });
+      }
+      return finish({
+        status: "uncertain",
+        delivery: "submitted",
+        pane: addr,
+        error: {
+          code: "protocol",
+          message: "hc send --wait returned no wait result; answer recovery skipped."
+        }
+      });
+    }
+    let currentWait = sent.wait;
+    let lastTurn = sent.turn;
+    let settled;
+    for (;; ) {
+      if (currentWait.terminal !== addr) {
+        return finish({
+          status: "uncertain",
+          delivery: "submitted",
+          pane: addr,
+          error: {
+            code: "protocol",
+            message: "hc wait response terminal did not match target address; answer recovery skipped."
+          }
+        });
+      }
+      if (currentWait.turn < sent.turn || currentWait.turn < lastTurn) {
+        return finish({
+          status: "uncertain",
+          delivery: "submitted",
+          pane: addr,
+          error: {
+            code: "protocol",
+            message: "hc wait reported a turn earlier than the send turn; answer recovery skipped."
+          }
+        });
+      }
+      lastTurn = currentWait.turn;
+      if (currentWait.reason === "not_started") {
+        return finish({
+          status: "stalled",
+          delivery: "submitted",
+          pane: addr,
+          ...currentWait.status ? { state: currentWait.status } : {},
+          error: {
+            code: "stalled",
+            message: "Prompt was submitted to hc, but the target did not start working (not_started)."
+          }
+        });
+      }
+      if (currentWait.reason === "exit") {
+        if (currentWait.ended !== true) {
+          return finish({
+            status: "uncertain",
+            delivery: "submitted",
+            pane: addr,
+            error: {
+              code: "protocol",
+              message: "hc wait reported exit with ended=false; answer recovery skipped."
+            }
+          });
+        }
+        const exitParts = [];
+        if (currentWait.exitCode !== null) {
+          exitParts.push(`exit_code=${currentWait.exitCode}`);
+        }
+        if (currentWait.signal !== null) {
+          exitParts.push(`signal=${currentWait.signal}`);
+        }
+        const exitDetail = exitParts.length > 0 ? exitParts.join(", ") : "no exit code";
+        return finish({
+          status: "response_unverified",
+          delivery: "submitted",
+          pane: addr,
+          state: "finished",
+          error: {
+            code: "terminal_finished",
+            message: `Target terminal exited before completing the turn (${exitDetail}); answer recovery skipped.`,
+            ...currentWait.exitCode !== null ? { exitCode: currentWait.exitCode } : {}
+          }
+        });
+      }
+      if (currentWait.status === "blocked") {
+        return finish({
+          status: "response_unverified",
+          delivery: "submitted",
+          pane: addr,
+          state: "blocked",
+          error: {
+            code: "agent_blocked",
+            message: "Target is blocked waiting for a user decision after prompt submission; answer recovery skipped."
+          }
+        });
+      }
+      if (currentWait.status === "error") {
+        return finish({
+          status: "response_unverified",
+          delivery: "submitted",
+          pane: addr,
+          state: "error",
+          error: {
+            code: "agent_error",
+            message: "Target reported error status after prompt submission; answer recovery skipped."
+          }
+        });
+      }
+      if (currentWait.ended === true) {
+        if (currentWait.reason !== "status") {
+          return finish({
+            status: "uncertain",
+            delivery: "submitted",
+            pane: addr,
+            ...currentWait.status ? { state: currentWait.status } : {},
+            error: {
+              code: "protocol",
+              message: "hc wait ended with an unexpected reason; answer recovery skipped."
+            }
+          });
+        }
+        if (currentWait.status !== "idle" && currentWait.status !== "done") {
+          return finish({
+            status: "uncertain",
+            delivery: "submitted",
+            pane: addr,
+            ...currentWait.status ? { state: currentWait.status } : {},
+            error: {
+              code: "protocol",
+              message: "hc wait ended with an unexpected status; answer recovery skipped."
+            }
+          });
+        }
+        if (currentWait.turn < sent.turn + 1) {
+          return finish({
+            status: "uncertain",
+            delivery: "submitted",
+            pane: addr,
+            state: currentWait.status,
+            error: {
+              code: "protocol",
+              message: "Target reported completion without advancing turn past send; answer recovery skipped."
+            }
+          });
+        }
+        settled = currentWait.status;
+        break;
+      }
+      if (currentWait.reason !== "timeout" && currentWait.reason !== "message" || currentWait.status !== null && currentWait.status !== "working") {
+        return finish({
+          status: "uncertain",
+          delivery: "submitted",
+          pane: addr,
+          ...currentWait.status ? { state: currentWait.status } : {},
+          error: {
+            code: "protocol",
+            message: "hc wait returned ended=false with an unexpected reason or terminal status; answer recovery skipped."
+          }
+        });
+      }
+      const waitRemMs = waitDeadline - now();
+      if (Math.floor(waitRemMs) < 1) {
+        return finish({
+          status: "uncertain",
+          delivery: "submitted",
+          pane: addr,
+          ...currentWait.status ? { state: currentWait.status } : {},
+          error: {
+            code: "timeout",
+            message: "Call wait budget exhausted after prompt submission; the target may still be running. Do not resend."
+          }
+        });
+      }
+      const waitTimeoutSec = Math.max(1, Math.ceil(waitRemMs / 1000));
+      const nextWait = await hcWait(hcDeps, addr, waitTimeoutSec, Math.floor(waitRemMs), signal);
+      if (!nextWait.ok) {
+        return finish({
+          status: "uncertain",
+          delivery: "submitted",
+          pane: addr,
+          error: {
+            code: nextWait.code,
+            message: nextWait.message,
+            ...nextWait.exitCode !== undefined ? { exitCode: nextWait.exitCode } : {}
+          }
+        });
+      }
+      currentWait = nextWait.wait;
+    }
+    if (deadline - now() < 1) {
+      return finish({
+        status: "uncertain",
+        delivery: "submitted",
+        pane: addr,
+        state: settled,
+        error: {
+          code: "timeout",
+          message: "Turn settled but no budget remained for result file recovery."
+        }
+      });
+    }
+    const recovered = await recoverResultFile(fsOps, rawResultFile, signal, {
+      deadline,
+      signal,
+      now,
+      fixedMessages: true
+    });
+    if (signal?.aborted || !recovered.ok && recovered.code === "aborted") {
+      return finish({
+        status: "read_failed",
+        delivery: "submitted",
+        pane: addr,
+        state: settled,
+        error: {
+          code: "aborted",
+          message: "Answer read aborted; the prompt was already delivered."
+        }
+      });
+    }
+    if (!recovered.ok && recovered.code === "timeout" || deadline - now() < 1) {
+      return finish({
+        status: "uncertain",
+        delivery: "submitted",
+        pane: addr,
+        state: settled,
+        error: {
+          code: "timeout",
+          message: "Result file recovery exceeded the call budget after prompt submission."
+        }
+      });
+    }
+    if (!recovered.ok) {
+      const fixedCode = recovered.code === "result_file_missing" ? "result_file_missing" : "result_file_invalid";
+      return finish({
+        status: "response_unverified",
+        delivery: "submitted",
+        pane: addr,
+        state: settled,
+        error: {
+          code: fixedCode,
+          message: `result file check failed: ${fixedCode}`
+        }
+      });
+    }
+    return {
+      ok: true,
+      status: "answered",
+      delivery: "submitted",
+      requestId,
+      pane: addr,
+      state: settled,
+      answer: recovered.answer,
+      resultFile: rawResultFile,
+      markerVerified: false,
+      elapsedMs: now() - startedAt
+    };
+  } finally {
+    deps.inFlight.delete(addr);
+  }
 }
 
 // src/mail.ts
@@ -24567,11 +26563,39 @@ function registerMailReceiver(api, overrides) {
 }
 
 // src/extension.ts
+var INVALID_BACKEND_WARNING = "Invalid GJC_HERDR_BACKEND value ignored; using automatic backend selection.";
+function selectBackend(env, helperPane, logger) {
+  const forced = env.GJC_HERDR_BACKEND;
+  if (forced === "herdr" || forced === "hc") {
+    return forced;
+  }
+  if (forced !== undefined) {
+    logger?.warn?.(INVALID_BACKEND_WARNING);
+  }
+  if (helperPane)
+    return "herdr";
+  if (typeof env.HC_TERMINAL_ID === "string" && env.HC_TERMINAL_ID.trim()) {
+    return "hc";
+  }
+  return "herdr";
+}
 function herdrMetadata(api) {
   api.logger.info("gjc-herdr extension loaded");
   const pane = resolveHerdrPaneEnvironment({ env: { ...process.env } });
-  registerSendFeatures(api, pane?.binPath ?? "herdr", pane?.paneId ?? process.env.HERDR_PANE_ID);
-  registerCallFeatures(api, pane?.binPath ?? "herdr", pane?.paneId ?? process.env.HERDR_PANE_ID);
+  const backend = selectBackend(process.env, pane, api.logger);
+  const hcBin = process.env.GJC_HERDR_HC_BIN?.trim() || "hc";
+  const senderPane = pane?.paneId ?? process.env.HERDR_PANE_ID;
+  const hcCallerId = process.env.HC_TERMINAL_ID?.trim() || undefined;
+  registerSendFeatures(api, pane?.binPath ?? "herdr", senderPane, {
+    backend,
+    hcBin,
+    hcCallerId
+  });
+  registerCallFeatures(api, pane?.binPath ?? "herdr", senderPane, {
+    backend,
+    hcBin,
+    hcCallerId
+  });
   registerMailFeatures(api);
   registerMailReceiver(api);
   if (!pane)
@@ -24626,5 +26650,7 @@ function herdrMetadata(api) {
   });
 }
 export {
-  herdrMetadata as default
+  INVALID_BACKEND_WARNING,
+  herdrMetadata as default,
+  selectBackend
 };
