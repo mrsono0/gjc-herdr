@@ -236,10 +236,10 @@ Core(`GJCH_CORE=1`, §2.4)에서도 중지·재개 원칙은 같다: 작업 중�
 
 - **(a) 팀장 띄우는 명령 (탑주 명부용, 글자 그대로):**
   ```sh
-  hc run --bg --json --no-notify --no-parent --name gjch-lead --cwd <저장소 루트> --label team=gjch --label role=lead --label herdr.space=gjch -- env GJCH_EXTERNAL_LEAD=1 GJCH_CORE=1 claude --permission-mode auto --name "GJCH 팀장"
+  hc run --bg --json --no-notify --no-parent --name gjch-lead --cwd <저장소 루트> --label team=gjch --label role=lead --label herdr.space=gjch -- env GJCH_EXTERNAL_LEAD=1 GJCH_CORE=1 claude --permission-mode auto --name gjch-lead
   ```
   `--label herdr.space=gjch`는 사용자 결정(2026-11-11)으로 포함한다: App이 이 터미널을 받아들이면 그 id의 공간을 만들고 keep을 켜므로 재부팅 뒤 터미널이 남을 수 있다. 팀원(mate·critic) 터미널에는 붙이지 않는다.
-  `--keep`은 붙이지 않는다. 기동 손은 탑주이며, Core 팀장의 권한 모드 `--permission-mode auto` 출처는 사용자 결정 194이다.
+  `--keep`은 붙이지 않는다. 교차 세션 이름(`claude --name`)은 터미널 이름과 같은 `gjch-lead`로 두어 명부 조건(둘이 같고, 이주 전 데스크톱 팀장 세션 이름 「GJCH 팀장」과 다름)을 맞춘다. 기동 손은 탑주이며, Core 팀장의 권한 모드 `--permission-mode auto` 출처는 사용자 결정 194이다.
 - **(b) 잠금 인계 순서:**
   1. 옛 팀장이 진행 중인 배정이 없는 것을 확인한 뒤 `scripts/team-lead.sh release`로 팀장 잠금을 놓는다.
   2. 새로 뜬 Core 팀장(`gjch-lead`)이 시작할 때 SessionStart hook(`scripts/team-up.sh --hook` → `scripts/core-team.sh --hook`) 또는 수동 `GJCH_CORE=1 GJCH_EXTERNAL_LEAD=1 scripts/team-up.sh --lock claim`으로 잠금을 확보하고 `mine`을 확인한다.
