@@ -6,19 +6,57 @@ import { registerCallFeatures } from "./call.ts";
 import { registerMailFeatures } from "./mail.ts";
 import { registerMailReceiver } from "./mail-receive.ts";
 
+export type BackendKind = "herdr" | "hc";
+
+export const INVALID_BACKEND_WARNING =
+	"Invalid GJC_HERDR_BACKEND value ignored; using automatic backend selection.";
+
+export function selectBackend(
+	env: NodeJS.ProcessEnv | Record<string, string | undefined>,
+	helperPane: { paneId: string; binPath: string } | null | undefined,
+	logger?: { warn?: (message: string) => void },
+): BackendKind {
+	const forced = env.GJC_HERDR_BACKEND;
+	if (forced === "herdr" || forced === "hc") {
+		return forced;
+	}
+	if (forced !== undefined) {
+		logger?.warn?.(INVALID_BACKEND_WARNING);
+	}
+	if (helperPane) return "herdr";
+	if (typeof env.HC_TERMINAL_ID === "string" && env.HC_TERMINAL_ID.trim()) {
+		return "hc";
+	}
+	return "herdr";
+}
+
 export default function herdrMetadata(api: ExtensionAPI): void {
 	api.logger.info("gjc-herdr extension loaded");
 	const pane = resolveHerdrPaneEnvironment({ env: { ...process.env } });
+	const backend = selectBackend(process.env, pane, api.logger);
+	const hcBin = process.env.GJC_HERDR_HC_BIN?.trim() || "hc";
+	const senderPane = pane?.paneId ?? process.env.HERDR_PANE_ID;
+	const hcCallerId = process.env.HC_TERMINAL_ID?.trim() || undefined;
 	// Explicit delivery to another pane does not depend on this process publishing metadata.
 	registerSendFeatures(
 		api,
 		pane?.binPath ?? "herdr",
-		pane?.paneId ?? process.env.HERDR_PANE_ID,
+		senderPane,
+		{
+			backend,
+			hcBin,
+			hcCallerId,
+		},
 	);
 	registerCallFeatures(
 		api,
 		pane?.binPath ?? "herdr",
-		pane?.paneId ?? process.env.HERDR_PANE_ID,
+		senderPane,
+		{
+			backend,
+			hcBin,
+			hcCallerId,
+		},
 	);
 	registerMailFeatures(api);
 	registerMailReceiver(api);

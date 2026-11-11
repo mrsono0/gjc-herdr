@@ -216,3 +216,116 @@ test("session events read current values and shutdown clears without changing na
 		}
 	}
 });
+
+test("HC-only environment registers no metadata publisher, timer, or report exec and keeps process.env unchanged", async () => {
+	const savedEnvironment = {
+		HERDR_ENV: process.env.HERDR_ENV,
+		HERDR_PANE_ID: process.env.HERDR_PANE_ID,
+		HC_TERMINAL_ID: process.env.HC_TERMINAL_ID,
+		GJC_HERDR_BACKEND: process.env.GJC_HERDR_BACKEND,
+		GJC_HERDR_HC_BIN: process.env.GJC_HERDR_HC_BIN,
+	};
+	delete process.env.HERDR_ENV;
+	delete process.env.HERDR_PANE_ID;
+	delete process.env.GJC_HERDR_BACKEND;
+	process.env.GJC_HERDR_HC_BIN = "/custom/hc";
+	process.env.HC_TERMINAL_ID = "t1";
+
+	const admission = spyOn(
+		publicHerdr,
+		"resolveHerdrPaneEnvironment",
+	).mockReturnValue(null);
+	const intervalSpy = spyOn(globalThis, "setInterval");
+
+	let registrations = 0;
+	let execs = 0;
+	const execCalls: { command: string; args: string[] }[] = [];
+	const commands: string[] = [];
+	const tools: string[] = [];
+	let sendCommandHandler:
+		| ((args: string, ctx: unknown) => Promise<void>)
+		| undefined;
+	let callToolExecute:
+		| ((
+				toolCallId: string,
+				params: { target: string; text: string; result_file?: string },
+		  ) => Promise<{ details: { status: string; error?: { code: string; message: string } } }>)
+		| undefined;
+
+	try {
+		herdrMetadata({
+			logger: { info() {}, warn() {} },
+			zod,
+			on() {
+				registrations++;
+			},
+			registerCommand(
+				name: string,
+				options?: { handler?: typeof sendCommandHandler },
+			) {
+				commands.push(name);
+				if (name === "herdr-send") {
+					sendCommandHandler = options?.handler;
+				}
+			},
+			registerTool(tool: { name: string; execute?: typeof callToolExecute }) {
+				tools.push(tool.name);
+				if (tool.name === "herdr_agent_call") {
+					callToolExecute = tool.execute;
+				}
+			},
+			exec: async (command: string, args: string[]) => {
+				execs++;
+				execCalls.push({ command, args });
+				return {
+					stdout: JSON.stringify({ turn: 4, started: true, status: "working" }),
+					stderr: "",
+					code: 0,
+					killed: false,
+				};
+			},
+		} as unknown as ExtensionAPI);
+
+		assert.equal(registrations, 0);
+		assert.equal(intervalSpy.mock.calls.length, 0);
+		assert.equal(execs, 0);
+		assert.deepEqual(commands, ["herdr-send", "herdr-call"]);
+		assert.deepEqual(tools, ["herdr_send", "herdr_agent_call", "herdr_mail_send"]);
+		assert.equal(process.env.HC_TERMINAL_ID, "t1");
+		assert.equal(process.env.HERDR_ENV, undefined);
+
+		// Verify herdr_agent_call was wired to the hc backend (--result-file required, 0 execs)
+		assert.ok(callToolExecute);
+		const callRes = await callToolExecute!("t-hc-1", {
+			target: "t7",
+			text: "ping",
+		});
+		assert.equal(callRes.details.status, "not_sent");
+		assert.equal(callRes.details.error?.code, "invalid_request");
+		assert.match(
+			callRes.details.error?.message ?? "",
+			/hc backend requires --result-file/,
+		);
+		assert.equal(execs, 0);
+
+		// Verify /herdr-send command was wired via extension to the hc backend using custom GJC_HERDR_HC_BIN
+		assert.ok(sendCommandHandler);
+		await sendCommandHandler!("t7 ping", {
+			hasUI: false,
+			sessionManager: { getSessionId: () => "session-hc" },
+		});
+		assert.equal(execs, 1);
+		assert.deepEqual(execCalls[0], {
+			command: "/custom/hc",
+			args: ["send", "--json", "--if", "idle", "t7", "ping"],
+		});
+	} finally {
+		intervalSpy.mockRestore();
+		admission.mockRestore();
+		for (const [key, value] of Object.entries(savedEnvironment)) {
+			if (value === undefined) delete process.env[key];
+			else process.env[key] = value;
+		}
+	}
+});
+

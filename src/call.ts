@@ -7,6 +7,17 @@ import {
 import { isAbsolute } from "node:path";
 import type { ExtensionAPI, ExecResult } from "@gajae-code/coding-agent";
 import { classifyInput, inputWaitMs, waitForEmptyInput } from "./input.ts";
+import {
+	HC_NAME_RE,
+	hcGet,
+	hcResolveTarget,
+	hcSend,
+	hcWait,
+	isRemoteHcAddress,
+	isSelf,
+	isValidHcAddress,
+	type HcExecDeps,
+} from "./hc.ts";
 
 type Exec = ExtensionAPI["exec"];
 type Json = Record<string, unknown>;
@@ -69,6 +80,12 @@ export interface AgentCallDeps {
 	herdrBin: string;
 	/** Canonical pane IDs with an in-flight call in this plugin instance. */
 	inFlight: Set<string>;
+	/** Active backend (`"herdr"` by default). */
+	backend?: "herdr" | "hc";
+	/** `hc` executable path or binary name (`"hc"` by default). */
+	hcBin?: string;
+	/** Caller terminal address (`HC_TERMINAL_ID`) when running on the `hc` backend. */
+	hcCallerId?: string;
 	/** Test seam for the input-box wait; defaults to a real timer. */
 	sleep?: (ms: number) => Promise<void>;
 	now?: () => number;
@@ -473,24 +490,175 @@ function isMissingPath(error: unknown): boolean {
 	return error instanceof Error && /\bENOENT\b/.test(error.message);
 }
 
+interface ResultFileBudgetContext {
+	deadline?: number;
+	signal?: AbortSignal;
+	now?: () => number;
+	fixedMessages?: boolean;
+}
+
+function isResultFileBudgetExpired(context?: ResultFileBudgetContext): boolean {
+	if (context?.deadline === undefined) return false;
+	const now = context.now ?? (() => performance.now());
+	return context.deadline - now() < 1;
+}
+
+type RacedFileOp<T> =
+	| { status: "ok"; value: T }
+	| { status: "error"; error: unknown }
+	| { status: "aborted" }
+	| { status: "timeout" };
+
+async function raceResultFileOp<T>(
+	startOp: () => Promise<T>,
+	context: ResultFileBudgetContext,
+	onLateSuccess?: (value: T) => void,
+): Promise<RacedFileOp<T>> {
+	const signal = context.signal;
+	if (signal?.aborted) return { status: "aborted" };
+	if (isResultFileBudgetExpired(context)) return { status: "timeout" };
+
+	const now = context.now ?? (() => performance.now());
+	const remMs =
+		context.deadline !== undefined ? context.deadline - now() : undefined;
+	if (remMs !== undefined && remMs < 1) {
+		return { status: "timeout" };
+	}
+
+	let settled = false;
+	let opPromise: Promise<T>;
+	try {
+		opPromise = startOp();
+	} catch (error) {
+		if (signal?.aborted) return { status: "aborted" };
+		if (isResultFileBudgetExpired(context)) return { status: "timeout" };
+		return { status: "error", error };
+	}
+
+	const wrappedOp: Promise<RacedFileOp<T>> = opPromise.then(
+		(value): RacedFileOp<T> => {
+			if (settled) {
+				if (onLateSuccess) {
+					try {
+						onLateSuccess(value);
+					} catch {
+						// Ignore cleanup errors on late I/O completion.
+					}
+				}
+				return { status: "ok", value };
+			}
+			settled = true;
+			return { status: "ok", value };
+		},
+		(error: unknown): RacedFileOp<T> => {
+			settled = true;
+			return { status: "error", error };
+		},
+	);
+
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	let onAbort: (() => void) | undefined;
+
+	const guardPromise = new Promise<RacedFileOp<T>>((resolve) => {
+		if (signal) {
+			if (signal.aborted) {
+				settled = true;
+				resolve({ status: "aborted" });
+				return;
+			}
+			onAbort = () => {
+				if (!settled) {
+					settled = true;
+					resolve({ status: "aborted" });
+				}
+			};
+			signal.addEventListener("abort", onAbort, { once: true });
+		}
+		if (remMs !== undefined) {
+			const delayMs = Math.max(1, Math.ceil(remMs));
+			timer = setTimeout(() => {
+				if (!settled) {
+					settled = true;
+					resolve({ status: "timeout" });
+				}
+			}, delayMs);
+			timer.unref?.();
+		}
+	});
+
+	try {
+		const outcome = await Promise.race([wrappedOp, guardPromise]);
+		if (outcome.status === "ok" || outcome.status === "error") {
+			if (signal?.aborted) {
+				if (outcome.status === "ok" && onLateSuccess) {
+					try {
+						onLateSuccess(outcome.value);
+					} catch {
+						// Ignore cleanup errors.
+					}
+				}
+				return { status: "aborted" };
+			}
+			if (isResultFileBudgetExpired(context)) {
+				if (outcome.status === "ok" && onLateSuccess) {
+					try {
+						onLateSuccess(outcome.value);
+					} catch {
+						// Ignore cleanup errors.
+					}
+				}
+				return { status: "timeout" };
+			}
+		}
+		return outcome;
+	} finally {
+		if (timer !== undefined) clearTimeout(timer);
+		if (signal && onAbort) signal.removeEventListener("abort", onAbort);
+	}
+}
+
 async function checkResultFileAbsent(
 	fsOps: ResultFileFs,
 	resultFile: string,
+	context?: ResultFileBudgetContext,
 ): Promise<string | undefined> {
-	try {
-		await fsOps.lstat(resultFile);
-		return `result_file already exists at ${resultFile}; use a new path for each call.`;
-	} catch (error) {
-		if (isMissingPath(error)) return undefined;
-		return `Cannot inspect result_file ${resultFile}: ${errorMessage(error)}`;
+	if (!context) {
+		try {
+			await fsOps.lstat(resultFile);
+			return `result_file already exists at ${resultFile}; use a new path for each call.`;
+		} catch (error) {
+			if (isMissingPath(error)) return undefined;
+			return `Cannot inspect result_file ${resultFile}: ${errorMessage(error)}`;
+		}
 	}
+	const raced = await raceResultFileOp(
+		() => fsOps.lstat(resultFile),
+		context,
+	);
+	if (raced.status === "aborted") return "aborted";
+	if (raced.status === "timeout") return "timeout";
+	if (raced.status === "ok") {
+		if (context.fixedMessages) {
+			return "result file check failed: already exists";
+		}
+		return `result_file already exists at ${resultFile}; use a new path for each call.`;
+	}
+	if (isMissingPath(raced.error)) return undefined;
+	if (context.fixedMessages) {
+		return "result file check failed: lstat_failed";
+	}
+	return `Cannot inspect result_file ${resultFile}: ${errorMessage(raced.error)}`;
 }
 
 type RecoveredResultFile =
 	| { ok: true; answer: string }
 	| {
 			ok: false;
-			code: "aborted" | "result_file_missing" | "result_file_invalid";
+			code:
+				| "aborted"
+				| "timeout"
+				| "result_file_missing"
+				| "result_file_invalid";
 			message: string;
 	  };
 
@@ -502,64 +670,239 @@ function abortedResultFile(): RecoveredResultFile {
 	};
 }
 
+function timeoutResultFile(): RecoveredResultFile {
+	return {
+		ok: false,
+		code: "timeout",
+		message:
+			"Result file recovery exceeded the call budget after prompt submission.",
+	};
+}
+
 async function recoverResultFile(
 	fsOps: ResultFileFs,
 	resultFile: string,
 	signal?: AbortSignal,
+	context?: ResultFileBudgetContext,
 ): Promise<RecoveredResultFile> {
-	if (signal?.aborted) return abortedResultFile();
-	let handle: ResultFileHandle;
-	try {
-		handle = await fsOps.open(resultFile, RESULT_FILE_OPEN_FLAGS);
-	} catch (error) {
+	if (!context) {
 		if (signal?.aborted) return abortedResultFile();
-		if (isMissingPath(error)) {
+		let handle: ResultFileHandle;
+		try {
+			handle = await fsOps.open(resultFile, RESULT_FILE_OPEN_FLAGS);
+		} catch (error) {
+			if (signal?.aborted) return abortedResultFile();
+			if (isMissingPath(error)) {
+				return {
+					ok: false,
+					code: "result_file_missing",
+					message: `Result file was not created at ${resultFile}.`,
+				};
+			}
+			return {
+				ok: false,
+				code: "result_file_invalid",
+				message: `Result file at ${resultFile} could not be opened: ${errorMessage(error)}`,
+			};
+		}
+		try {
+			if (signal?.aborted) return abortedResultFile();
+			let stat: ResultFileStat;
+			try {
+				stat = await handle.stat();
+			} catch (error) {
+				if (signal?.aborted) return abortedResultFile();
+				return {
+					ok: false,
+					code: "result_file_invalid",
+					message: `Result file at ${resultFile} could not be inspected: ${errorMessage(error)}`,
+				};
+			}
+			if (signal?.aborted) return abortedResultFile();
+			if (!stat.isFile()) {
+				return {
+					ok: false,
+					code: "result_file_invalid",
+					message: `Result file at ${resultFile} is not a regular file.`,
+				};
+			}
+			if (stat.nlink !== 1) {
+				return {
+					ok: false,
+					code: "result_file_invalid",
+					message: `Result file at ${resultFile} must have link count 1 (got ${stat.nlink}).`,
+				};
+			}
+			if (stat.size <= 0 || stat.size > MAX_RESULT_FILE_BYTES) {
+				return {
+					ok: false,
+					code: "result_file_invalid",
+					message:
+						stat.size <= 0
+							? `Result file at ${resultFile} is empty.`
+							: `Result file at ${resultFile} exceeds the 1 MiB limit (${stat.size} bytes).`,
+				};
+			}
+			const maxReadBytes = MAX_RESULT_FILE_BYTES + 1;
+			const buffer = new Uint8Array(maxReadBytes);
+			let totalBytes = 0;
+			try {
+				while (totalBytes < maxReadBytes) {
+					if (signal?.aborted) return abortedResultFile();
+					const { bytesRead, buffer: chunkBuffer } = await handle.read(
+						buffer,
+						totalBytes,
+						maxReadBytes - totalBytes,
+						totalBytes,
+					);
+					if (signal?.aborted) return abortedResultFile();
+					if (bytesRead <= 0) break;
+					if (chunkBuffer && chunkBuffer !== buffer) {
+						const copyLen = Math.min(bytesRead, maxReadBytes - totalBytes);
+						buffer.set(chunkBuffer.subarray(0, copyLen), totalBytes);
+					}
+					totalBytes += bytesRead;
+				}
+			} catch (error) {
+				if (signal?.aborted) return abortedResultFile();
+				return {
+					ok: false,
+					code: "result_file_invalid",
+					message: `Result file at ${resultFile} could not be read: ${errorMessage(error)}`,
+				};
+			}
+			if (signal?.aborted) return abortedResultFile();
+			if (totalBytes <= 0 || totalBytes > MAX_RESULT_FILE_BYTES) {
+				return {
+					ok: false,
+					code: "result_file_invalid",
+					message:
+						totalBytes <= 0
+							? `Result file at ${resultFile} is empty.`
+							: `Result file at ${resultFile} exceeds the 1 MiB limit (${totalBytes} bytes).`,
+				};
+			}
+			let answer: string;
+			try {
+				answer = new TextDecoder("utf-8", { fatal: true }).decode(
+					buffer.subarray(0, totalBytes),
+				);
+			} catch (error) {
+				if (signal?.aborted) return abortedResultFile();
+				return {
+					ok: false,
+					code: "result_file_invalid",
+					message: `Result file at ${resultFile} is not valid UTF-8: ${errorMessage(error)}`,
+				};
+			}
+			if (signal?.aborted) return abortedResultFile();
+			return { ok: true, answer };
+		} finally {
+			try {
+				await handle.close();
+			} catch {
+				// Ignore close errors so the primary recovery verdict is preserved.
+			}
+		}
+	}
+
+	const effSignal = context.signal ?? signal;
+	const effContext: ResultFileBudgetContext = {
+		...context,
+		signal: effSignal,
+	};
+	const fixed = effContext.fixedMessages === true;
+	const opened = await raceResultFileOp(
+		() => fsOps.open(resultFile, RESULT_FILE_OPEN_FLAGS),
+		effContext,
+		(lateHandle) => {
+			try {
+				void lateHandle.close().catch(() => {});
+			} catch {
+				// Ignore close errors on late open.
+			}
+		},
+	);
+	if (opened.status === "aborted") return abortedResultFile();
+	if (opened.status === "timeout") return timeoutResultFile();
+	if (opened.status === "error") {
+		if (isMissingPath(opened.error)) {
 			return {
 				ok: false,
 				code: "result_file_missing",
-				message: `Result file was not created at ${resultFile}.`,
+				message: fixed
+					? "result file check failed: result_file_missing"
+					: `Result file was not created at ${resultFile}.`,
 			};
 		}
 		return {
 			ok: false,
 			code: "result_file_invalid",
-			message: `Result file at ${resultFile} could not be opened: ${errorMessage(error)}`,
+			message: fixed
+				? "result file check failed: result_file_invalid"
+				: `Result file at ${resultFile} could not be opened: ${errorMessage(opened.error)}`,
 		};
 	}
+	const handle = opened.value;
+	let opInFlight = false;
+	let lastOpPromise: Promise<unknown> | undefined;
+	const trackOp = <T>(p: Promise<T>): Promise<T> => {
+		opInFlight = true;
+		const tracked = p.then(
+			(v) => {
+				opInFlight = false;
+				return v;
+			},
+			(e) => {
+				opInFlight = false;
+				throw e;
+			},
+		);
+		lastOpPromise = tracked.catch(() => {});
+		return tracked;
+	};
 	try {
-		if (signal?.aborted) return abortedResultFile();
-		let stat: ResultFileStat;
-		try {
-			stat = await handle.stat();
-		} catch (error) {
-			if (signal?.aborted) return abortedResultFile();
+		const statted = await raceResultFileOp(
+			() => trackOp(handle.stat()),
+			effContext,
+		);
+		if (statted.status === "aborted") return abortedResultFile();
+		if (statted.status === "timeout") return timeoutResultFile();
+		if (statted.status === "error") {
 			return {
 				ok: false,
 				code: "result_file_invalid",
-				message: `Result file at ${resultFile} could not be inspected: ${errorMessage(error)}`,
+				message: fixed
+					? "result file check failed: result_file_invalid"
+					: `Result file at ${resultFile} could not be inspected: ${errorMessage(statted.error)}`,
 			};
 		}
-		if (signal?.aborted) return abortedResultFile();
+		const stat = statted.value;
 		if (!stat.isFile()) {
 			return {
 				ok: false,
 				code: "result_file_invalid",
-				message: `Result file at ${resultFile} is not a regular file.`,
+				message: fixed
+					? "result file check failed: result_file_invalid"
+					: `Result file at ${resultFile} is not a regular file.`,
 			};
 		}
 		if (stat.nlink !== 1) {
 			return {
 				ok: false,
 				code: "result_file_invalid",
-				message: `Result file at ${resultFile} must have link count 1 (got ${stat.nlink}).`,
+				message: fixed
+					? "result file check failed: result_file_invalid"
+					: `Result file at ${resultFile} must have link count 1 (got ${stat.nlink}).`,
 			};
 		}
 		if (stat.size <= 0 || stat.size > MAX_RESULT_FILE_BYTES) {
 			return {
 				ok: false,
 				code: "result_file_invalid",
-				message:
-					stat.size <= 0
+				message: fixed
+					? "result file check failed: result_file_invalid"
+					: stat.size <= 0
 						? `Result file at ${resultFile} is empty.`
 						: `Result file at ${resultFile} exceeds the 1 MiB limit (${stat.size} bytes).`,
 			};
@@ -567,37 +910,47 @@ async function recoverResultFile(
 		const maxReadBytes = MAX_RESULT_FILE_BYTES + 1;
 		const buffer = new Uint8Array(maxReadBytes);
 		let totalBytes = 0;
-		try {
-			while (totalBytes < maxReadBytes) {
-				const { bytesRead, buffer: chunkBuffer } = await handle.read(
-					buffer,
-					totalBytes,
-					maxReadBytes - totalBytes,
-					totalBytes,
-				);
-				if (signal?.aborted) return abortedResultFile();
-				if (bytesRead <= 0) break;
-				if (chunkBuffer && chunkBuffer !== buffer) {
-					const copyLen = Math.min(bytesRead, maxReadBytes - totalBytes);
-					buffer.set(chunkBuffer.subarray(0, copyLen), totalBytes);
-				}
-				totalBytes += bytesRead;
+		while (totalBytes < maxReadBytes) {
+			const readStep = await raceResultFileOp(
+				() =>
+					trackOp(
+						handle.read(
+							buffer,
+							totalBytes,
+							maxReadBytes - totalBytes,
+							totalBytes,
+						),
+					),
+				effContext,
+			);
+			if (readStep.status === "aborted") return abortedResultFile();
+			if (readStep.status === "timeout") return timeoutResultFile();
+			if (readStep.status === "error") {
+				return {
+					ok: false,
+					code: "result_file_invalid",
+					message: fixed
+						? "result file check failed: result_file_invalid"
+						: `Result file at ${resultFile} could not be read: ${errorMessage(readStep.error)}`,
+				};
 			}
-		} catch (error) {
-			if (signal?.aborted) return abortedResultFile();
-			return {
-				ok: false,
-				code: "result_file_invalid",
-				message: `Result file at ${resultFile} could not be read: ${errorMessage(error)}`,
-			};
+			const { bytesRead, buffer: chunkBuffer } = readStep.value;
+			if (bytesRead <= 0) break;
+			if (chunkBuffer && chunkBuffer !== buffer) {
+				const copyLen = Math.min(bytesRead, maxReadBytes - totalBytes);
+				buffer.set(chunkBuffer.subarray(0, copyLen), totalBytes);
+			}
+			totalBytes += bytesRead;
 		}
-		if (signal?.aborted) return abortedResultFile();
+		if (effSignal?.aborted) return abortedResultFile();
+		if (isResultFileBudgetExpired(effContext)) return timeoutResultFile();
 		if (totalBytes <= 0 || totalBytes > MAX_RESULT_FILE_BYTES) {
 			return {
 				ok: false,
 				code: "result_file_invalid",
-				message:
-					totalBytes <= 0
+				message: fixed
+					? "result file check failed: result_file_invalid"
+					: totalBytes <= 0
 						? `Result file at ${resultFile} is empty.`
 						: `Result file at ${resultFile} exceeds the 1 MiB limit (${totalBytes} bytes).`,
 			};
@@ -608,20 +961,38 @@ async function recoverResultFile(
 				buffer.subarray(0, totalBytes),
 			);
 		} catch (error) {
-			if (signal?.aborted) return abortedResultFile();
+			if (effSignal?.aborted) return abortedResultFile();
+			if (isResultFileBudgetExpired(effContext)) return timeoutResultFile();
 			return {
 				ok: false,
 				code: "result_file_invalid",
-				message: `Result file at ${resultFile} is not valid UTF-8: ${errorMessage(error)}`,
+				message: fixed
+					? "result file check failed: result_file_invalid"
+					: `Result file at ${resultFile} is not valid UTF-8: ${errorMessage(error)}`,
 			};
 		}
-		if (signal?.aborted) return abortedResultFile();
+		if (effSignal?.aborted) return abortedResultFile();
+		if (isResultFileBudgetExpired(effContext)) return timeoutResultFile();
 		return { ok: true, answer };
 	} finally {
-		try {
-			await handle.close();
-		} catch {
-			// Ignore close errors so the primary recovery verdict is preserved.
+		if (opInFlight && lastOpPromise) {
+			void lastOpPromise.then(() => {
+				try {
+					void handle.close().catch(() => {});
+				} catch {
+					// Ignore close errors.
+				}
+			});
+		} else if (effSignal?.aborted || isResultFileBudgetExpired(effContext)) {
+			try {
+				const closePromise = handle.close();
+				closePromise.catch(() => {});
+				await Promise.race([closePromise, Promise.resolve()]);
+			} catch {
+				// Ignore close errors.
+			}
+		} else {
+			await raceResultFileOp(() => handle.close(), effContext);
 		}
 	}
 }
@@ -879,6 +1250,9 @@ export async function callRegisteredAgent(
 	senderPane: string | undefined,
 	signal?: AbortSignal,
 ): Promise<AgentCallResult> {
+	if (deps.backend === "hc") {
+		return callViaHc(deps, request, signal);
+	}
 	const now = deps.now ?? (() => performance.now());
 	const startedAt = now();
 	let deadline = startedAt + CALL_BUDGET_MS;
@@ -1610,18 +1984,59 @@ export function describeCallResult(result: AgentCallResult): string {
 	return parts.join("\n");
 }
 
+export interface RegisterCallOptions {
+	backend?: "herdr" | "hc";
+	hcBin?: string;
+	hcCallerId?: string;
+}
+
+export const HC_CALL_BACKEND_NOTE =
+	"hc: unattended target assumed (not verified by the plugin); a target left in done cannot take a follow-up automatically; text delivery only, no GJC session token";
+
 export function registerCallFeatures(
 	api: ExtensionAPI,
 	herdrBin: string,
 	senderPane: string | undefined,
+	options?: RegisterCallOptions,
 ): void {
+	const resolvedOptions: RegisterCallOptions = options ?? {};
+	const isHc = resolvedOptions.backend === "hc";
 	const deps: AgentCallDeps = {
 		exec: api.exec.bind(api),
 		herdrBin,
 		inFlight: new Set<string>(),
+		...(resolvedOptions.backend !== undefined
+			? { backend: resolvedOptions.backend }
+			: {}),
+		...(resolvedOptions.hcBin !== undefined
+			? { hcBin: resolvedOptions.hcBin }
+			: {}),
+		...(resolvedOptions.hcCallerId !== undefined
+			? { hcCallerId: resolvedOptions.hcCallerId }
+			: {}),
 	};
 
 	function summarize(result: AgentCallResult): void {
+		if (deps.backend === "hc") {
+			const phase = result.ok
+				? "completed"
+				: result.delivery === "not_sent"
+					? "pre_send"
+					: result.delivery === "unknown"
+						? "send"
+						: "post_send";
+			api.logger.info("herdr-call finished", {
+				backend: "hc",
+				phase,
+				code: result.error?.code,
+				status: result.status,
+				delivery: result.delivery,
+				elapsedMs: result.elapsedMs,
+				hasResultFile: Boolean(result.resultFile),
+				resultFileLength: result.resultFile?.length ?? 0,
+			});
+			return;
+		}
 		api.logger.info("herdr-call finished", {
 			requestId: result.requestId,
 			pane: result.pane,
@@ -1634,9 +2049,28 @@ export function registerCallFeatures(
 		});
 	}
 
+	const commandDescription = isHc
+		? "Call an hc terminal agent in another local terminal and recover its answer from --result-file: --result-file <abs-path> <terminal-id-or-unique-name> <text> " +
+			`(--result-file required, idle targets only, local address only, no screen read; ${HC_CALL_BACKEND_NOTE})`
+		: "Call a Herdr-registered agent in another pane and get its answer back: [--result-file <abs-path>] <pane-id-or-unique-agent-name> <text> " +
+			`(Herdr backend uses screen markers or optional --result-file; when running on hc: --result-file required, idle targets only, local address only, no screen read; ${HC_CALL_BACKEND_NOTE})`;
+
+	const toolDescription = isHc
+		? "Call an hc terminal agent in another local terminal and recover its answer text from `result_file` (60s total budget, 5s reserved for file recovery). " +
+			"`target` must be an explicit local hc terminal ID (e.g. t2) or a name that resolves to exactly one terminal, and `result_file` is required (--result-file required, idle targets only, local address only, no screen read). " +
+			`${HC_CALL_BACKEND_NOTE}. ` +
+			"No remote approvals, key presses, or retries are ever sent."
+		: "Call a Herdr-registered agent (Claude Code, Codex, Copilot, Gemini, ...) in another Herdr pane and get its answer text back. " +
+			"`target` must be an explicit Herdr pane ID or a name that resolves to exactly one agent; the target must be observed idle/done, " +
+			"and Herdr's own known-agent/foreground gate decides finally whether the prompt is sent (zero input on rejection). " +
+			"One prompt with a bounded wait (60s total budget) and bounded 200-line screen reads (initial unwrapped read, at most one --source recent retry if only the end marker is visible, or one confirmation read after a prompt timeout); the answer is recovered from " +
+			"per-request marker lines, or from `result_file` when a new absolute file path is provided (must not already exist before sending; resilient to long answers and folded/truncated terminal output; the target agent must be able to write to that path, e.g. inside the repository for sandboxed agy). " +
+			"Anything less is returned as an unverified capture instead of a success. " +
+			"No remote approvals, key presses, or retries are ever sent. For GJC targets use the existing herdr_send tool instead. " +
+			`(When running on hc instead of Herdr: --result-file required, idle targets only, local address only, no screen read; ${HC_CALL_BACKEND_NOTE})`;
+
 	api.registerCommand("herdr-call", {
-		description:
-			"Call a Herdr-registered agent in another pane and get its answer back: [--result-file <abs-path>] <pane-id-or-unique-agent-name> <text>",
+		description: commandDescription,
 		handler: async (args: string) => {
 			const request = parseCallCommandArgs(args);
 			const result: AgentCallResult =
@@ -1668,24 +2102,29 @@ export function registerCallFeatures(
 	api.registerTool({
 		name: "herdr_agent_call",
 		label: "Herdr Agent Call",
-		description:
-			"Call a Herdr-registered agent (Claude Code, Codex, Copilot, Gemini, ...) in another Herdr pane and get its answer text back. " +
-			"`target` must be an explicit Herdr pane ID or a name that resolves to exactly one agent; the target must be observed idle/done, " +
-			"and Herdr's own known-agent/foreground gate decides finally whether the prompt is sent (zero input on rejection). " +
-			"One prompt with a bounded wait (60s total budget) and bounded 200-line screen reads (initial unwrapped read, at most one --source recent retry if only the end marker is visible, or one confirmation read after a prompt timeout); the answer is recovered from " +
-			"per-request marker lines, or from `result_file` when a new absolute file path is provided (must not already exist before sending; resilient to long answers and folded/truncated terminal output; the target agent must be able to write to that path, e.g. inside the repository for sandboxed agy). " +
-			"Anything less is returned as an unverified capture instead of a success. " +
-			"No remote approvals, key presses, or retries are ever sent. For GJC targets use the existing herdr_send tool instead.",
+		description: toolDescription,
 		parameters: z.object({
 			target: z
 				.string()
-				.describe("Target Herdr pane ID (e.g. wC:p2) or unique agent name"),
-			text: z.string().describe("Prompt text to deliver verbatim"),
+				.describe(
+					isHc
+						? "Target local hc terminal ID (e.g. t2) or unique terminal name"
+						: "Target Herdr pane ID (e.g. wC:p2) or unique agent name",
+				),
+			text: z
+				.string()
+				.describe(
+					isHc
+						? "Prompt text to deliver verbatim (must not start with '-')"
+						: "Prompt text to deliver verbatim",
+				),
 			result_file: z
 				.string()
 				.optional()
 				.describe(
-					"Optional new absolute path (must not exist before sending) where the target agent writes its full answer (resilient to long output or screen folding; target agent must have write access, e.g. inside the workspace for sandboxed agy)",
+					isHc
+						? "Required on hc: new local absolute path (must not exist before sending) where the target agent writes its full answer"
+						: "Optional new absolute path (must not exist before sending) where the target agent writes its full answer (resilient to long output or screen folding; target agent must have write access, e.g. inside the workspace for sandboxed agy)",
 				),
 		}),
 		async execute(_toolCallId: string, params, signal) {
@@ -1709,4 +2148,769 @@ export function registerCallFeatures(
 			};
 		},
 	});
+}
+
+const HC_FILE_RESERVE_MS = 5_000;
+
+function isValidResultFilePath(rawResultFile: string): boolean {
+	return Boolean(
+		rawResultFile &&
+			rawResultFile.trim() &&
+			rawResultFile === rawResultFile.trim() &&
+			!/[\0\r\n]/.test(rawResultFile) &&
+			isAbsolute(rawResultFile),
+	);
+}
+
+/**
+ * Calls an `hc` terminal agent and recovers its answer from `--result-file`:
+ * result-file required & pre-check -> resolve target (local only) -> caller/self check ->
+ * inFlight -> preflight `hc get` (live, reported===true, status.state==="idle") ->
+ * pre-send result-file re-check -> `hc send --json --if idle --wait --timeout` ->
+ * turn/wait correlation (with follow-up `hc wait` on ended=false timeout/message) ->
+ * `recoverResultFile` (`markerVerified: false`, no screen read).
+ */
+export async function callViaHc(
+	deps: AgentCallDeps,
+	request: AgentCallRequest,
+	signal?: AbortSignal,
+): Promise<AgentCallResult> {
+	const now = deps.now ?? (() => performance.now());
+	const startedAt = now();
+	const deadline = startedAt + CALL_BUDGET_MS;
+	const waitDeadline = deadline - HC_FILE_RESERVE_MS;
+	const requestId = randomUUID();
+	const rawResultFile = request.resultFile ?? request.result_file;
+	const finish = (
+		partial: Partial<AgentCallResult> & {
+			status: AgentCallStatus;
+			delivery: DeliveryCertainty;
+		},
+	): AgentCallResult => ({
+		ok: false,
+		requestId,
+		elapsedMs: now() - startedAt,
+		...(rawResultFile !== undefined ? { resultFile: rawResultFile } : {}),
+		...partial,
+	});
+
+	if (rawResultFile === undefined) {
+		return finish({
+			status: "not_sent",
+			delivery: "not_sent",
+			error: {
+				code: "invalid_request",
+				message: "hc backend requires --result-file",
+			},
+		});
+	}
+	if (!isValidResultFilePath(rawResultFile)) {
+		return finish({
+			status: "not_sent",
+			delivery: "not_sent",
+			error: {
+				code: "invalid_request",
+				message:
+					"result_file must be a non-empty absolute path without NUL or newline characters.",
+			},
+		});
+	}
+
+	const target = request.target.trim();
+	if (!target) {
+		return finish({
+			status: "not_sent",
+			delivery: "not_sent",
+			error: { code: "invalid_request", message: "Target is required." },
+		});
+	}
+	if (target.startsWith("-")) {
+		return finish({
+			status: "not_sent",
+			delivery: "not_sent",
+			error: {
+				code: "invalid_request",
+				message: "Target must be an hc terminal address or name, not an option.",
+			},
+		});
+	}
+	if (!request.text.trim()) {
+		return finish({
+			status: "not_sent",
+			delivery: "not_sent",
+			error: {
+				code: "invalid_request",
+				message: "Prompt text must not be empty.",
+			},
+		});
+	}
+	if (request.text.startsWith("-")) {
+		return finish({
+			status: "not_sent",
+			delivery: "not_sent",
+			error: {
+				code: "invalid_request",
+				message: "text starting with '-' unsupported on hc",
+			},
+		});
+	}
+	if (signal?.aborted) {
+		return finish({
+			status: "not_sent",
+			delivery: "not_sent",
+			error: { code: "aborted", message: "Call aborted before delivery." },
+		});
+	}
+
+	const fsOps = deps.fs ?? defaultFs;
+	const preSendFileBudget: ResultFileBudgetContext = {
+		deadline: waitDeadline,
+		signal,
+		now,
+		fixedMessages: true,
+	};
+	const initialConflict = await checkResultFileAbsent(
+		fsOps,
+		rawResultFile,
+		preSendFileBudget,
+	);
+	if (signal?.aborted || initialConflict === "aborted") {
+		return finish({
+			status: "not_sent",
+			delivery: "not_sent",
+			error: { code: "aborted", message: "Call aborted before delivery." },
+		});
+	}
+	if (initialConflict === "timeout") {
+		return finish({
+			status: "not_sent",
+			delivery: "not_sent",
+			error: {
+				code: "timeout",
+				message: "result file check timed out",
+			},
+		});
+	}
+	if (initialConflict !== undefined) {
+		return finish({
+			status: "not_sent",
+			delivery: "not_sent",
+			error: {
+				code: "invalid_request",
+				message: initialConflict,
+			},
+		});
+	}
+
+	if (isValidHcAddress(target) && isRemoteHcAddress(target)) {
+		return finish({
+			status: "not_sent",
+			delivery: "not_sent",
+			pane: target,
+			error: {
+				code: "invalid_request",
+				message: "remote result file recovery unsupported",
+			},
+		});
+	}
+	if (
+		!isValidHcAddress(target) &&
+		(target.includes("/") || !HC_NAME_RE.test(target))
+	) {
+		return finish({
+			status: "not_sent",
+			delivery: "not_sent",
+			error: {
+				code: "invalid_request",
+				message:
+					"Target is neither a valid hc terminal address nor a valid terminal name.",
+			},
+		});
+	}
+
+	const callerId = deps.hcCallerId?.trim();
+	if (!callerId || !isValidHcAddress(callerId)) {
+		return finish({
+			status: "not_sent",
+			delivery: "not_sent",
+			error: {
+				code: "invalid_request",
+				message: "hc caller unknown",
+			},
+		});
+	}
+
+	const hcDeps: HcExecDeps = {
+		exec: deps.exec,
+		hcBin: deps.hcBin ?? "hc",
+	};
+
+	const resolved = await hcResolveTarget(
+		hcDeps,
+		target,
+		Math.min(LOOKUP_TIMEOUT_MS, waitDeadline - now()),
+		signal,
+	);
+	if (!resolved.ok) {
+		return finish({
+			status: "not_sent",
+			delivery: "not_sent",
+			error: {
+				code: resolved.code,
+				message: resolved.message,
+				...(resolved.exitCode !== undefined
+					? { exitCode: resolved.exitCode }
+					: {}),
+			},
+		});
+	}
+	const addr = resolved.address;
+	if (resolved.remote) {
+		return finish({
+			status: "not_sent",
+			delivery: "not_sent",
+			pane: addr,
+			error: {
+				code: "invalid_request",
+				message: "remote result file recovery unsupported",
+			},
+		});
+	}
+	if (isSelf(addr, callerId)) {
+		return finish({
+			status: "not_sent",
+			delivery: "not_sent",
+			pane: addr,
+			error: {
+				code: "self_target",
+				message: "Cannot call the current hc terminal.",
+			},
+		});
+	}
+
+	if (deps.inFlight.has(addr)) {
+		return finish({
+			status: "not_sent",
+			delivery: "not_sent",
+			pane: addr,
+			error: {
+				code: "target_busy",
+				message: "Another call to this terminal is already in flight here.",
+			},
+		});
+	}
+
+	deps.inFlight.add(addr);
+	try {
+		const preflight = await hcGet(
+			hcDeps,
+			addr,
+			Math.min(LOOKUP_TIMEOUT_MS, waitDeadline - now()),
+			signal,
+		);
+		if (!preflight.ok) {
+			return finish({
+				status: "not_sent",
+				delivery: "not_sent",
+				pane: addr,
+				error: {
+					code: preflight.code,
+					message: preflight.message,
+					...(preflight.exitCode !== undefined
+						? { exitCode: preflight.exitCode }
+						: {}),
+				},
+			});
+		}
+
+		const facts = preflight.facts;
+		if (facts.state === "finished") {
+			return finish({
+				status: "not_sent",
+				delivery: "not_sent",
+				pane: addr,
+				state: "finished",
+				error: {
+					code: "terminal_finished",
+					message: "Target terminal has finished; no input was sent.",
+				},
+			});
+		}
+		if (facts.reported !== true) {
+			return finish({
+				status: "not_sent",
+				delivery: "not_sent",
+				pane: addr,
+				...(facts.statusState ? { state: facts.statusState } : {}),
+				error: {
+					code: "not_reported",
+					message:
+						"Target terminal has not reported status (OSC 7501); no input was sent.",
+				},
+			});
+		}
+		if (facts.statusState === "done") {
+			return finish({
+				status: "not_sent",
+				delivery: "not_sent",
+				pane: addr,
+				state: "done",
+				error: {
+					code: "agent_done",
+					message: "target finished its last turn; a new turn needs idle",
+				},
+			});
+		}
+		if (facts.statusState === "working") {
+			return finish({
+				status: "not_sent",
+				delivery: "not_sent",
+				pane: addr,
+				state: "working",
+				error: {
+					code: "agent_busy",
+					message: "Target agent is currently working; no input was sent.",
+				},
+			});
+		}
+		if (facts.statusState === "blocked") {
+			return finish({
+				status: "not_sent",
+				delivery: "not_sent",
+				pane: addr,
+				state: "blocked",
+				error: {
+					code: "agent_blocked",
+					message:
+						"Target is blocked waiting for a user decision; no input was sent.",
+				},
+			});
+		}
+		if (facts.statusState !== "idle") {
+			return finish({
+				status: "not_sent",
+				delivery: "not_sent",
+				pane: addr,
+				...(facts.statusState ? { state: facts.statusState } : {}),
+				error: {
+					code: "agent_state_unknown",
+					message: "Target agent state is not idle; no input was sent.",
+				},
+			});
+		}
+
+		const patchedText =
+			request.text + resultFileInstruction(requestId, rawResultFile);
+		const preSendConflict = await checkResultFileAbsent(
+			fsOps,
+			rawResultFile,
+			preSendFileBudget,
+		);
+		if (signal?.aborted || preSendConflict === "aborted") {
+			return finish({
+				status: "not_sent",
+				delivery: "not_sent",
+				pane: addr,
+				state: "idle",
+				error: { code: "aborted", message: "Call aborted before delivery." },
+			});
+		}
+		if (preSendConflict === "timeout") {
+			return finish({
+				status: "not_sent",
+				delivery: "not_sent",
+				pane: addr,
+				state: "idle",
+				error: {
+					code: "timeout",
+					message: "result file check timed out",
+				},
+			});
+		}
+		if (preSendConflict !== undefined) {
+			return finish({
+				status: "not_sent",
+				delivery: "not_sent",
+				pane: addr,
+				state: "idle",
+				error: {
+					code: "invalid_request",
+					message: preSendConflict,
+				},
+			});
+		}
+
+		const sendRemMs = waitDeadline - now();
+		if (Math.floor(sendRemMs) < 1) {
+			return finish({
+				status: "not_sent",
+				delivery: "not_sent",
+				pane: addr,
+				state: "idle",
+				error: {
+					code: "timeout",
+					message: "Call budget exhausted before hc send.",
+				},
+			});
+		}
+		const sendTimeoutSec = Math.max(1, Math.ceil(sendRemMs / 1000));
+		const sent = await hcSend(
+			hcDeps,
+			addr,
+			patchedText,
+			{ wait: true, timeoutSec: sendTimeoutSec },
+			Math.floor(sendRemMs),
+			signal,
+		);
+		if (!sent.ok) {
+			return finish({
+				status: sent.certainty === "not_sent" ? "not_sent" : "uncertain",
+				delivery: sent.certainty,
+				pane: addr,
+				error: {
+					code: sent.code,
+					message: sent.message,
+					...(sent.exitCode !== undefined ? { exitCode: sent.exitCode } : {}),
+				},
+			});
+		}
+
+		if (sent.turn < facts.turn) {
+			return finish({
+				status: "uncertain",
+				delivery: "submitted",
+				pane: addr,
+				error: {
+					code: "protocol",
+					message:
+						"hc send reported a turn earlier than preflight get; answer recovery skipped.",
+				},
+			});
+		}
+		if (!sent.waitValid) {
+			return finish({
+				status: "uncertain",
+				delivery: "submitted",
+				pane: addr,
+				error: {
+					code: "protocol",
+					message:
+						"hc send returned a malformed wait object; answer recovery skipped.",
+				},
+			});
+		}
+		if (sent.wait === null || sent.wait === undefined) {
+			if (sent.started === false) {
+				return finish({
+					status: "stalled",
+					delivery: "submitted",
+					pane: addr,
+					error: {
+						code: "stalled",
+						message:
+							"Prompt was submitted to hc, but the target did not start working.",
+					},
+				});
+			}
+			return finish({
+				status: "uncertain",
+				delivery: "submitted",
+				pane: addr,
+				error: {
+					code: "protocol",
+					message:
+						"hc send --wait returned no wait result; answer recovery skipped.",
+				},
+			});
+		}
+
+		let currentWait = sent.wait;
+		let lastTurn = sent.turn;
+		let settled: "idle" | "done";
+
+		for (;;) {
+			if (currentWait.terminal !== addr) {
+				return finish({
+					status: "uncertain",
+					delivery: "submitted",
+					pane: addr,
+					error: {
+						code: "protocol",
+						message:
+							"hc wait response terminal did not match target address; answer recovery skipped.",
+					},
+				});
+			}
+			if (currentWait.turn < sent.turn || currentWait.turn < lastTurn) {
+				return finish({
+					status: "uncertain",
+					delivery: "submitted",
+					pane: addr,
+					error: {
+						code: "protocol",
+						message:
+							"hc wait reported a turn earlier than the send turn; answer recovery skipped.",
+					},
+				});
+			}
+			lastTurn = currentWait.turn;
+
+			if (currentWait.reason === "not_started") {
+				return finish({
+					status: "stalled",
+					delivery: "submitted",
+					pane: addr,
+					...(currentWait.status ? { state: currentWait.status } : {}),
+					error: {
+						code: "stalled",
+						message:
+							"Prompt was submitted to hc, but the target did not start working (not_started).",
+					},
+				});
+			}
+			if (currentWait.reason === "exit") {
+				if (currentWait.ended !== true) {
+					return finish({
+						status: "uncertain",
+						delivery: "submitted",
+						pane: addr,
+						error: {
+							code: "protocol",
+							message:
+								"hc wait reported exit with ended=false; answer recovery skipped.",
+						},
+					});
+				}
+				const exitParts: string[] = [];
+				if (currentWait.exitCode !== null) {
+					exitParts.push(`exit_code=${currentWait.exitCode}`);
+				}
+				if (currentWait.signal !== null) {
+					exitParts.push(`signal=${currentWait.signal}`);
+				}
+				const exitDetail =
+					exitParts.length > 0 ? exitParts.join(", ") : "no exit code";
+				return finish({
+					status: "response_unverified",
+					delivery: "submitted",
+					pane: addr,
+					state: "finished",
+					error: {
+						code: "terminal_finished",
+						message: `Target terminal exited before completing the turn (${exitDetail}); answer recovery skipped.`,
+						...(currentWait.exitCode !== null
+							? { exitCode: currentWait.exitCode }
+							: {}),
+					},
+				});
+			}
+			if (currentWait.status === "blocked") {
+				return finish({
+					status: "response_unverified",
+					delivery: "submitted",
+					pane: addr,
+					state: "blocked",
+					error: {
+						code: "agent_blocked",
+						message:
+							"Target is blocked waiting for a user decision after prompt submission; answer recovery skipped.",
+					},
+				});
+			}
+			if (currentWait.status === "error") {
+				return finish({
+					status: "response_unverified",
+					delivery: "submitted",
+					pane: addr,
+					state: "error",
+					error: {
+						code: "agent_error",
+						message:
+							"Target reported error status after prompt submission; answer recovery skipped.",
+					},
+				});
+			}
+
+			if (currentWait.ended === true) {
+				if (currentWait.reason !== "status") {
+					return finish({
+						status: "uncertain",
+						delivery: "submitted",
+						pane: addr,
+						...(currentWait.status ? { state: currentWait.status } : {}),
+						error: {
+							code: "protocol",
+							message:
+								"hc wait ended with an unexpected reason; answer recovery skipped.",
+						},
+					});
+				}
+				if (currentWait.status !== "idle" && currentWait.status !== "done") {
+					return finish({
+						status: "uncertain",
+						delivery: "submitted",
+						pane: addr,
+						...(currentWait.status ? { state: currentWait.status } : {}),
+						error: {
+							code: "protocol",
+							message:
+								"hc wait ended with an unexpected status; answer recovery skipped.",
+						},
+					});
+				}
+				if (currentWait.turn < sent.turn + 1) {
+					return finish({
+						status: "uncertain",
+						delivery: "submitted",
+						pane: addr,
+						state: currentWait.status,
+						error: {
+							code: "protocol",
+							message:
+								"Target reported completion without advancing turn past send; answer recovery skipped.",
+						},
+					});
+				}
+				settled = currentWait.status;
+				break;
+			}
+
+			// ended === false: only valid check-in reasons (timeout or message) while working may re-wait.
+			if (
+				(currentWait.reason !== "timeout" &&
+					currentWait.reason !== "message") ||
+				(currentWait.status !== null && currentWait.status !== "working")
+			) {
+				return finish({
+					status: "uncertain",
+					delivery: "submitted",
+					pane: addr,
+					...(currentWait.status ? { state: currentWait.status } : {}),
+					error: {
+						code: "protocol",
+						message:
+							"hc wait returned ended=false with an unexpected reason or terminal status; answer recovery skipped.",
+					},
+				});
+			}
+
+			const waitRemMs = waitDeadline - now();
+			if (Math.floor(waitRemMs) < 1) {
+				return finish({
+					status: "uncertain",
+					delivery: "submitted",
+					pane: addr,
+					...(currentWait.status ? { state: currentWait.status } : {}),
+					error: {
+						code: "timeout",
+						message:
+							"Call wait budget exhausted after prompt submission; the target may still be running. Do not resend.",
+					},
+				});
+			}
+			const waitTimeoutSec = Math.max(1, Math.ceil(waitRemMs / 1000));
+			const nextWait = await hcWait(
+				hcDeps,
+				addr,
+				waitTimeoutSec,
+				Math.floor(waitRemMs),
+				signal,
+			);
+			if (!nextWait.ok) {
+				return finish({
+					status: "uncertain",
+					delivery: "submitted",
+					pane: addr,
+					error: {
+						code: nextWait.code,
+						message: nextWait.message,
+						...(nextWait.exitCode !== undefined
+							? { exitCode: nextWait.exitCode }
+							: {}),
+					},
+				});
+			}
+			currentWait = nextWait.wait;
+		}
+
+		if (deadline - now() < 1) {
+			return finish({
+				status: "uncertain",
+				delivery: "submitted",
+				pane: addr,
+				state: settled,
+				error: {
+					code: "timeout",
+					message:
+						"Turn settled but no budget remained for result file recovery.",
+				},
+			});
+		}
+
+		const recovered = await recoverResultFile(fsOps, rawResultFile, signal, {
+			deadline,
+			signal,
+			now,
+			fixedMessages: true,
+		});
+		if (
+			signal?.aborted ||
+			(!recovered.ok && recovered.code === "aborted")
+		) {
+			return finish({
+				status: "read_failed",
+				delivery: "submitted",
+				pane: addr,
+				state: settled,
+				error: {
+					code: "aborted",
+					message: "Answer read aborted; the prompt was already delivered.",
+				},
+			});
+		}
+		if ((!recovered.ok && recovered.code === "timeout") || deadline - now() < 1) {
+			return finish({
+				status: "uncertain",
+				delivery: "submitted",
+				pane: addr,
+				state: settled,
+				error: {
+					code: "timeout",
+					message:
+						"Result file recovery exceeded the call budget after prompt submission.",
+				},
+			});
+		}
+		if (!recovered.ok) {
+			const fixedCode =
+				recovered.code === "result_file_missing"
+					? "result_file_missing"
+					: "result_file_invalid";
+			return finish({
+				status: "response_unverified",
+				delivery: "submitted",
+				pane: addr,
+				state: settled,
+				error: {
+					code: fixedCode,
+					message: `result file check failed: ${fixedCode}`,
+				},
+			});
+		}
+
+		return {
+			ok: true,
+			status: "answered",
+			delivery: "submitted",
+			requestId,
+			pane: addr,
+			state: settled,
+			answer: recovered.answer,
+			resultFile: rawResultFile,
+			markerVerified: false,
+			elapsedMs: now() - startedAt,
+		};
+	} finally {
+		deps.inFlight.delete(addr);
+	}
 }
