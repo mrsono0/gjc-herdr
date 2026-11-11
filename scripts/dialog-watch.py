@@ -926,4 +926,13 @@ def main(argv: Optional[List[str]] = None) -> int:
 
 
 if __name__ == "__main__":
+    if os.environ.get("GJCH_CORE") == "1":
+        os.execv(
+            sys.executable,
+            [
+                sys.executable,
+                os.path.join(ROOT, "scripts", "core-dialog-check.py"),
+                *sys.argv[1:],
+            ],
+        )
     sys.exit(main())

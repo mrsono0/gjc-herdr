@@ -4,6 +4,14 @@
 # 확인창으로 끝났으면 처리한 뒤 같은 명령으로 다시 건다.
 set -u
 
+if [ "${GJCH_CORE:-}" = 1 ]; then
+	ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+	if [ -x "$ROOT/scripts/core-mate-watch.sh" ]; then
+		exec "$ROOT/scripts/core-mate-watch.sh" "$@"
+	fi
+	exec /bin/bash "$ROOT/scripts/core-mate-watch.sh" "$@"
+fi
+
 usage() {
 	printf '사용법: %s <결과 파일> <완료 줄> [시간 상한 초, 기본 2700]\n' "$0" >&2
 }

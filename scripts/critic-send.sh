@@ -7,6 +7,12 @@ set -eu
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 # shellcheck source=scripts/worktree-guard.sh
 . "$ROOT/scripts/worktree-guard.sh"
+if [ "${GJCH_CORE:-}" = 1 ]; then
+	if [ -x "$ROOT/scripts/core-critic-send.sh" ]; then
+		exec "$ROOT/scripts/core-critic-send.sh" "$@"
+	fi
+	exec /bin/bash "$ROOT/scripts/core-critic-send.sh" "$@"
+fi
 CRITIC_NAME="${GJCH_CRITIC_NAME:-gjc-herdr-critic}"
 timeout=1800000 # 기본 30분, 준비 확인은 최대 30초
 no_wait=0

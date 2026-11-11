@@ -24,7 +24,51 @@ else
 fi
 command -v gjc >/dev/null && ok "gjc $(gjc --version 2>/dev/null)" || bad "gjc 없음 (GJC 본체는 이 저장소가 설치하지 않음)"
 command -v agy >/dev/null && ok "agy $(agy --version 2>/dev/null) (구현 팀원)" || bad "agy 없음 (구현 팀원; Antigravity CLI 설치 필요)"
-command -v herdr >/dev/null && ok "herdr $(herdr --version 2>/dev/null)" || warn "herdr 없음 (팀 구성·표시는 Herdr pane 안에서만 동작)"
+if [ "${GJCH_CORE:-}" = 1 ]; then
+	# shellcheck source=scripts/core-lib.sh
+	. "$ROOT/scripts/core-lib.sh"
+	hc_bin="${GJCH_HC_BIN:-hc}"
+	if hc_ver="$("$hc_bin" --version 2>/dev/null)"; then
+		core_redact "OK    hc ($hc_bin): $hc_ver"
+	else
+		core_redact "FAIL  hc ($hc_bin) 없음 또는 실행 실패"
+		fail=1
+	fi
+	srv_raw=""
+	srv_parsed=""
+	if srv_raw="$("$hc_bin" server status --json 2>/dev/null)" && srv_parsed="$(python3 -B -c 'import json,re,sys
+try:
+    d = json.loads(sys.argv[1])
+except Exception:
+    sys.exit(1)
+if not isinstance(d, dict):
+    sys.exit(1)
+core = d.get("core")
+name = core.get("name") if isinstance(core, dict) else None
+live = d.get("live")
+fin = d.get("finished")
+if not isinstance(name, str) or not name:
+    sys.exit(1)
+name = re.sub(r"[\r\n\t]+", " ", name).strip()
+if not name:
+    sys.exit(1)
+if not isinstance(live, int) or isinstance(live, bool) or live < 0:
+    sys.exit(1)
+if not isinstance(fin, int) or isinstance(fin, bool) or fin < 0:
+    sys.exit(1)
+print(f"{name}\t{live}\t{fin}")' "$srv_raw" 2>/dev/null)"; then
+		srv_name="${srv_parsed%%$'\t'*}"
+		srv_rest="${srv_parsed#*$'\t'}"
+		srv_live="${srv_rest%%$'\t'*}"
+		srv_fin="${srv_rest#*$'\t'}"
+		srv_name="$(core_redact "$srv_name")"
+		ok "hc server status: core.name=$srv_name live=$srv_live finished=$srv_fin"
+	else
+		bad "hc server status 확인 실패"
+	fi
+else
+	command -v herdr >/dev/null && ok "herdr $(herdr --version 2>/dev/null)" || warn "herdr 없음 (팀 구성·표시는 Herdr pane 안에서만 동작)"
+fi
 if command -v codex >/dev/null; then
 	ok "codex: $(command -v codex) (선택 검토 팀원)"
 else
@@ -32,7 +76,13 @@ else
 fi
 
 # --- Herdr pane 여부 ---
-if [ "${HERDR_ENV:-}" = 1 ] && [ -n "${HERDR_PANE_ID:-}" ]; then
+if [ "${GJCH_CORE:-}" = 1 ]; then
+	if [ "${GJCH_EXTERNAL_LEAD:-}" = 1 ]; then
+		ok "Core 외부 팀장 모드(GJCH_CORE=1, GJCH_EXTERNAL_LEAD=1)"
+	else
+		warn "GJCH_EXTERNAL_LEAD 없음"
+	fi
+elif [ "${HERDR_ENV:-}" = 1 ] && [ -n "${HERDR_PANE_ID:-}" ]; then
 	ok "Herdr pane 안: $HERDR_PANE_ID (workspace ${HERDR_WORKSPACE_ID:-?})"
 elif [ "${GJCH_EXTERNAL_LEAD:-}" = 1 ]; then
 	ok "외부 팀장 모드(herdr pane 밖, GJCH_EXTERNAL_LEAD=1)"
@@ -52,10 +102,18 @@ case "$wt_state" in
 		warn "작업 트리 판정 불가: git 저장소가 아니거나 작업 트리 상태를 확인할 수 없음 ($ROOT)"
 		;;
 esac
+if [ "${GJCH_CORE:-}" = 1 ]; then
+	if lead_cls="$(core_lock_class)"; then
+		ok "팀장 잠금: $lead_cls"
+	else
+		warn "팀장 잠금: ${lead_cls:-unknown}"
+	fi
+else
 if lead_status="$(/bin/bash "$ROOT/scripts/team-lead.sh" status 2>/dev/null)"; then
 	ok "팀장 잠금: $lead_status"
 else
 	warn "팀장 잠금 상태 확인 실패"
+fi
 fi
 
 # --- 저장소 파일 ---
@@ -102,14 +160,31 @@ else:
 fi
 
 # --- Herdr sidebar 설정(선택) ---
-cfg="${HERDR_CONFIG:-$HOME/.config/herdr/config.toml}"
-if [ -f "$cfg" ] && grep -q 'gjc_herdr_model' "$cfg"; then
-	ok "Herdr sidebar에 gjc_herdr_model 설정 있음"
-else
-	warn "Herdr sidebar custom token 설정 없음 (token은 발행되지만 sidebar에는 안 보임; README 'Sidebar 설정')"
+if [ "${GJCH_CORE:-}" != 1 ]; then
+	cfg="${HERDR_CONFIG:-$HOME/.config/herdr/config.toml}"
+	if [ -f "$cfg" ] && grep -q 'gjc_herdr_model' "$cfg"; then
+		ok "Herdr sidebar에 gjc_herdr_model 설정 있음"
+	else
+		warn "Herdr sidebar custom token 설정 없음 (token은 발행되지만 sidebar에는 안 보임; README 'Sidebar 설정')"
+	fi
 fi
 
 # --- 팀원·검토 시작 옵션 점검(#42) ---
+if [ "${GJCH_CORE:-}" = 1 ]; then
+	core_check_out=""
+	core_check_rc=0
+	core_check_out="$(GJCH_EXTERNAL_LEAD=1 /bin/bash "$ROOT/scripts/core-team.sh" --check 2>&1)" || core_check_rc=$?
+	if [ -n "$core_check_out" ]; then
+		while IFS= read -r _core_chk_line; do
+			[ -n "$_core_chk_line" ] && core_redact "$_core_chk_line"
+		done <<< "$core_check_out"
+	fi
+	case "$core_check_rc" in
+		0) ok "Core 팀원 점검 통과" ;;
+		1) bad "Core 팀원 점검 불일치 (rc 1)" ;;
+		*) warn "Core 팀원 점검 미확인 (rc $core_check_rc)" ;;
+	esac
+else
 MATE_NAME="${GJCH_MATE_NAME:-gjc-herdr-mate}"
 CRITIC_NAME="${GJCH_CRITIC_NAME:-gjc-herdr-critic}"
 check_env_member_argv() { # name kind
@@ -180,6 +255,7 @@ if command -v herdr >/dev/null && command -v python3 >/dev/null; then
 	fi
 else
 	warn "팀원 옵션 점검 생략 (herdr 또는 python3 없음)"
+fi
 fi
 
 exit "$fail"
