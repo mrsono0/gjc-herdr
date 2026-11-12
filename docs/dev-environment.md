@@ -48,12 +48,12 @@
 - 클라이언트가 없을 때 Herdr 화면 읽기(`herdr pane read`, `agent read`)가 지금과 같은 내용을 주는지: 로컬 detach 실측에서 `herdr pane read --source visible`(2026-10-17)과 `herdr agent read`(2026-10-18)는 같은 내용을 줬다. 진짜 원격 서버의 agent pane은 미측정이다.
 - 클라이언트 없이 새로 만든 좁은 pane(예: 57칸)에서 플러그인 입력란 판정이 되는지(이미 있던 pane은 줄지 않아 해당 없음, §0.1), `headless_cols`·`headless_rows`를 바꾸면 실제로 적용되는지, lf-prod(Herdr 0.9.3)에도 이 설정이 있는지
 - 원격에서 팀장(Claude Code)을 어디에 둘지: Herdr pane 안인지, 원격 밖 세션인지. 그리고 세션 간 메시지가 닿는지
-- **Core(`herdr-core`, `hc`) 길에서 아직 실측하지 않은 것(미실측):**
+- **Core(`herdr-core`, `hc`) 길의 확인 현황(원격 환경 실측은 남음):**
   - 재부팅 뒤 Core 서버·터미널 수명과 잔류 정리 동작(**미실측**)
   - Core에서 팀원 `status.state=blocked` 확인창 실제 발생과 사용자 해소 뒤 복귀(**미실측**)
   - 원격 호스트에서의 Core 동거 운용(**미실측**)
-  - 탑주가 기동한 Core 팀장(`gjch-lead`)과 기존 팀장 사이의 잠금 인계(**미실측**)
-  - `agy`(`gjch-mate`)가 첫 과제 뒤 `status.state=done`에 머문 상태에서 `--if` 없이 보낸 다음 배정이 실제로 새 과제를 시작하는지(**미실측**, §2.4 (e))
+  - 탑주가 기동한 Core 팀장(`gjch-lead`)과 기존 팀장 사이의 잠금 인계(**로컬 1회 관찰**(2026-11-12): 옛 팀장 `release` 뒤 탑주 `hc run` 기동, 새 팀장의 SessionStart 잠금 보유 안내(팀장 보고)와 그 뒤 `mine`·팀원 기동·`--check` rc `0` 확인. hook `claim` 순간의 별도 로그는 없음, §2.4 (b))
+  - `agy`(`gjch-mate`)가 첫 과제 뒤 `status.state=done`에 머문 상태에서 `--if` 없이 보낸 다음 배정이 실제로 새 과제를 시작하는지(**로컬 1회 관찰**(2026-11-12): 응답 `started=true`·다음 `turn`, 새 과제 완료, §2.4 (e))
   - `hc` 터미널 안에서의 대화형 GJC 실사용 및 플러그인 `hc` 백엔드 라이브 연동(**미실측**, 별도 이슈)
 
 ## 1. 구성 요약
@@ -243,7 +243,7 @@ Core(`GJCH_CORE=1`, §2.4)에서도 중지·재개 원칙은 같다: 작업 중�
 - **(b) 잠금 인계 순서:**
   1. 옛 팀장이 진행 중인 배정이 없는 것을 확인한 뒤 `scripts/team-lead.sh release`로 팀장 잠금을 놓는다.
   2. 새로 뜬 Core 팀장(`gjch-lead`)이 시작할 때 SessionStart hook(`scripts/team-up.sh --hook` → `scripts/core-team.sh --hook`) 또는 수동 `GJCH_CORE=1 GJCH_EXTERNAL_LEAD=1 scripts/team-up.sh --lock claim`으로 잠금을 확보하고 `mine`을 확인한다.
-  3. 잠금 확보에 실패하면(`other-live` rc `3` 또는 `unknown` rc `4`/`1`) 팀원 구성을 즉시 중단하고 사용자에게 보고한다(탑주가 기동한 팀장의 실제 잠금 인계는 **미실측**).
+  3. 잠금 확보에 실패하면(`other-live` rc `3` 또는 `unknown` rc `4`/`1`) 팀원 구성을 즉시 중단하고 사용자에게 보고한다(탑주가 기동한 팀장의 실제 잠금 인계는 **로컬 1회 관찰**(2026-11-12): 옛 팀장 `release` 뒤 탑주 `hc run` 기동, 새 팀장의 SessionStart 잠금 보유 안내(팀장 보고)와 그 뒤 `mine`·팀원 기동·`--check` rc `0` 확인. hook `claim` 순간의 별도 로그는 없음).
 - **(c) 팀원 구성과 준비 미확인(rc `2`) 처리:**
   - Core 팀장에서 `GJCH_CORE=1 GJCH_EXTERNAL_LEAD=1 scripts/team-up.sh --up`(또는 `--spawn`)을 실행하면 `gjch-mate`(`team=gjch`, `role=mate`, `agy`)와 `gjch-critic`(`team=gjch`, `role=critic`, `codex`)을 `hc run --bg --json --no-notify --no-parent`로 띄우고 끝에 `--check` 요약을 출력한다.
   - `--up` 직후 끝 요약이 종료 코드 `2`(`unknown`, 예: 막 뜬 `mate`의 `reported=false` 또는 `critic`의 foreground 미관측)로 나오는 것은 **준비 미확인** 상태이므로 그 이유가 초기 준비 지연으로 확인된 경우에 한해 정상 기동 과정으로 다루고(라벨 중복·조회 오류·잠금 unknown 등 다른 이유의 `2`는 그대로 확인한다), 잠시 뒤 후속 `GJCH_CORE=1 GJCH_EXTERNAL_LEAD=1 scripts/team-up.sh --check`(및 `--status`)를 실행해 `0`(`ok`)이 되는지로 판단한다(특정 대기 초수를 고정 규칙으로 두지 않는다; 로컬 1회 실측에서 기동 후 약 50초 뒤 `--check` `0` 확인).
@@ -254,7 +254,7 @@ Core(`GJCH_CORE=1`, §2.4)에서도 중지·재개 원칙은 같다: 작업 중�
 - **(e) 운용 사실 (`agy` 과제 뒤 `done`과 다음 배정):**
   - 로컬 Core 1회 실측에서 `agy`(`gjch-mate`)는 첫 과제를 마친 뒤 `status.state=done`(`reported=true`)에 머물렀다(`foreground`는 그대로 유지).
   - `hc send --if idle`은 `done` 대상을 `status_mismatch`로 거부하므로, `done`에 머문 `gjch-mate`에 다음 과제를 배정할 때는 팀장이 먼저 `hc get --json <주소>`로 `state=live`·`reported=true`·`status.state=done`(`blocked`·`working`·`error` 아님)과 사용자 직접 입력이 없음을 확인한 뒤, `--if` 없이 `hc send --json <주소> "<짧은 지시>"`를 **1회** 보내고 응답 JSON의 수락(`started`·`turn`)을 확인한다.
-  - `timeout`이나 불확실 응답 뒤에는 미전달로 단정해 무조건 재전송하지 않고 `hc get --json` 상태와 결과 파일부터 확인한다(`done` 상태 대상에 `--if` 없이 보낸 다음 배정이 실제로 새 과제를 시작하는지는 **미실측**).
+  - `timeout`이나 불확실 응답 뒤에는 미전달로 단정해 무조건 재전송하지 않고 `hc get --json` 상태와 결과 파일부터 확인한다(`done` 상태 대상에 `--if` 없이 보낸 다음 배정이 실제로 새 과제를 시작하는지는 **로컬 1회 관찰**(2026-11-12): 응답 `started=true`·다음 `turn`, 새 과제 완료).
 - **(f) 확인창 (`blocked`):**
   - Core에서는 화면 읽기(`hc read`/`attach`)를 쓰지 않으므로 `scripts/mate-watch.sh`(`core-mate-watch.sh`)와 `python3 scripts/dialog-watch.py`(`core-dialog-check.py`)는 `status.state == "blocked"`일 때 `DIALOG <role> <kind> msglen=<n>`(종료 코드 `10`, `status.msg` 원문 미출력)만 알리고 멈춘다.
   - 화면에서 명령 전문을 읽을 수 없으므로 Herdr의 `agy` 명령·편집 확인창 「이번만」 팀장 위임은 Core에서 적용하지 않는다. 모든 `DIALOG`는 사용자에게 알리고 사용자 조치를 기다리며, `hc keys`나 `hc send --force`로 응답하지 않는다(Core에서 실제 `blocked` 발생은 **미실측**).
@@ -326,7 +326,7 @@ Core(`GJCH_CORE=1`, §2.4)에서도 중지·재개 원칙은 같다: 작업 중�
 | 작업 | Herdr 경로 | Core(`GJCH_CORE=1`) 경로 |
 |---|---|---|
 | 팀 구성·점검·정리 | `scripts/team-up.sh --up \| --check \| --status \| --lock …` | `GJCH_CORE=1 GJCH_EXTERNAL_LEAD=1 scripts/team-up.sh --up \| --check \| --status \| --lock … \| --down` (`scripts/core-team.sh` 실행; `--layout`·`--report-resume`는 미지원 rc `2`) |
-| 팀장 → 구현 팀원(`agy`) 배정 | `herdr agent prompt gjc-herdr-mate "<지시>"` | 첫 배정(`idle`): `hc send --json --if idle <mate 주소> "<지시>"` / 직전 과제 뒤 `done`: §2.4 (e) 절차대로 `state=live`·`reported=true`·`status.state=done` 확인 후 `hc send --json <mate 주소> "<지시>"` 1회(**미실측**) |
+| 팀장 → 구현 팀원(`agy`) 배정 | `herdr agent prompt gjc-herdr-mate "<지시>"` | 첫 배정(`idle`): `hc send --json --if idle <mate 주소> "<지시>"` / 직전 과제 뒤 `done`: §2.4 (e) 절차대로 `state=live`·`reported=true`·`status.state=done` 확인 후 `hc send --json <mate 주소> "<지시>"` 1회(**로컬 1회 관찰**(2026-11-12): 응답 `started=true`·다음 `turn`, 새 과제 완료) |
 | 구현 팀원 감시 | `scripts/mate-watch.sh <결과 파일> "<완료 줄>"` | `GJCH_CORE=1 GJCH_EXTERNAL_LEAD=1 scripts/mate-watch.sh <결과 파일> "<완료 줄>"` (`scripts/core-mate-watch.sh`; `0` DONE / `1` TIMEOUT / `2` 인자·가드 / `10` DIALOG / `11` NO_RESULT / `12` UNKNOWN) |
 | 확인창 감시 | `python3 scripts/dialog-watch.py [--once]` | `GJCH_CORE=1 python3 scripts/dialog-watch.py [--once]` (`scripts/core-dialog-check.py`; `--once`: `none`=`0` / `DIALOG`=`10` / `UNKNOWN`=`2`; 상시: `UNKNOWN` 줄 출력 후 계속 감시, 새 `DIALOG`=`10`, `--timeout` 도달=`0`; 인자·가드: `GJCH_TEAM_ROLE` 설정·연결 worktree는 `0`, `GJCH_CORE != 1`·잘못된 인자는 `2`, `GJCH_EXTERNAL_LEAD != 1`·경로 오류는 `--once`만 `2`이고 상시는 `0`) |
 | 팀장 → 검토(`Codex`) 전송 | `scripts/critic-send.sh --result <결과 파일> <지시서>` (화면 확인 후 `/new`) | `GJCH_CORE=1 GJCH_EXTERNAL_LEAD=1 scripts/critic-send.sh --result <결과 파일> <지시서>` (`scripts/core-critic-send.sh`: 화면 읽기·`/new` 대신 기존 소유 `critic`이 `live`·`reported=true`·`idle`/`done`임을 확인한 뒤 `hc kill` → `state=finished` 확인 → `hc rm` → `hc run`으로 **회차마다 교체 기동** 후 `reported=true`·`status.state=idle` 확인 뒤 `hc send --json --if idle --wait` 1회 전송; `0` 완료 / `1` 전제·교체·전송 실패 / `2` 대기 timeout / `4` 결과 파일 미작성 / `5` `blocked` 감지) |
