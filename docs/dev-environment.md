@@ -8,8 +8,9 @@
 
 - **원격 서버:** 원격 서버에서 Herdr 서버가 돌고, GJC·agy·Codex 같은 세션은 그 Herdr의 pane 안에 떠 있다.
 - **화면 없음:** 대부분의 시간에는 그 화면을 보는 Herdr TUI 클라이언트가 붙어 있지 않다. 사람은 가끔 접속해서 보거나, 아예 보지 않는다.
-- **팀장도 화면 밖:** 팀장도 Herdr 화면을 늘 보지 않는다. 지금의 외부 팀장(§2.1)처럼 세션 간 메시지(`SendMessage`/`ListAgents`)나 Herdr CLI(`herdr agent …`, `herdr pane read` 등)로만 다룬다.
+- **팀장도 화면 밖:** 팀장도 Herdr 화면을 늘 보지 않는다. 지금의 외부 팀장(§2.1)처럼 세션 간 메시지(`SendMessage`/`ListAgents`)와 상태 필드(Herdr `herdr agent list/get`, Core `hc ls --json`·`hc get --json`), 결과 파일·우편함으로 다루며, 화면 텍스트 읽기(`herdr pane read`·`herdr agent read`·`hc read`/`attach`)로 상태를 확인하지 않는다(2026-11-07 사용자 결정; 단, Herdr 길인 옛 길의 `critic-send.sh`·`dialog-watch.py`는 이주 전까지 화면 판정을 남겨 둔 한계다).
 - **Core(`herdr-core`, `hc`) 동거 실행 범위:** Core 길(§2.4)에서는 팀장·구현 팀원(`agy`)·검토 팀원(`Codex`) 터미널과 저장소·결과 파일·팀장 잠금 파일이 모두 **같은 Core 호스트**에 놓이는 동거 실행을 기준으로 한다. 팀 운영 스크립트는 다른 머신(`machine/tN`)의 터미널을 제어하지 않으며, 화면 읽기(`hc read`/`attach`)와 키·강제 입력(`hc keys`/`--force`)을 전혀 쓰지 않고 `hc ls --json`·`hc get --json`·결과 파일만으로 상태를 판정한다.
+- **이주 범위(2026-11-07 사용자 결정):** 지금은 이 컴퓨터의 herdr server → herdr core(`hc`) 이주만 다룬다. 원격 core는 수정하거나 새로 만드는 스크립트에서만 상정한다(소켓 경로·호스트·바이너리 경로를 로컬 전용으로 박지 않고 설정·환경변수로 받는다. 예: `GJCH_HC_BIN`). 원격 서버 구성·배포와 다른 머신 터미널 제어는 이 범위 밖이다.
 
 ### 0.1 설계 기준
 - **사람이 화면을 보고 있다고 가정하지 않는다.** 화면에만 뜨는 알림(토스트, 상태 줄, 잠깐 떴다 사라지는 안내)은 보고 경로로 쓰지 않는다. 결과·보고·진단은 파일, 우편함(`.gjc-herdr/mailbox`), 세션 간 메시지, 로그처럼 나중에 읽을 수 있는 곳에 남긴다.
