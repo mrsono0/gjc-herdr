@@ -70,6 +70,7 @@ describe("core-critic-send.sh 및 critic-send.sh 분기 (#86 2b)", () => {
 	let stateDir = "";
 	let tmpHome = "";
 	let hcCallsLog = "";
+	let gitCallsLog = "";
 	let lockPath = "";
 	let mySockPath = "";
 	let otherSockPath = "";
@@ -119,6 +120,7 @@ with open(dst,"w",encoding="utf-8") as f:
 		stateDir = path.join(tmpDir, "state");
 		tmpHome = path.join(tmpDir, "home");
 		hcCallsLog = path.join(tmpDir, "hc-calls.log");
+		gitCallsLog = path.join(tmpDir, "git-calls.log");
 		lockPath = path.join(tmpDir, "lead-test.json");
 		mySockPath = path.join(tmpDir, "my.sock");
 		otherSockPath = path.join(tmpDir, "other.sock");
@@ -145,7 +147,52 @@ with open(dst,"w",encoding="utf-8") as f:
 			}
 		}
 
-		fs.symlinkSync(REAL_GIT, path.join(binDir, "git"));
+		expect(fs.existsSync(REAL_GIT)).toBe(true);
+		writeExecutable(
+			path.join(binDir, "git"),
+			`#!/bin/sh
+orig_args="$*"
+if [ "\${1:-}" = "-C" ]; then
+	shift 2
+fi
+sub="\${1:-}"
+if [ "$sub" = "rev-parse" ] && [ "\${2:-}" != "HEAD" ]; then
+	printf '.git\\n'
+	exit 0
+fi
+printf 'GIT_OPTIONAL_LOCKS=%s args=%s\\n' "\${GIT_OPTIONAL_LOCKS:-}" "$orig_args" >> ${JSON.stringify(gitCallsLog)}
+cnt=0
+if [ -f "${stateDir}/git-\${sub}-count.txt" ]; then
+	cnt="$(cat "${stateDir}/git-\${sub}-count.txt")"
+fi
+cnt=$((cnt + 1))
+printf '%s' "$cnt" > "${stateDir}/git-\${sub}-count.txt"
+if [ -f "${stateDir}/git-fail-\${sub}-\${cnt}.txt" ] || [ -f "${stateDir}/git-fail-\${cnt}.txt" ]; then
+	exit 128
+fi
+if [ -f "${stateDir}/git-\${sub}-\${cnt}.txt" ]; then
+	cat "${stateDir}/git-\${sub}-\${cnt}.txt"
+	exit 0
+fi
+if [ -f "${stateDir}/git-\${sub}.txt" ]; then
+	cat "${stateDir}/git-\${sub}.txt"
+	exit 0
+fi
+case "$sub" in
+	rev-parse)
+		printf '1111111111111111111111111111111111111111\\n'
+		;;
+	for-each-ref)
+		printf 'refs/heads/main 1111111111111111111111111111111111111111\\n'
+		;;
+	stash)
+		;;
+	status)
+		;;
+esac
+exit 0
+`,
+		);
 		fs.symlinkSync(REAL_PYTHON3, path.join(binDir, "python3"));
 		writeExecutable(path.join(binDir, "codex"), "#!/bin/sh\nprintf '0.1.0-stub\\n'\n");
 		writeExecutable(path.join(binDir, "lsof"), "#!/bin/sh\nprintf '42424\\n'\nexit 0\n");
@@ -349,6 +396,7 @@ exit 99
 
 	beforeEach(() => {
 		fs.rmSync(hcCallsLog, { force: true });
+		fs.rmSync(gitCallsLog, { force: true });
 		fs.rmSync(lockPath, { force: true });
 		fs.rmSync(`${lockPath}.mutex`, { force: true });
 		fs.rmSync(stateDir, { recursive: true, force: true });
@@ -397,6 +445,17 @@ exit 99
 		}
 		return fs
 			.readFileSync(hcCallsLog, "utf8")
+			.trim()
+			.split("\n")
+			.filter(Boolean);
+	}
+
+	function readGitCalls(): string[] {
+		if (!fs.existsSync(gitCallsLog)) {
+			return [];
+		}
+		return fs
+			.readFileSync(gitCallsLog, "utf8")
 			.trim()
 			.split("\n")
 			.filter(Boolean);
@@ -1670,4 +1729,169 @@ exec ${JSON.stringify(REAL_PYTHON3)} "$@"
 			expect((pgrepStream.stdout ?? "").trim()).toBe("");
 		}
 	}, 60_000);
+
+	test("5. 검토 전후 저장소 상태(HEAD·refs·stash·status) 대조 및 종료 코드 6·4·0(#89)", () => {
+		const resFile = path.join(stateDir, "critic-89-result.md");
+
+		function resetGitFixture(): void {
+			fs.rmSync(hcCallsLog, { force: true });
+			fs.rmSync(gitCallsLog, { force: true });
+			for (const entry of fs.readdirSync(stateDir)) {
+				if (entry.startsWith("git-") || entry === "get-t9critic-count.txt") {
+					fs.rmSync(path.join(stateDir, entry), { force: true });
+				}
+			}
+		}
+
+		// (a) 전후 같음 + 새 결과 파일 → rc 0, 변경 알림 없음 + 가짜 git 호출 인자(-C <ROOT>, GIT_OPTIONAL_LOCKS=0) 확인
+		resetGitFixture();
+		seedSpawnedCritic({ status: { state: "idle", kind: null } });
+		fs.writeFileSync(path.join(stateDir, "write-on-send.txt"), "검토 결과 (a)\n", "utf8");
+		const sameRes = spawnSync(
+			"/bin/bash",
+			[CORE_CRITIC_SEND_SH, "--timeout", "5000", "--result", resFile, briefPath],
+			{
+				cwd: REPO_ROOT,
+				encoding: "utf8",
+				env: buildEnv({ TEST_RESULT_FILE: resFile }),
+			},
+		);
+		expect(sameRes.status).toBe(0);
+		expect(sameRes.stdout).toContain("완료·결과 파일 확인");
+		expect(sameRes.stdout + sameRes.stderr).not.toContain("저장소 상태 변경 감지");
+		expect(sameRes.stdout + sameRes.stderr).not.toContain("저장소 상태 대조 불가");
+		const gitCallsA = readGitCalls();
+		expect(gitCallsA).toEqual([
+			`GIT_OPTIONAL_LOCKS=0 args=-C ${REPO_ROOT} rev-parse HEAD`,
+			`GIT_OPTIONAL_LOCKS=0 args=-C ${REPO_ROOT} for-each-ref --format=%(refname) %(objectname)`,
+			`GIT_OPTIONAL_LOCKS=0 args=-C ${REPO_ROOT} stash list`,
+			`GIT_OPTIONAL_LOCKS=0 args=-C ${REPO_ROOT} status --porcelain=v1 --untracked-files=all`,
+			`GIT_OPTIONAL_LOCKS=0 args=-C ${REPO_ROOT} rev-parse HEAD`,
+			`GIT_OPTIONAL_LOCKS=0 args=-C ${REPO_ROOT} for-each-ref --format=%(refname) %(objectname)`,
+			`GIT_OPTIONAL_LOCKS=0 args=-C ${REPO_ROOT} stash list`,
+			`GIT_OPTIONAL_LOCKS=0 args=-C ${REPO_ROOT} status --porcelain=v1 --untracked-files=all`,
+		]);
+
+		// (b) 전후 status가 다름 + 새 결과 파일 → rc 6, 알림 줄에 status 이름표가 있고 파일 이름 원문은 없음
+		resetGitFixture();
+		seedSpawnedCritic({ status: { state: "idle", kind: null } });
+		fs.writeFileSync(path.join(stateDir, "write-on-send.txt"), "검토 결과 (b)\n", "utf8");
+		fs.writeFileSync(
+			path.join(stateDir, "git-status-2.txt"),
+			" M secret-dirty-source.ts\n?? leaked-untracked-file.txt\n",
+			"utf8",
+		);
+		const statusDiffRes = spawnSync(
+			"/bin/bash",
+			[CORE_CRITIC_SEND_SH, "--timeout", "5000", "--result", resFile, briefPath],
+			{
+				cwd: REPO_ROOT,
+				encoding: "utf8",
+				env: buildEnv({ TEST_RESULT_FILE: resFile }),
+			},
+		);
+		expect(statusDiffRes.status).toBe(6);
+		expect(statusDiffRes.stdout).toContain("완료·결과 파일 확인");
+		expect(statusDiffRes.stderr).toContain(
+			"저장소 상태 변경 감지: status — 검토 중 팀장·다른 작업의 변경일 수 있음, 팀장이 확인",
+		);
+		expect(statusDiffRes.stdout + statusDiffRes.stderr).not.toContain("secret-dirty-source.ts");
+		expect(statusDiffRes.stdout + statusDiffRes.stderr).not.toContain("leaked-untracked-file.txt");
+
+		// (c) 전후 HEAD·refs가 다름 → rc 6, 두 이름표
+		resetGitFixture();
+		seedSpawnedCritic({ status: { state: "idle", kind: null } });
+		fs.writeFileSync(path.join(stateDir, "write-on-send.txt"), "검토 결과 (c)\n", "utf8");
+		fs.writeFileSync(
+			path.join(stateDir, "git-rev-parse-2.txt"),
+			"2222222222222222222222222222222222222222\n",
+			"utf8",
+		);
+		fs.writeFileSync(
+			path.join(stateDir, "git-for-each-ref-2.txt"),
+			"refs/heads/main 2222222222222222222222222222222222222222\n",
+			"utf8",
+		);
+		const headRefsDiffRes = spawnSync(
+			"/bin/bash",
+			[CORE_CRITIC_SEND_SH, "--timeout", "5000", "--result", resFile, briefPath],
+			{
+				cwd: REPO_ROOT,
+				encoding: "utf8",
+				env: buildEnv({ TEST_RESULT_FILE: resFile }),
+			},
+		);
+		expect(headRefsDiffRes.status).toBe(6);
+		expect(headRefsDiffRes.stdout).toContain("완료·결과 파일 확인");
+		expect(headRefsDiffRes.stderr).toContain(
+			"저장소 상태 변경 감지: HEAD refs — 검토 중 팀장·다른 작업의 변경일 수 있음, 팀장이 확인",
+		);
+		expect(headRefsDiffRes.stdout + headRefsDiffRes.stderr).not.toContain(
+			"2222222222222222222222222222222222222222",
+		);
+
+		// (d) 완료 뒤 기록 실패(가짜 git이 비0) → rc 6, 「대조 불가」
+		resetGitFixture();
+		seedSpawnedCritic({ status: { state: "idle", kind: null } });
+		fs.writeFileSync(path.join(stateDir, "write-on-send.txt"), "검토 결과 (d)\n", "utf8");
+		fs.writeFileSync(path.join(stateDir, "git-fail-status-2.txt"), "1", "utf8");
+		const afterFailRes = spawnSync(
+			"/bin/bash",
+			[CORE_CRITIC_SEND_SH, "--timeout", "5000", "--result", resFile, briefPath],
+			{
+				cwd: REPO_ROOT,
+				encoding: "utf8",
+				env: buildEnv({ TEST_RESULT_FILE: resFile }),
+			},
+		);
+		expect(afterFailRes.status).toBe(6);
+		expect(afterFailRes.stdout).toContain("완료·결과 파일 확인");
+		expect(afterFailRes.stderr).toContain("저장소 상태 대조 불가 — 팀장이 확인");
+
+		// (e) 다름 + 결과 파일 미작성 → rc 4 유지, 알림 줄 있음
+		resetGitFixture();
+		seedSpawnedCritic({ status: { state: "idle", kind: null } });
+		fs.rmSync(path.join(stateDir, "write-on-send.txt"), { force: true });
+		fs.writeFileSync(resFile, "이전 회차 결과 유지\n", "utf8");
+		fs.writeFileSync(path.join(stateDir, "git-status-2.txt"), " M untouched-result.ts\n", "utf8");
+		const diffNoResultRes = spawnSync(
+			"/bin/bash",
+			[CORE_CRITIC_SEND_SH, "--timeout", "5000", "--result", resFile, briefPath],
+			{
+				cwd: REPO_ROOT,
+				encoding: "utf8",
+				env: buildEnv(),
+			},
+		);
+		expect(diffNoResultRes.status).toBe(4);
+		expect(diffNoResultRes.stderr).toContain(
+			"저장소 상태 변경 감지: status — 검토 중 팀장·다른 작업의 변경일 수 있음, 팀장이 확인",
+		);
+		expect(diffNoResultRes.stderr).toContain(
+			"Codex가 idle로 돌아왔지만 결과 파일이 새로 쓰이지 않았습니다.",
+		);
+		expect(diffNoResultRes.stdout + diffNoResultRes.stderr).not.toContain("untouched-result.ts");
+
+		// (f) --no-wait 경로는 git을 부르지 않음(가짜 git 호출 0회)
+		resetGitFixture();
+		seedSpawnedCritic({ status: { state: "idle", kind: null } });
+		fs.writeFileSync(
+			path.join(stateDir, "send-result.json"),
+			JSON.stringify({
+				turn: 1,
+				started: true,
+				status: "idle",
+				wait: null,
+			}),
+			"utf8",
+		);
+		const noWaitGitRes = spawnSync("/bin/bash", [CORE_CRITIC_SEND_SH, "--no-wait", briefPath], {
+			cwd: REPO_ROOT,
+			encoding: "utf8",
+			env: buildEnv(),
+		});
+		expect(noWaitGitRes.status).toBe(0);
+		expect(noWaitGitRes.stdout).toContain("전송 수락(started) 확인");
+		expect(readGitCalls()).toEqual([]);
+	}, 20_000);
 });

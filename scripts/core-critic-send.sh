@@ -2,7 +2,7 @@
 # Core(hc) Codex 검토 전송: 소유 critic 터미널을 교체 기동(kill -> finished -> rm -> run)한 뒤
 # reported=true·idle 준비를 확인하고 지시서를 1회 전송한다.
 # 화면 읽기(hc read/attach)·/new·--force·keys·자동 재전송은 절대 수행하지 않는다.
-# 종료 코드: 완료(0) / 전제·교체·전송 실패(1) / 대기 timeout(2) / 결과 파일 미작성(4) / 확인창 blocked 감지(5).
+# 종료 코드: 완료(0) / 전제·교체·전송 실패(1) / 대기 timeout(2) / 결과 파일 미작성(4) / 확인창 blocked 감지(5) / 저장소 상태 변경·대조 불가(6).
 set -u
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
@@ -365,6 +365,17 @@ if not stat.S_ISREG(st.st_mode) or st.st_size==0: sys.exit(1)
 sys.exit(0 if before=="없음" or before!=str(st.st_mtime_ns)+" "+str(st.st_size) else 1)' "$1" "$2"
 }
 
+# 검토 전후 저장소 상태(HEAD·refs·stash·status)를 이름표와 함께 한 덩어리로 기록한다.
+capture_repo_state() {
+	local head_out="" refs_out="" stash_out="" status_out=""
+	head_out="$(GIT_OPTIONAL_LOCKS=0 git -C "$ROOT" rev-parse HEAD 2>/dev/null)" || return 1
+	refs_out="$(GIT_OPTIONAL_LOCKS=0 git -C "$ROOT" for-each-ref --format='%(refname) %(objectname)' 2>/dev/null)" || return 1
+	stash_out="$(GIT_OPTIONAL_LOCKS=0 git -C "$ROOT" stash list 2>/dev/null)" || return 1
+	status_out="$(GIT_OPTIONAL_LOCKS=0 git -C "$ROOT" status --porcelain=v1 --untracked-files=all 2>/dev/null)" || return 1
+	printf 'HEAD\n%s\n\036refs\n%s\n\036stash\n%s\n\036status\n%s\n' \
+		"$head_out" "$refs_out" "$stash_out" "$status_out"
+}
+
 extract_error_kind() {
 	local raw="$1" k=""
 	k="$(core_json "$raw" "error.kind" || core_json "$raw" "error.data.kind" || true)"
@@ -687,10 +698,17 @@ if [ "$ready_ok" -ne 1 ]; then
 	fail "준비 미확인(${last_ready_reason}). 지시서는 보내지 않았습니다."
 fi
 
-# --- 4. 전송 전 결과 파일 lstat 상태 기록 ---
+# --- 4. 전송 전 결과 파일 lstat 상태 및 저장소 상태 기록 ---
 result_before=""
 if [ -n "$result_file" ]; then
 	result_before="$(result_state "$result_file")" || fail '결과 파일 전송 전 상태 기록 실패. 지시서는 보내지 않았습니다.'
+fi
+repo_before=""
+repo_before_ok=0
+if [ "$no_wait" -eq 0 ]; then
+	if repo_before="$(capture_repo_state)"; then
+		repo_before_ok=1
+	fi
 fi
 
 report_blocked_and_exit() {
@@ -1133,24 +1151,18 @@ case "$v_tag" in
 		;;
 esac
 
-# --- 6. 완료 및 결과 파일 검증(--result) ---
+# --- 6. 완료 및 결과 파일 검증(--result) 및 저장소 상태 대조 ---
 now_ms="$(core_now_ms)"
 if [ "$((deadline_ms - now_ms))" -le 0 ]; then
 	core_redact "timeout·완료 미확인: ${tname} (${target_addr}). 원격 작업은 중단하지 않았습니다." >&2
 	exit 2
 fi
-if [ -z "$result_file" ]; then
-	now_ms="$(core_now_ms)"
-	if [ "$((deadline_ms - now_ms))" -le 0 ]; then
-		core_redact "timeout·완료 미확인: ${tname} (${target_addr}). 원격 작업은 중단하지 않았습니다." >&2
-		exit 2
+res_ok=1
+if [ -n "$result_file" ]; then
+	res_ok=0
+	if result_written "$result_file" "$result_before"; then
+		res_ok=1
 	fi
-	core_redact "완료(idle/done) 확인: ${tname} (${target_addr})"
-	exit 0
-fi
-res_ok=0
-if result_written "$result_file" "$result_before"; then
-	res_ok=1
 fi
 now_ms="$(core_now_ms)"
 if [ "$((deadline_ms - now_ms))" -le 0 ]; then
@@ -1158,10 +1170,35 @@ if [ "$((deadline_ms - now_ms))" -le 0 ]; then
 	exit 2
 fi
 core_redact "완료(idle/done) 확인: ${tname} (${target_addr})"
-if [ "$res_ok" -eq 1 ]; then
+if [ -n "$result_file" ] && [ "$res_ok" -eq 1 ]; then
 	core_redact "완료·결과 파일 확인: ${result_file}"
-	exit 0
 fi
 
-core_redact "Codex가 idle로 돌아왔지만 결과 파일이 새로 쓰이지 않았습니다." >&2
-exit 4
+repo_rc=0
+repo_after=""
+if [ "$repo_before_ok" -ne 1 ] || ! repo_after="$(capture_repo_state)"; then
+	core_redact "저장소 상태 대조 불가 — 팀장이 확인" >&2
+	repo_rc=6
+elif [ "$repo_before" != "$repo_after" ]; then
+	b_rest="$repo_before"
+	a_rest="$repo_after"
+	changed_labels=""
+	for label in HEAD refs stash status; do
+		b_part="${b_rest%%$'\036'*}"
+		b_rest="${b_rest#*$'\036'}"
+		a_part="${a_rest%%$'\036'*}"
+		a_rest="${a_rest#*$'\036'}"
+		if [ "$b_part" != "$a_part" ]; then
+			changed_labels="${changed_labels:+$changed_labels }${label}"
+		fi
+	done
+	[ -n "$changed_labels" ] || changed_labels="status"
+	core_redact "저장소 상태 변경 감지: ${changed_labels} — 검토 중 팀장·다른 작업의 변경일 수 있음, 팀장이 확인" >&2
+	repo_rc=6
+fi
+
+if [ -n "$result_file" ] && [ "$res_ok" -ne 1 ]; then
+	core_redact "Codex가 idle로 돌아왔지만 결과 파일이 새로 쓰이지 않았습니다." >&2
+	exit 4
+fi
+exit "$repo_rc"

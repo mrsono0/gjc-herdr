@@ -258,6 +258,7 @@ Core(`GJCH_CORE=1`, §2.4)에서도 중지·재개 원칙은 같다: 작업 중�
 - **(f) 확인창 (`blocked`):**
   - Core에서는 화면 읽기(`hc read`/`attach`)를 쓰지 않으므로 `scripts/mate-watch.sh`(`core-mate-watch.sh`)와 `python3 scripts/dialog-watch.py`(`core-dialog-check.py`)는 `status.state == "blocked"`일 때 `DIALOG <role> <kind> msglen=<n>`(종료 코드 `10`, `status.msg` 원문 미출력)만 알리고 멈춘다.
   - 화면에서 명령 전문을 읽을 수 없으므로 Herdr의 `agy` 명령·편집 확인창 「이번만」 팀장 위임은 Core에서 적용하지 않는다. 모든 `DIALOG`는 사용자에게 알리고 사용자 조치를 기다리며, `hc keys`나 `hc send --force`로 응답하지 않는다(Core에서 실제 `blocked` 발생은 **미실측**).
+  - Core에서 `hc send`로 `/` 명령(`/new`·`/quit` 등)을 보내지 않는다. hc 0.1.20은 보고된 에이전트끼리 보낸 글을 감쌀 수 있어 명령으로 동작하지 않을 수 있다(다른 팀 관측, GJCH 미확인). 검토 팀원은 `/new` 대신 회차마다 교체 기동하고, 팀원 종료는 `hc kill` → `hc rm`이다.
 - **(g) `scripts/check-env.sh` Core 분기:**
   - `GJCH_CORE=1`로 실행하면 `herdr`·Sidebar 설정·`herdr pane process-info` 점검 대신 `hc --version`, `hc server status --json`(`core.name`·`live`·`finished` 확인 및 민감 문자열 가림), `Core 외부 팀장 모드(GJCH_CORE=1, GJCH_EXTERNAL_LEAD=1)`, 팀장 잠금(`core_lock_class`: `mine`·`none`·`other-live`·`stale`·`unknown`), `scripts/core-team.sh --check` 요약(`rc 0`은 `OK`, `rc 1`은 `FAIL`, `rc 2`는 `WARN`)을 점검한다.
 - **(h) 조정 역할(마탑·탑주)의 Core 팀장 터미널 관리 수용 (2026-11-12 GJCH 사용자 결정, #87):**
@@ -329,7 +330,7 @@ Core(`GJCH_CORE=1`, §2.4)에서도 중지·재개 원칙은 같다: 작업 중�
 | 팀장 → 구현 팀원(`agy`) 배정 | `herdr agent prompt gjc-herdr-mate "<지시>"` | 첫 배정(`idle`): `hc send --json --if idle <mate 주소> "<지시>"` / 직전 과제 뒤 `done`: §2.4 (e) 절차대로 `state=live`·`reported=true`·`status.state=done` 확인 후 `hc send --json <mate 주소> "<지시>"` 1회(**로컬 1회 관찰**(2026-11-12): 응답 `started=true`·다음 `turn`, 새 과제 완료) |
 | 구현 팀원 감시 | `scripts/mate-watch.sh <결과 파일> "<완료 줄>"` | `GJCH_CORE=1 GJCH_EXTERNAL_LEAD=1 scripts/mate-watch.sh <결과 파일> "<완료 줄>"` (`scripts/core-mate-watch.sh`; `0` DONE / `1` TIMEOUT / `2` 인자·가드 / `10` DIALOG / `11` NO_RESULT / `12` UNKNOWN) |
 | 확인창 감시 | `python3 scripts/dialog-watch.py [--once]` | `GJCH_CORE=1 python3 scripts/dialog-watch.py [--once]` (`scripts/core-dialog-check.py`; `--once`: `none`=`0` / `DIALOG`=`10` / `UNKNOWN`=`2`; 상시: `UNKNOWN` 줄 출력 후 계속 감시, 새 `DIALOG`=`10`, `--timeout` 도달=`0`; 인자·가드: `GJCH_TEAM_ROLE` 설정·연결 worktree는 `0`, `GJCH_CORE != 1`·잘못된 인자는 `2`, `GJCH_EXTERNAL_LEAD != 1`·경로 오류는 `--once`만 `2`이고 상시는 `0`) |
-| 팀장 → 검토(`Codex`) 전송 | `scripts/critic-send.sh --result <결과 파일> <지시서>` (화면 확인 후 `/new`) | `GJCH_CORE=1 GJCH_EXTERNAL_LEAD=1 scripts/critic-send.sh --result <결과 파일> <지시서>` (`scripts/core-critic-send.sh`: 화면 읽기·`/new` 대신 기존 소유 `critic`이 `live`·`reported=true`·`idle`/`done`임을 확인한 뒤 `hc kill` → `state=finished` 확인 → `hc rm` → `hc run`으로 **회차마다 교체 기동** 후 `reported=true`·`status.state=idle` 확인 뒤 `hc send --json --if idle --wait` 1회 전송; `0` 완료 / `1` 전제·교체·전송 실패 / `2` 대기 timeout / `4` 결과 파일 미작성 / `5` `blocked` 감지) |
+| 팀장 → 검토(`Codex`) 전송 | `scripts/critic-send.sh --result <결과 파일> <지시서>` (화면 확인 후 `/new`) | `GJCH_CORE=1 GJCH_EXTERNAL_LEAD=1 scripts/critic-send.sh --result <결과 파일> <지시서>` (`scripts/core-critic-send.sh`: 화면 읽기·`/new` 대신 기존 소유 `critic`이 `live`·`reported=true`·`idle`/`done`임을 확인한 뒤 `hc kill` → `state=finished` 확인 → `hc rm` → `hc run`으로 **회차마다 교체 기동** 후 `reported=true`·`status.state=idle` 확인 뒤 `hc send --json --if idle --wait` 1회 전송; `0` 완료 / `1` 전제·교체·전송 실패 / `2` 대기 timeout / `4` 결과 파일 미작성 / `5` `blocked` 감지 / `6` 완료했으나 검토 전후 저장소 상태가 다르거나 대조할 수 없음 — 팀장이 원인 확인) |
 
 ### GJC 관측 절차 (필요할 때만 임시 실행)
 
