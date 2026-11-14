@@ -70,6 +70,8 @@
   6. (GJCH) 전역 설치·물리 rename
   7. (GJCH) 다른 팀 자료 열기·옮기기
 
+  명시 전달에 한해 (공통) 1~4는 같은 대상·동작·위험·상한의 기존 명시 승인이 확인되면 다시 묻지 않는다(#94, 상세·조건은 [docs/work-records.md](docs/work-records.md)). (GJCH) 5~7은 늘 다시 묻는다.
+
 ## 이슈 관리 핵심 (2026-10-21 사용자 확정, #72)
 
 상세 절차와 닫기 점검은 [docs/work-records.md](docs/work-records.md) "이슈 관리"를 직접 읽고 따른다.
