@@ -207,7 +207,7 @@ describe("team-up.sh --check / --lock / --up (#68)", () => {
 					argv: [
 						"agy",
 						"--model",
-						"gemini-4-argon-high",
+						"gemini-4-neon-xhigh",
 						"--mode",
 						"accept-edits",
 						"--sandbox",
@@ -950,7 +950,7 @@ exit 99
 		const mismatchRes = runTeamUp(["--check"], extEnv);
 		expect(mismatchRes.status).toBe(1);
 		expect(mismatchRes.stdout.trim().split("\n")).toEqual([
-			"gjc-herdr-mate w1:p2 mismatch 실제=다름:--model,없음:--sandbox 기대=--model gemini-4-argon-high,--sandbox",
+			"gjc-herdr-mate w1:p2 mismatch 실제=다름:--model,없음:--sandbox 기대=--model gemini-4-neon-xhigh,--sandbox",
 			"gjc-herdr-critic w1:p3 ok",
 			"lock none",
 		]);
@@ -965,7 +965,7 @@ exit 99
 		const mixedRes = runTeamUp(["--check"], extEnv);
 		expect(mixedRes.status).toBe(1);
 		expect(mixedRes.stdout.trim().split("\n")).toEqual([
-			"gjc-herdr-mate w1:p2 mismatch 실제=다름:--model,없음:--sandbox 기대=--model gemini-4-argon-high,--sandbox",
+			"gjc-herdr-mate w1:p2 mismatch 실제=다름:--model,없음:--sandbox 기대=--model gemini-4-neon-xhigh,--sandbox",
 			"gjc-herdr-critic w1:p3 unknown process-info 실패",
 			"lock none",
 		]);
@@ -1358,7 +1358,7 @@ print(json.dumps({
 		expect(upMismatch.status).toBe(1);
 		const upMismatchLines = upMismatch.stdout.trim().split("\n");
 		expect(upMismatchLines.slice(-3)).toEqual([
-			"gjc-herdr-mate w1:p2 mismatch 실제=없음:--model,없음:--mode,없음:--sandbox 기대=--model gemini-4-argon-high,--mode accept-edits,--sandbox",
+			"gjc-herdr-mate w1:p2 mismatch 실제=없음:--model,없음:--mode,없음:--sandbox 기대=--model gemini-4-neon-xhigh,--mode accept-edits,--sandbox",
 			"gjc-herdr-critic w1:p3 ok",
 			"lock mine",
 		]);
@@ -2035,7 +2035,7 @@ Run this command?
 			"--conversation",
 			mateFullSid,
 			"--model",
-			"gemini-4-argon-high",
+			"gemini-4-neon-xhigh",
 			"--mode",
 			"accept-edits",
 			"--sandbox",

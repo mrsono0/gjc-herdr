@@ -16,7 +16,7 @@
 #   팀장 잠금(scripts/team-lead.sh, GJCH_LEAD_LOCK): 잠금이 다른 세션에 있으면 Herdr 안 Claude는 부팀장(GJCH_DEPUTY_NAME, 기본 gjc-herdr-deputy)이 되고,
 #   외부 세션은 팀원이 있는 작업공간(GJCH_WS_LABEL)을 건드리지 않는다.
 #   Sidebar 등 다른 pane은 건드리지 않는다(임시 탭에 자동 생성된 agent 없는 Sidebar만 탭 닫기로 함께 정리).
-#   GJCH_MATE_MODEL은 팀원 agy 모델(기본 gemini-4-argon-high)이며, 영문자·숫자·점·밑줄·하이픈만 허용한다.
+#   GJCH_MATE_MODEL은 팀원 agy 모델(기본 gemini-4-neon-xhigh)이며, 영문자·숫자·점·밑줄·하이픈만 허용한다.
 #   GJCH_TEAM_CODEX=0은 Codex 생성을 끈다. Codex는 사용자 지시로 --yolo(샌드박스 없음)를 사용한다.
 #   --no-daemon은 공유 daemon 환경의 훅이 세션 ID를 다른 pane으로 보고하는 것을 막는다.
 #   -c 'tui.status_line=[...]'은 56칸 검토 pane에서 상태 줄이 잘리지 않게 사용자 설정을 바꾸지 않고 이 프로세스만 덮어쓴다.

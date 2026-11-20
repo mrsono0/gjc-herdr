@@ -88,7 +88,7 @@ function writeExecutable(filePath: string, content: string): void {
 }
 
 const AGY_EXPECTED_UNITS = [
-	"--model gemini-4-argon-high",
+	"--model gemini-4-neon-xhigh",
 	"--mode accept-edits",
 	"--sandbox",
 ];
@@ -543,7 +543,7 @@ printf '{"result":{"ok":true}}\\n'
 					argv: [
 						"agy",
 						"--model",
-						"gemini-4-argon-high",
+						"gemini-4-neon-xhigh",
 						"--mode",
 						"accept-edits",
 						"--sandbox",
@@ -607,7 +607,7 @@ printf '{"result":{"ok":true}}\\n'
 		});
 		expect(res.status).toBe(1);
 		expect(res.stdout.trim()).toBe(
-			`↳ gjc-herdr-mate 옵션 불일치: 없음 --model gemini-4-argon-high, --mode accept-edits, --sandbox (복구: ${RECOVERY_INSIDE})`,
+			`↳ gjc-herdr-mate 옵션 불일치: 없음 --model gemini-4-neon-xhigh, --mode accept-edits, --sandbox (복구: ${RECOVERY_INSIDE})`,
 		);
 		expect(res.stdout).not.toContain("conv-secret-id-98765");
 		expect(res.stdout).not.toContain("SENTINEL_API_KEY_123");
@@ -661,7 +661,7 @@ printf '{"result":{"ok":true}}\\n'
 		});
 		expect(diffOnly.status).toBe(1);
 		expect(diffOnly.stdout.trim()).toBe(
-			`↳ gjc-herdr-mate 옵션 불일치: 다름 --model(기대 gemini-4-argon-high) (복구: ${RECOVERY_INSIDE})`,
+			`↳ gjc-herdr-mate 옵션 불일치: 다름 --model(기대 gemini-4-neon-xhigh) (복구: ${RECOVERY_INSIDE})`,
 		);
 		expect(diffOnly.stdout).not.toContain("ACTUAL_SECRET_MODEL_VALUE");
 		expect(diffOnly.stdout).not.toContain("SENTINEL_API_KEY_123");
@@ -687,7 +687,7 @@ printf '{"result":{"ok":true}}\\n'
 		});
 		expect(missingAndDiff.status).toBe(1);
 		expect(missingAndDiff.stdout.trim()).toBe(
-			`↳ gjc-herdr-mate 옵션 불일치: 없음 --sandbox; 다름 --model(기대 gemini-4-argon-high), --mode(기대 accept-edits) (복구: ${RECOVERY_INSIDE})`,
+			`↳ gjc-herdr-mate 옵션 불일치: 없음 --sandbox; 다름 --model(기대 gemini-4-neon-xhigh), --mode(기대 accept-edits) (복구: ${RECOVERY_INSIDE})`,
 		);
 		expect(missingAndDiff.stdout).not.toContain("ACTUAL_SECRET_MODEL_VALUE");
 		expect(missingAndDiff.stdout).not.toContain("ACTUAL_SECRET_MODE_VALUE");
@@ -703,7 +703,7 @@ printf '{"result":{"ok":true}}\\n'
 					cwd: REPO_ROOT,
 					argv: [
 						"agy",
-						"--model=gemini-4-argon-high",
+						"--model=gemini-4-neon-xhigh",
 						"--mode",
 						"accept-edits",
 						"--sandbox",
@@ -713,7 +713,7 @@ printf '{"result":{"ok":true}}\\n'
 		});
 		expect(equalsCombined.status).toBe(1);
 		expect(equalsCombined.stdout.trim()).toBe(
-			`↳ gjc-herdr-mate 옵션 불일치: 없음 --model gemini-4-argon-high (복구: ${RECOVERY_INSIDE})`,
+			`↳ gjc-herdr-mate 옵션 불일치: 없음 --model gemini-4-neon-xhigh (복구: ${RECOVERY_INSIDE})`,
 		);
 	});
 
@@ -867,7 +867,7 @@ printf '{"result":{"ok":true}}\\n'
 							argv: [
 								"agy",
 								"--model",
-								"gemini-4-argon-high",
+								"gemini-4-neon-xhigh",
 								"--mode",
 								"accept-edits",
 								"--sandbox",
@@ -1014,7 +1014,7 @@ printf '{"result":{"ok":true}}\\n'
 		expect(spawnRes.stdout).toContain("critic already exists at w1:p3; nothing spawned");
 		expect(spawnRes.stdout).toContain("layout: lead w1:p1 on top (60%)");
 		expect(spawnRes.stderr).toContain(
-			`↳ gjc-herdr-mate 옵션 불일치: 없음 --model gemini-4-argon-high, --mode accept-edits, --sandbox (복구: ${RECOVERY_INSIDE})`,
+			`↳ gjc-herdr-mate 옵션 불일치: 없음 --model gemini-4-neon-xhigh, --mode accept-edits, --sandbox (복구: ${RECOVERY_INSIDE})`,
 		);
 		expect(spawnRes.stderr).toContain(
 			`↳ gjc-herdr-critic 옵션 불일치: 없음 --no-daemon, --yolo, -m gpt-6.1-sol, -C ${REPO_ROOT}, --disable worktrees, -c ${CODEX_STATUS_LINE}, -c project_doc_max_bytes=65536 (복구: ${RECOVERY_INSIDE})`,
@@ -1044,7 +1044,7 @@ printf '{"result":{"ok":true}}\\n'
 		});
 		expect(hookSpawnRes.status).toBe(0);
 		expect(hookSpawnRes.stdout).toContain(
-			`GJCH: ↳ gjc-herdr-mate 옵션 불일치: 없음 --model gemini-4-argon-high, --mode accept-edits, --sandbox (복구: ${RECOVERY_INSIDE})`,
+			`GJCH: ↳ gjc-herdr-mate 옵션 불일치: 없음 --model gemini-4-neon-xhigh, --mode accept-edits, --sandbox (복구: ${RECOVERY_INSIDE})`,
 		);
 		expect(hookSpawnRes.stdout).toContain(
 			`GJCH: ↳ gjc-herdr-critic 옵션 불일치: 없음 --no-daemon, --yolo, -m gpt-6.1-sol, -C ${REPO_ROOT}, --disable worktrees, -c ${CODEX_STATUS_LINE}, -c project_doc_max_bytes=65536 (복구: ${RECOVERY_INSIDE})`,
@@ -1117,7 +1117,7 @@ printf '{"result":{"ok":true}}\\n'
 					argv: [
 						"agy",
 						"--model",
-						"gemini-4-argon-high",
+						"gemini-4-neon-xhigh",
 						"--mode",
 						"accept-edits",
 						"--sandbox",
@@ -1227,7 +1227,7 @@ printf '{"result":{"ok":true}}\\n'
 		waitForHookBgSpawn();
 		expect(hookRes.status).toBe(0);
 		expect(hookRes.stdout).toContain(
-			`GJCH: ↳ gjc-herdr-mate 옵션 불일치: 없음 --model gemini-4-argon-high, --mode accept-edits, --sandbox (복구: ${RECOVERY_EXTERNAL})`,
+			`GJCH: ↳ gjc-herdr-mate 옵션 불일치: 없음 --model gemini-4-neon-xhigh, --mode accept-edits, --sandbox (복구: ${RECOVERY_EXTERNAL})`,
 		);
 		expect(hookRes.stdout).toContain(
 			`GJCH: ↳ gjc-herdr-critic 옵션 불일치: 없음 --no-daemon, --yolo, -m gpt-6.1-sol, -C ${REPO_ROOT}, --disable worktrees, -c ${CODEX_STATUS_LINE}, -c project_doc_max_bytes=65536 (복구: ${RECOVERY_EXTERNAL})`,
@@ -1270,7 +1270,7 @@ printf '{"result":{"ok":true}}\\n'
 			"agy가 시작 중 멈췄습니다(w1:p2, status=blocked).",
 		);
 		expect(blockedSpawnRes.stderr).toContain(
-			`↳ gjc-herdr-mate 옵션 불일치: 없음 --model gemini-4-argon-high, --mode accept-edits, --sandbox (복구: ${RECOVERY_INSIDE})`,
+			`↳ gjc-herdr-mate 옵션 불일치: 없음 --model gemini-4-neon-xhigh, --mode accept-edits, --sandbox (복구: ${RECOVERY_INSIDE})`,
 		);
 		const blockedSpawnCalls = readHerdrCalls();
 		expect(
@@ -1292,7 +1292,7 @@ printf '{"result":{"ok":true}}\\n'
 		waitForHookBgSpawn();
 		expect(blockedHookRes.status).toBe(0);
 		expect(blockedHookRes.stdout).toContain(
-			`GJCH: ↳ gjc-herdr-mate 옵션 불일치: 없음 --model gemini-4-argon-high, --mode accept-edits, --sandbox (복구: ${RECOVERY_EXTERNAL})`,
+			`GJCH: ↳ gjc-herdr-mate 옵션 불일치: 없음 --model gemini-4-neon-xhigh, --mode accept-edits, --sandbox (복구: ${RECOVERY_EXTERNAL})`,
 		);
 		const blockedHookCalls = readHerdrCalls();
 		expect(

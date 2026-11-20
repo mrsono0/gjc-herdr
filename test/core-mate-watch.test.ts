@@ -220,7 +220,7 @@ exit 99
 			reported: true,
 			turn: 1,
 			cwd: REPO_ROOT,
-			argv: ["agy", "--model", "gemini-4-argon-high", "--mode", "accept-edits", "--sandbox"],
+			argv: ["agy", "--model", "gemini-4-neon-xhigh", "--mode", "accept-edits", "--sandbox"],
 			labels: { team: "gjch-test-86", role: "mate" },
 			status: {
 				state: "idle",

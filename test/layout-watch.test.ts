@@ -1905,7 +1905,7 @@ exec ${JSON.stringify(REAL_PYTHON3)} "$@"
 								argv: [
 									"agy",
 									"--model",
-									"gemini-4-argon-high",
+									"gemini-4-neon-xhigh",
 									"--mode",
 									"accept-edits",
 									"--sandbox",

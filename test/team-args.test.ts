@@ -9,7 +9,7 @@ const TEAM_ARGS_SH = path.join(REPO_ROOT, "scripts", "team-args.sh");
 const CORE_TEAM_SH = path.join(REPO_ROOT, "scripts", "core-team.sh");
 
 const EXPECTED_AGY_STDOUT = [
-	"--model gemini-4-argon-high",
+	"--model gemini-4-neon-xhigh",
 	"--mode accept-edits",
 	"--sandbox",
 	"",

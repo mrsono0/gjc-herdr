@@ -94,7 +94,7 @@ describe("core-lib.sh / core-team.sh / team-up.sh 분기 / check-env.sh 분기 (
 		const validArgv = [
 			"agy",
 			"--model",
-			"gemini-4-argon-high",
+			"gemini-4-neon-xhigh",
 			"--mode",
 			"accept-edits",
 			"--sandbox",
@@ -854,7 +854,7 @@ printf 'ADDR=%s FRC=%s GRC=%s\\n%s\\n' "$addr" "$frc" "$grc" "$info"`,
 		const misRes = runCoreTeam(["--check"]);
 		expect(misRes.status).toBe(1);
 		expect(misRes.stdout).toContain(
-			"gjch-test-86-mate t1m mismatch 실제=다름:--model,없음:--sandbox 기대=--model gemini-4-argon-high,--sandbox",
+			"gjch-test-86-mate t1m mismatch 실제=다름:--model,없음:--sandbox 기대=--model gemini-4-neon-xhigh,--sandbox",
 		);
 		expect(misRes.stdout).not.toContain("SECRET_WRONG_MODEL");
 		assertZeroMutatingHcCalls(readHcCalls());

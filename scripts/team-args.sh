@@ -15,7 +15,7 @@ CODEX_DOC_MAX_BYTES="${GJCH_CODEX_DOC_MAX_BYTES:-65536}"
 case "$CODEX_DOC_MAX_BYTES" in
 	""|0*|*[!0-9]*) CODEX_DOC_MAX_BYTES=65536 ;;
 esac
-MATE_MODEL="${GJCH_MATE_MODEL:-gemini-4-argon-high}"
+MATE_MODEL="${GJCH_MATE_MODEL:-gemini-4-neon-xhigh}"
 WS_LABEL="${GJCH_WS_LABEL:-GJCH · gjc-herdr}"
 RETRIES="${GJCH_RETRIES:-30}"   # 2초 간격 → 최대 약 60초
 
