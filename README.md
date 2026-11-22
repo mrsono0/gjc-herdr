@@ -122,6 +122,19 @@ rows = [
 - `gjc_herdr_session_id`: 현재 GJC session ID. 프롬프트 전달 대상 식별용이며 정규화·길이 제한 없이 그대로 발행한다(sidebar 행 추가 불필요).
 - 독립 source·증가 seq·전용 키를 사용하며 native lifecycle report/release를 호출하지 않는다. 정상 종료는 자기 세 키만 clear하고, crash/SIGKILL의 즉시 정리는 보장하지 않는다.
 
+### 끄기 (`GJC_HERDR_DISABLE`, v0.6.1)
+
+플러그인을 쓰지 않는 호출에서는 환경변수 `GJC_HERDR_DISABLE=1`로 끌 수 있다.
+
+```sh
+GJC_HERDR_DISABLE=1 gjc -p "요청"
+```
+
+- `GJC_HERDR_DISABLE`이 정확히 `1`일 때만 꺼진다(`true`·` 1`·빈 값 등 다른 값은 기존과 같이 동작한다).
+- 꺼지면 명령(`/herdr-send`·`/herdr-call`), 도구(`herdr_send`·`herdr_agent_call`·`herdr_mail_send`), 이벤트 훅, 타이머를 하나도 등록하지 않는다(우편 보내기 도구와 우편 받기도 함께 꺼진다).
+- GJC 프로세스를 시작하기 전에 설정해야 하며, 이미 실행 중인 세션에는 적용되지 않는다.
+- 하위 에이전트에 도구가 보이는 문제는 이 스위치로 다루지 않는다.
+
 ## 프롬프트 전달
 
 이 플러그인이 로드된 GJC(보내는 쪽)에서 다른 Herdr pane의 GJC(받는 쪽)로 프롬프트를 보낸다. 전달은 GJC 공식 `gjc sdk session send`를 사용하므로 받는 쪽 입력창을 건드리지 않고, 받는 쪽이 작업 중이면 GJC가 진행 중인 turn에 이어 처리한다.

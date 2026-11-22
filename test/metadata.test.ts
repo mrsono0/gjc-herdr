@@ -329,3 +329,149 @@ test("HC-only environment registers no metadata publisher, timer, or report exec
 	}
 });
 
+test("GJC_HERDR_DISABLE=1 skips pane resolution, hooks, commands, tools, exec, and timers", () => {
+	const savedEnvironment = {
+		GJC_HERDR_DISABLE: process.env.GJC_HERDR_DISABLE,
+		GJC_HERDR_MAILBOX: process.env.GJC_HERDR_MAILBOX,
+		HC_TERMINAL_ID: process.env.HC_TERMINAL_ID,
+		HERDR_ENV: process.env.HERDR_ENV,
+		HERDR_PANE_ID: process.env.HERDR_PANE_ID,
+	};
+	process.env.GJC_HERDR_DISABLE = "1";
+	process.env.GJC_HERDR_MAILBOX = "gjc-worker";
+	process.env.HC_TERMINAL_ID = "t1";
+	process.env.HERDR_ENV = "1";
+	process.env.HERDR_PANE_ID = "wC:p5";
+
+	const admission = spyOn(
+		publicHerdr,
+		"resolveHerdrPaneEnvironment",
+	).mockReturnValue({
+		paneId: "wC:p5",
+		binPath: "herdr",
+	});
+	const intervalSpy = spyOn(globalThis, "setInterval");
+
+	const infoLogs: string[] = [];
+	let registrations = 0;
+	const commands: string[] = [];
+	const tools: string[] = [];
+	let execs = 0;
+
+	try {
+		herdrMetadata({
+			logger: {
+				info(message: string) {
+					infoLogs.push(message);
+				},
+				warn() {},
+			},
+			zod,
+			on() {
+				registrations++;
+			},
+			registerCommand(name: string) {
+				commands.push(name);
+			},
+			registerTool(tool: { name: string }) {
+				tools.push(tool.name);
+			},
+			exec: async () => {
+				execs++;
+				return { stdout: "", stderr: "", code: 0, killed: false };
+			},
+		} as unknown as ExtensionAPI);
+
+		assert.deepEqual(infoLogs, [
+			"gjc-herdr extension loaded",
+			"gjc-herdr disabled by GJC_HERDR_DISABLE=1",
+		]);
+		assert.equal(admission.mock.calls.length, 0);
+		assert.equal(registrations, 0);
+		assert.deepEqual(commands, []);
+		assert.deepEqual(tools, []);
+		assert.equal(execs, 0);
+		assert.equal(intervalSpy.mock.calls.length, 0);
+	} finally {
+		intervalSpy.mockRestore();
+		admission.mockRestore();
+		for (const [key, value] of Object.entries(savedEnvironment)) {
+			if (value === undefined) delete process.env[key];
+			else process.env[key] = value;
+		}
+	}
+});
+
+test("GJC_HERDR_DISABLE values other than '1' keep normal HC-only command and tool registration", () => {
+	const savedEnvironment = {
+		GJC_HERDR_DISABLE: process.env.GJC_HERDR_DISABLE,
+		GJC_HERDR_MAILBOX: process.env.GJC_HERDR_MAILBOX,
+		HERDR_ENV: process.env.HERDR_ENV,
+		HERDR_PANE_ID: process.env.HERDR_PANE_ID,
+		HC_TERMINAL_ID: process.env.HC_TERMINAL_ID,
+		GJC_HERDR_BACKEND: process.env.GJC_HERDR_BACKEND,
+	};
+	delete process.env.GJC_HERDR_MAILBOX;
+	delete process.env.HERDR_ENV;
+	delete process.env.HERDR_PANE_ID;
+	delete process.env.GJC_HERDR_BACKEND;
+	process.env.HC_TERMINAL_ID = "t1";
+
+	const admission = spyOn(
+		publicHerdr,
+		"resolveHerdrPaneEnvironment",
+	).mockReturnValue(null);
+	const intervalSpy = spyOn(globalThis, "setInterval");
+
+	try {
+		let expectedAdmissions = 0;
+		for (const value of ["0", "true", " 1", ""]) {
+			process.env.GJC_HERDR_DISABLE = value;
+			const infoLogs: string[] = [];
+			let registrations = 0;
+			const commands: string[] = [];
+			const tools: string[] = [];
+			let execs = 0;
+
+			herdrMetadata({
+				logger: {
+					info(message: string) {
+						infoLogs.push(message);
+					},
+					warn() {},
+				},
+				zod,
+				on() {
+					registrations++;
+				},
+				registerCommand(name: string) {
+					commands.push(name);
+				},
+				registerTool(tool: { name: string }) {
+					tools.push(tool.name);
+				},
+				exec: async () => {
+					execs++;
+					return { stdout: "", stderr: "", code: 0, killed: false };
+				},
+			} as unknown as ExtensionAPI);
+
+			expectedAdmissions++;
+			assert.deepEqual(infoLogs, ["gjc-herdr extension loaded"]);
+			assert.equal(admission.mock.calls.length, expectedAdmissions);
+			assert.equal(registrations, 0);
+			assert.equal(intervalSpy.mock.calls.length, 0);
+			assert.equal(execs, 0);
+			assert.deepEqual(commands, ["herdr-send", "herdr-call"]);
+			assert.deepEqual(tools, ["herdr_send", "herdr_agent_call", "herdr_mail_send"]);
+		}
+	} finally {
+		intervalSpy.mockRestore();
+		admission.mockRestore();
+		for (const [key, value] of Object.entries(savedEnvironment)) {
+			if (value === undefined) delete process.env[key];
+			else process.env[key] = value;
+		}
+	}
+});
+

@@ -32,6 +32,10 @@ export function selectBackend(
 
 export default function herdrMetadata(api: ExtensionAPI): void {
 	api.logger.info("gjc-herdr extension loaded");
+	if (process.env.GJC_HERDR_DISABLE === "1") {
+		api.logger.info("gjc-herdr disabled by GJC_HERDR_DISABLE=1");
+		return;
+	}
 	const pane = resolveHerdrPaneEnvironment({ env: { ...process.env } });
 	const backend = selectBackend(process.env, pane, api.logger);
 	const hcBin = process.env.GJC_HERDR_HC_BIN?.trim() || "hc";
