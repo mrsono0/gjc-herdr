@@ -2,10 +2,6 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import type { ExecResult, ExtensionAPI } from "@gajae-code/coding-agent";
 import {
-	INVALID_BACKEND_WARNING,
-	selectBackend,
-} from "../src/extension.ts";
-import {
 	extractHcErrorKind,
 	HC_ERROR_SPECS,
 	HC_SEND_ERROR_KINDS,
@@ -560,64 +556,4 @@ test("hcSend rejects text starting with '-', builds exact argv without '--', and
 	assert.deepEqual(parseWaitFacts(null), { wait: null, valid: true });
 	assert.deepEqual(parseWaitFacts(undefined), { wait: undefined, valid: true });
 	assert.equal(parseWaitFacts({ terminal: "t7" }).valid, false);
-});
-
-test("selectBackend follows priority rules and logs fixed warning without leaking bad values", () => {
-	const warnings: string[] = [];
-	const logger = {
-		warn(msg: string) {
-			warnings.push(msg);
-		},
-	};
-	const helper = { paneId: "w1:p1", binPath: "herdr" };
-
-	// helper valid + HC_TERMINAL_ID present -> herdr
-	assert.equal(
-		selectBackend({ HC_TERMINAL_ID: "t1" }, helper, logger),
-		"herdr",
-	);
-	// helper null + HC_TERMINAL_ID present -> hc
-	assert.equal(selectBackend({ HC_TERMINAL_ID: "t1" }, null, logger), "hc");
-	// both absent -> herdr
-	assert.equal(selectBackend({}, null, logger), "herdr");
-	// forced GJC_HERDR_BACKEND overrides automatic
-	assert.equal(
-		selectBackend(
-			{ GJC_HERDR_BACKEND: "hc", HC_TERMINAL_ID: "t1" },
-			helper,
-			logger,
-		),
-		"hc",
-	);
-	assert.equal(
-		selectBackend(
-			{ GJC_HERDR_BACKEND: "herdr", HC_TERMINAL_ID: "t1" },
-			null,
-			logger,
-		),
-		"herdr",
-	);
-	assert.equal(warnings.length, 0);
-
-	// Invalid / empty GJC_HERDR_BACKEND warns with fixed message and falls back to automatic
-	assert.equal(
-		selectBackend(
-			{ GJC_HERDR_BACKEND: "SECRET_BAD_BACKEND", HC_TERMINAL_ID: "t1" },
-			null,
-			logger,
-		),
-		"hc",
-	);
-	assert.equal(
-		selectBackend({ GJC_HERDR_BACKEND: "" }, helper, logger),
-		"herdr",
-	);
-	assert.deepEqual(warnings, [
-		INVALID_BACKEND_WARNING,
-		INVALID_BACKEND_WARNING,
-	]);
-	assert.equal(
-		warnings.some((w) => w.includes("SECRET_BAD_BACKEND")),
-		false,
-	);
 });

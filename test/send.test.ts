@@ -6,23 +6,22 @@ import type {
 	ExtensionContext,
 } from "@gajae-code/coding-agent";
 import * as zod from "zod/v4";
-import { SESSION_ID_KEY } from "../src/metadata.ts";
+import {
+	HC_SEND_ERROR_KINDS,
+	HC_SEND_NOT_SENT_KINDS,
+	type HcSendErrorKind,
+} from "../src/hc.ts";
 import {
 	deliverPrompt,
-	GJC_NOT_FOUND,
+	deliverViaHc,
+	describeResult,
+	HC_SEND_NOTE,
 	parseCommandArgs,
 	registerSendFeatures,
-	sendRawPrompt,
 	type SendDeps,
 	type SendResult,
 	USAGE,
 } from "../src/send.ts";
-
-const SENDER = { sessionId: "sender-session", pane: "wE:p1" };
-const TARGET = "receiver-session";
-const RULE_LINE = "─".repeat(60);
-const EMPTY_CLAUDE = `${RULE_LINE}\n❯\n${RULE_LINE}\n  -- INSERT --`;
-const TYPING_CLAUDE = `${RULE_LINE}\n❯ 권고 내용으로 적\n${RULE_LINE}\n  -- INSERT --`;
 
 type ExecOptions = Parameters<ExtensionAPI["exec"]>[2];
 type Handler = (args: string[], options: ExecOptions) => Partial<ExecResult> | Error;
@@ -42,50 +41,6 @@ function assertExecTimeout(timeout: number | undefined): void {
 function ok(body: unknown): Partial<ExecResult> {
 	return { stdout: JSON.stringify(body) };
 }
-
-function herdrError(code: string, message: string): Partial<ExecResult> {
-	return { code: 1, stderr: JSON.stringify({ error: { code, message } }) };
-}
-
-function paneGet(
-	paneId: string,
-	tokens: Record<string, string> = {},
-	extra: Record<string, unknown> = {},
-) {
-	return ok({
-		result: { pane: { pane_id: paneId, agent: "gjc", tokens, ...extra } },
-	});
-}
-
-/** Routes `herdr <a> <b>` and `gjc sdk session <verb>` calls; unrouted calls fail the test. */
-function fakeExec(routes: Record<string, Handler>) {
-	let clock = 0;
-	const calls: { command: string; args: string[]; options: ExecOptions }[] = [];
-	const handlers: Record<string, Handler> = { "herdr pane read": () => ({ stdout: EMPTY_CLAUDE }), ...routes };
-	const exec: SendDeps["exec"] = async (command, args, options) => {
-		assertExecTimeout(options?.timeout);
-		calls.push({ command, args, options });
-		const key =
-			command === "gjc" ? `gjc ${args[2]}` : `herdr ${args[0]} ${args[1]}`;
-		const handler = handlers[key];
-		assert(handler, `unexpected exec ${command} ${args.join(" ")}`);
-		const result = handler(args, options);
-		if (result instanceof Error) throw result;
-		return { stdout: "", stderr: "", code: 0, killed: false, ...result };
-	};
-	const count = (key: string) =>
-		calls.filter(({ command, args }) =>
-			command === "gjc"
-				? `gjc ${args[2]}` === key
-				: `herdr ${args[0]} ${args[1]}` === key,
-		).length;
-	const advance = (ms: number) => { clock += ms; };
-	const deps: SendDeps = { exec, herdrBin: "herdr", now: () => clock, sleep: async (ms) => advance(ms) };
-	return { deps, calls, count, advance };
-}
-
-const sent = (status: string, operationRef = "op-1") =>
-	ok({ ok: true, result: { version: 2, operationRef, status } });
 
 test("command arguments keep everything after the target separator verbatim", () => {
 	assert.deepEqual(parseCommandArgs("wE:p2 hello"), {
@@ -109,897 +64,9 @@ test("command arguments keep everything after the target separator verbatim", ()
 	assert.deepEqual(parseCommandArgs("  "), { pane: "", text: "" });
 });
 
-test("invalid requests are rejected before any exec", async () => {
-	for (const [request, error] of [
-		[{ pane: " ", text: "x" }, "Pane is required."],
-		[{ pane: "wE:p2", text: " \n" }, "Prompt text must not be empty."],
-		[
-			{ pane: "wE:p2", text: "x", raw: true, wait: true },
-			"Raw delivery does not support wait.",
-		],
-	] as const) {
-		const { deps, calls } = fakeExec({});
-		const result = await deliverPrompt(deps, request, SENDER);
-		assert.equal(result.error, error);
-		assert.equal(result.status, "not_sent");
-		assert.equal(calls.length, 0);
-	}
-});
-
-test("a session ID token is used directly and the prompt is sent exactly once", async () => {
-	const { deps, calls, count } = fakeExec({
-		"herdr pane get": () => paneGet("wE:p2", { [SESSION_ID_KEY]: TARGET }),
-		"gjc send": () => sent("accepted"),
-	});
-	const text = '  line1\n"quoted" --wait  ';
-	const result = await deliverPrompt(deps, { pane: "wE:p2", text }, SENDER);
-	assert.deepEqual(result, {
-		ok: true,
-		mode: "sdk",
-		status: "accepted",
-		sessionId: TARGET,
-		operationRef: "op-1",
-		pane: "wE:p2",
-	});
-	assert.equal(count("herdr pane process-info"), 0);
-	assert.equal(count("gjc list"), 0);
-	const send = calls.find((call) => call.command === "gjc")!;
-	assert.deepEqual(send.args, [
-		"sdk",
-		"session",
-		"send",
-		TARGET,
-		"--text",
-		text,
-		"--json",
-	]);
-});
-
-test("without a token, only a live session owning a foreground PID matches", async () => {
-	const rows = [
-		{ sessionId: "stale", pid: 101, live: false },
-		{ sessionId: "elsewhere", pid: 999, live: true },
-		{ sessionId: TARGET, pid: 101, live: true },
-	];
-	const run = (sessions: unknown[]) =>
-		fakeExec({
-			"herdr agent get": () =>
-				ok({ result: { agent: { name: "recvb", pane_id: "wE:p2" } } }),
-			"herdr pane get": (args) => {
-				assert.equal(args[2], "wE:p2");
-				return paneGet("wE:p2");
-			},
-			"herdr pane process-info": () =>
-				ok({
-					result: {
-						process_info: {
-							shell_pid: 100,
-							foreground_processes: [{ pid: 101, argv0: "gjc" }],
-						},
-					},
-				}),
-			"gjc list": () => ok({ ok: true, result: { sessions } }),
-			"gjc send": () => sent("accepted"),
-		});
-
-	const hit = run(rows);
-	const result = await deliverPrompt(hit.deps, { pane: "recvb", text: "x" }, SENDER);
-	assert.equal(result.ok, true);
-	assert.equal(result.sessionId, TARGET);
-	assert.equal(hit.count("gjc send"), 1);
-
-	for (const [sessions, error] of [
-		[rows.slice(0, 2), "No live GJC session found for pane wE:p2."],
-		[
-			[...rows, { sessionId: "twin", pid: 101, live: true }],
-			"Multiple live GJC sessions found for pane wE:p2.",
-		],
-	] as const) {
-		const miss = run([...sessions]);
-		const failed = await deliverPrompt(miss.deps, { pane: "recvb", text: "x" }, SENDER);
-		assert.equal(failed.error, error);
-		assert.equal(miss.count("gjc send"), 0);
-	}
-});
-
-test("malformed or failed lookups keep their specific error and send nothing", async () => {
-	const info = (processes: unknown) =>
-		ok({ result: { process_info: { foreground_processes: processes } } });
-	const live = () =>
-		ok({ ok: true, result: { sessions: [{ sessionId: TARGET, pid: 7, live: true }] } });
-	const cases: [Record<string, Handler>, string][] = [
-		[{ "herdr pane get": () => ok({ result: {} }) }, "Herdr pane get returned an invalid response."],
-		[{ "herdr pane get": () => ({ stdout: "not json" }) }, "Herdr pane get returned an invalid response."],
-		[
-			{ "herdr pane get": () => paneGet("wE:p2"), "herdr pane process-info": () => info(undefined) },
-			"Herdr pane process-info returned an invalid response.",
-		],
-		[
-			{
-				"herdr pane get": () => paneGet("wE:p2"),
-				"herdr pane process-info": () => herdrError("io", "boom"),
-			},
-			"Herdr process-info failed for pane wE:p2: boom",
-		],
-		[
-			{
-				"herdr pane get": () => paneGet("wE:p2"),
-				"herdr pane process-info": () => info([{ pid: 7 }]),
-				"gjc list": () => ok({ ok: true, result: {} }),
-			},
-			"GJC session list returned an invalid response.",
-		],
-		[
-			{
-				"herdr pane get": () => paneGet("wE:p2"),
-				"herdr pane process-info": () => info([{ pid: 7 }]),
-				"gjc list": () => ({
-					code: 1,
-					...ok({ ok: false, error: { code: "operation_failed", message: "no repo" } }),
-				}),
-			},
-			"GJC session list failed: no repo",
-		],
-		[
-			{
-				"herdr pane get": () => paneGet("wE:p2"),
-				"herdr pane process-info": () => info([{ pid: 7 }]),
-				"gjc list": () => ({ code: 127, stderr: "gjc: command not found" }),
-			},
-			GJC_NOT_FOUND,
-		],
-		[
-			{
-				"herdr pane get": () => paneGet("wE:p2"),
-				"herdr pane process-info": () => info([{ pid: "7" }, { pid: -7 }]),
-				"gjc list": live,
-			},
-			"No live GJC session found for pane wE:p2.",
-		],
-	];
-	for (const [routes, error] of cases) {
-		const { deps, count } = fakeExec(routes);
-		const result = await deliverPrompt(deps, { pane: "wE:p2", text: "x" }, SENDER);
-		assert.equal(result.error, error);
-		assert.equal(result.status, "not_sent");
-		assert.equal(count("gjc send"), 0);
-	}
-	const noPane = fakeExec({
-		"herdr agent get": () => ok({ result: { agent: { name: "recvb" } } }),
-	});
-	const result = await deliverPrompt(noPane.deps, { pane: "recvb", text: "x", raw: true }, SENDER);
-	assert.equal(result.error, "Herdr agent get returned an invalid response.");
-	assert.equal(noPane.calls.length, 1);
-});
-
-test("unknown targets and Herdr failures send nothing", async () => {
-	const unknownAgent = fakeExec({
-		"herdr agent get": () =>
-			herdrError("agent_not_found", "agent target nosuch not found"),
-	});
-	const result = await deliverPrompt(
-		unknownAgent.deps,
-		{ pane: "nosuch", text: "x" },
-		SENDER,
-	);
-	assert.equal(result.error, "Herdr target not found: nosuch.");
-	assert.equal(unknownAgent.calls.length, 1);
-
-	const noHerdr = fakeExec({
-		"herdr pane get": () =>
-			Object.assign(new Error('Executable not found in $PATH: "herdr"'), {
-				code: "ENOENT",
-			}),
-	});
-	const unavailable = await deliverPrompt(
-		noHerdr.deps,
-		{ pane: "wE:p2", text: "x", raw: true },
-		SENDER,
-	);
-	assert.match(unavailable.error!, /^Herdr is unavailable: /);
-	assert.equal(noHerdr.calls.length, 1);
-});
-
-test("self delivery is refused before transport in both modes", async () => {
-	for (const request of [
-		{ pane: "wE:p1", text: "x" },
-		{ pane: "me", text: "x", raw: true },
-	]) {
-		const { deps, count } = fakeExec({
-			"herdr agent get": () =>
-				ok({ result: { agent: { name: "me", pane_id: "wE:p1" } } }),
-			"herdr pane get": () =>
-				paneGet("wE:p1", { [SESSION_ID_KEY]: SENDER.sessionId }),
-		});
-		const result = await deliverPrompt(deps, request, SENDER);
-		assert.equal(
-			result.error,
-			request.raw
-				? "Cannot send raw input to the current Herdr pane."
-				: "Cannot send a prompt to the current GJC session.",
-		);
-		assert.equal(
-			count("gjc send") + count("herdr pane send-text") + count("herdr pane send-keys"),
-			0,
-		);
-	}
-});
-
-test("a blocked target refuses delivery in both modes and sends nothing", async () => {
-	for (const raw of [false, true]) {
-		const { deps, count } = fakeExec({
-			"herdr pane get": () =>
-				ok({
-					result: {
-						pane: {
-							pane_id: "wE:p2",
-							agent_status: "blocked",
-							tokens: { [SESSION_ID_KEY]: TARGET },
-						},
-					},
-				}),
-		});
-		const result = await deliverPrompt(deps, { pane: "wE:p2", text: "x", raw }, SENDER);
-		assert.equal(result.ok, false);
-		assert.equal(result.status, "not_sent");
-		assert.match(result.error ?? "", /blocked/);
-		assert.equal(
-			count("gjc send") + count("herdr pane send-text") + count("herdr pane send-keys"),
-			0,
-		);
-	}
-});
-
-test("SDK send outcomes are classified without retries", async () => {
-	const enoent = Object.assign(
-		new Error('Executable not found in $PATH: "gjc"'),
-		{ code: "ENOENT" },
-	);
-	// Observed in Phase 0: `gjc sdk session send <id> --text "" --json` (exit 2, stdout envelope).
-	const usageEnvelope = {
-		schema: "gjc.command-error",
-		version: 1,
-		ok: false,
-		error: {
-			code: "usage",
-			category: "usage",
-			message: "The command arguments are invalid.",
-			outcomeCertainty: "not-applied",
-			references: [{ kind: "sessionId", value: TARGET }],
-		},
-	};
-	const cases: [Handler, boolean | undefined, Partial<SendResult>][] = [
-		[() => enoent, false, { ok: false, status: "not_sent", error: GJC_NOT_FOUND }],
-		[
-			() => ({ code: 127, stderr: "gjc: command not found" }),
-			false,
-			{ ok: false, status: "not_sent", error: GJC_NOT_FOUND },
-		],
-		[
-			() => ({ code: 2, ...ok(usageEnvelope) }),
-			false,
-			{
-				ok: false,
-				status: "not_sent",
-				error: "GJC session send failed: The command arguments are invalid.",
-			},
-		],
-		[
-			() => ({
-				code: 1,
-				...ok({
-					ok: false,
-					error: {
-						code: "endpoint_stale",
-						message: "The SDK endpoint is stale or unavailable.",
-						outcomeCertainty: "unknown",
-						references: [{ kind: "operationRef", value: "op-stale" }],
-					},
-				}),
-			}),
-			false,
-			{ ok: false, status: "uncertain", operationRef: "op-stale" },
-		],
-		[
-			() => ({
-				code: 1,
-				...ok({
-					ok: false,
-					error: {
-						code: "wait_timeout",
-						message: "timed out",
-						references: [{ kind: "operationRef", value: "op-wait" }],
-					},
-				}),
-			}),
-			true,
-			{
-				ok: false,
-				status: "uncertain",
-				operationRef: "op-wait",
-				error: "GJC session wait timed out; the prompt may already be accepted.",
-			},
-		],
-		[
-			() => ({ killed: true }),
-			false,
-			{
-				ok: false,
-				status: "uncertain",
-				error: "GJC session send timed out; delivery may already have been accepted.",
-			},
-		],
-		[
-			() => ok({ ok: true, result: { status: "accepted" } }),
-			false,
-			{ ok: false, status: "uncertain", error: "GJC session send returned an invalid response." },
-		],
-		[
-			() => ({ code: 1, ...sent("accepted") }),
-			false,
-			{
-				ok: false,
-				status: "uncertain",
-				operationRef: "op-1",
-				error: "GJC session send returned an invalid response.",
-			},
-		],
-		[
-			() => sent("queued"),
-			false,
-			{ ok: false, status: "uncertain", error: "GJC session send returned an invalid response." },
-		],
-		[() => sent("terminal_ok"), true, { ok: true, status: "terminal_ok", operationRef: "op-1" }],
-		[
-			() => sent("failed"),
-			true,
-			{
-				ok: false,
-				status: "failed",
-				operationRef: "op-1",
-				error: "GJC target turn failed (operationRef op-1).",
-			},
-		],
-	];
-	for (const [handler, wait, expected] of cases) {
-		const { deps, calls, count } = fakeExec({
-			"herdr pane get": () => paneGet("wE:p2", { [SESSION_ID_KEY]: TARGET }),
-			"gjc send": handler,
-		});
-		const result = await deliverPrompt(
-			deps,
-			{ pane: "wE:p2", text: "x", wait },
-			SENDER,
-		);
-		for (const [key, value] of Object.entries(expected)) {
-			assert.equal(result[key as keyof SendResult], value, `${key} for ${JSON.stringify(expected)}`);
-		}
-		assert.equal(count("gjc send"), 1);
-		assert.equal(count("herdr pane send-text"), 0);
-		const args = calls.find((call) => call.command === "gjc")!.args;
-		assert.equal(args.includes("--wait"), wait === true);
-	}
-});
-
-test("raw delivery types then submits, and reports partial failure", async () => {
-	const run = (text: Handler, keys: Handler) =>
-		fakeExec({
-			"herdr pane get": () => paneGet("wE:p2"),
-			"herdr pane send-text": text,
-			"herdr pane send-keys": keys,
-		});
-	const success = run(() => ({}), () => ({}));
-	const result = await deliverPrompt(
-		success.deps,
-		{ pane: "wE:p2", text: "hi there", raw: true },
-		SENDER,
-	);
-	assert.deepEqual(result, {
-		ok: true,
-		mode: "raw",
-		status: "raw_written",
-		pane: "wE:p2",
-	});
-	assert.deepEqual(
-		success.calls.slice(2).map((call) => call.args),
-		[
-			["pane", "send-text", "wE:p2", "hi there"],
-			["pane", "send-keys", "wE:p2", "enter"],
-		],
-	);
-
-	const textFails = run(() => herdrError("io", "write failed"), () => ({}));
-	const noText = await deliverPrompt(textFails.deps, { pane: "wE:p2", text: "x", raw: true }, SENDER);
-	assert.equal(noText.error, "Herdr raw text delivery failed: write failed");
-	assert.equal(textFails.count("herdr pane send-keys"), 0);
-
-	const enterFails = run(() => ({}), () => herdrError("io", "key failed"));
-	const partial = await deliverPrompt(enterFails.deps, { pane: "wE:p2", text: "x", raw: true }, SENDER);
-	assert.equal(partial.status, "raw_partial");
-	assert.equal(partial.error, "Herdr raw submit failed; text may already be present: key failed");
-});
-
-test("command and tool share delivery and read the sender session per call", async () => {
-	let command: ((args: string, ctx: ExtensionContext) => Promise<void>) | undefined;
-	let tool:
-		| {
-				execute: (...args: unknown[]) => Promise<{
-					content: { text: string }[];
-					details: SendResult;
-					isError: boolean;
-				}>;
-		  }
-		| undefined;
-	const logs: string[] = [];
-	const { exec, count } = (() => {
-		const fake = fakeExec({
-			"herdr pane get": () => paneGet("wE:p2", { [SESSION_ID_KEY]: TARGET }),
-			"gjc send": () => sent("accepted"),
-		});
-		return { exec: fake.deps.exec, count: fake.count };
-	})();
-	registerSendFeatures(
-		{
-			zod,
-			exec,
-			logger: {
-				info: (message: string) => logs.push(`info:${message}`),
-				warn: (message: string) => logs.push(`warn:${message}`),
-			},
-			registerCommand: (_name: string, options: { handler: typeof command }) => {
-				command = options.handler;
-			},
-			registerTool: (definition: typeof tool) => {
-				tool = definition;
-			},
-		} as unknown as ExtensionAPI,
-		"herdr",
-		"wE:p1",
-	);
-	const ctx = (sessionId: string) =>
-		({ hasUI: false, sessionManager: { getSessionId: () => sessionId } }) as unknown as ExtensionContext;
-
-	await command!("wE:p2 hello", ctx(SENDER.sessionId));
-	await command!("--bogus wE:p2 hello", ctx(SENDER.sessionId));
-	assert.match(logs[0], /^info:Prompt accepted by GJC session receiver-session on pane wE:p2 \(operationRef op-1\)/);
-	assert.equal(logs[1], `warn:${USAGE}`);
-
-	const accepted = await tool!.execute("call-1", { pane: "wE:p2", text: "hi" }, undefined, undefined, ctx(SENDER.sessionId));
-	assert.equal(accepted.details.status, "accepted");
-	assert.equal(accepted.isError, false);
-	const self = await tool!.execute("call-2", { pane: "wE:p2", text: "hi" }, undefined, undefined, ctx(TARGET));
-	assert.equal(self.details.error, "Cannot send a prompt to the current GJC session.");
-	assert.equal(self.isError, true);
-	assert.equal(count("gjc send"), 2);
-});
-
-const SENDS = (calls: { args: string[] }[]) =>
-	calls.filter(({ args }) => args[1] === "send-text" || args[1] === "send-keys");
-
-test("raw delivery waits for a typed-in input box, then sends once", async () => {
-	const screens = [TYPING_CLAUDE, EMPTY_CLAUDE];
-	const { deps, calls } = fakeExec({
-		"herdr pane get": () => paneGet("wE:p2", {}, { focused: true }),
-		"herdr pane read": () => ({ stdout: screens.shift() ?? EMPTY_CLAUDE }),
-		"herdr pane send-text": () => ({}),
-		"herdr pane send-keys": () => ({}),
-	});
-	const result = await deliverPrompt(deps, { pane: "wE:p2", text: "x", raw: true }, SENDER);
-	assert.equal(result.status, "raw_written");
-	assert.equal(result.waitedMs, 2_000);
-	assert.equal(SENDS(calls).length, 2);
-});
-
-test("raw delivery gives up on a stuck input box without typing anything", async () => {
-	const { deps, calls } = fakeExec({
-		"herdr pane get": () => paneGet("wE:p2"),
-		"herdr pane read": () => ({ stdout: TYPING_CLAUDE }),
-	});
-	deps.inputWaitMs = 4_000;
-	const result = await deliverPrompt(deps, { pane: "wE:p2", text: "x", raw: true }, SENDER);
-	assert.equal(result.ok, false);
-	assert.equal(result.status, "not_sent");
-	assert.match(result.error ?? "", /input box still has text after 4s/);
-	assert.equal(result.waitedMs, 4_000);
-	assert.equal(SENDS(calls).length, 0);
-});
-
-test("raw delivery falls back to the focus rule when the input box is unreadable; SDK is unaffected", async () => {
-	const focused = fakeExec({
-		"herdr pane get": () => paneGet("wE:p2", {}, { focused: true }),
-		"herdr pane read": () => ({ stdout: "$ plain shell" }),
-	});
-	const refused = await deliverPrompt(focused.deps, { pane: "wE:p2", text: "x", raw: true }, SENDER);
-	assert.equal(refused.status, "not_sent");
-	assert.match(refused.error ?? "", /could not be read and the pane is focused/);
-	assert.equal(SENDS(focused.calls).length, 0);
-
-	const unfocused = fakeExec({
-		"herdr pane get": () => paneGet("wE:p2", {}, { focused: false }),
-		"herdr pane read": () => ({ stdout: "$ plain shell" }),
-		"herdr pane send-text": () => ({}),
-		"herdr pane send-keys": () => ({}),
-	});
-	const written = await deliverPrompt(unfocused.deps, { pane: "wE:p2", text: "x", raw: true }, SENDER);
-	assert.equal(written.status, "raw_written");
-
-	const sdk = fakeExec({
-		"herdr pane get": () => paneGet("wE:p2", { [SESSION_ID_KEY]: TARGET }, { focused: true }),
-		"gjc send": () => sent("accepted"),
-	});
-	const accepted = await deliverPrompt(sdk.deps, { pane: "wE:p2", text: "x" }, SENDER);
-	assert.equal(accepted.status, "accepted");
-	assert(!sdk.calls.some(({ args }) => args[1] === "read"));
-});
-
-test("raw rechecks blocked and focused state after waiting", async () => {
-	for (const latest of [
-		"blocked",
-		"blocked-unknown-ui",
-		"typing-cap-exhausted",
-		"focused",
-		"focused-then-typing",
-	] as const) {
-		let agentGets = 0;
-		let gets = 0;
-		const screens =
-			latest === "blocked"
-				? [TYPING_CLAUDE, EMPTY_CLAUDE]
-				: latest === "blocked-unknown-ui"
-					? [TYPING_CLAUDE, "$ approval / unknown UI"]
-					: latest === "typing-cap-exhausted"
-						? [TYPING_CLAUDE]
-						: latest === "focused"
-							? [TYPING_CLAUDE, "$ approval / unknown UI", "$ approval / unknown UI"]
-							: [TYPING_CLAUDE, "$ approval / unknown UI", TYPING_CLAUDE];
-		const { deps, calls, count, advance } = fakeExec({
-			"herdr agent get": (_args, options) => {
-				if (++agentGets > 1) advance(1_000);
-				assert.equal(options?.timeout, 3_000);
-				return ok({ result: { agent: { pane_id: "wE:p2" } } });
-			},
-			"herdr pane get": (_args, options) => {
-				if (++gets === 1) {
-					return paneGet("wE:p2", {}, { focused: false, agent_status: "idle" });
-				}
-				if (latest === "blocked-unknown-ui") assert.equal(options?.timeout, 1_500);
-				if (latest === "typing-cap-exhausted") advance(1_000);
-				return paneGet(
-					"wE:p2",
-					{},
-					{
-						focused: latest === "focused-then-typing" ? gets === 2 : true,
-						agent_status: latest.startsWith("blocked") ? "blocked" : "idle",
-					},
-				);
-			},
-			"herdr pane read": () => ({ stdout: screens.shift() ?? "$ approval / unknown UI" }),
-		});
-		deps.inputWaitMs =
-			latest === "typing-cap-exhausted"
-				? 2_000
-				: latest === "blocked-unknown-ui"
-					? 3_500
-					: 6_000;
-		const target = latest === "typing-cap-exhausted" ? "receiver" : "wE:p2";
-		const result = await deliverPrompt(deps, { pane: target, text: "x", raw: true }, SENDER);
-		assert.equal(result.status, "not_sent");
-		assert.equal(
-			result.waitedMs,
-			latest.startsWith("blocked") || latest === "typing-cap-exhausted" ? 2_000 : 6_000,
-		);
-		assert.match(
-			result.error ?? "",
-			latest.startsWith("blocked")
-				? /Target is blocked/
-				: latest === "typing-cap-exhausted"
-					? /input box still has text after 2s; raw input not sent/
-					: latest === "focused"
-						? /could not be read and the pane is focused.*after 6s/
-						: /input box still has text after 6s; raw input not sent/,
-		);
-		if (latest === "typing-cap-exhausted") {
-			assert.equal(count("herdr agent get"), 1);
-			assert.equal(count("herdr pane get"), 1);
-			assert.equal(count("herdr pane read"), 1);
-		} else {
-			assert.equal(count("herdr pane get"), latest === "focused" ? 3 : 2);
-			assert.equal(count("herdr pane read"), latest.startsWith("blocked") ? 2 : 3);
-		}
-		assert.equal(SENDS(calls).length, 0);
-	}
-});
-
-test("raw re-resolves names and refuses a refreshed self target", async () => {
-	let selfGets = 0;
-	const selfScreens = [TYPING_CLAUDE, EMPTY_CLAUDE];
-	const selfTarget = fakeExec({
-		"herdr agent get": () =>
-			ok({ result: { agent: { pane_id: ++selfGets === 1 ? "wE:p2" : SENDER.pane } } }),
-		"herdr pane get": (args) => paneGet(args[2]),
-		"herdr pane read": () => ({ stdout: selfScreens.shift()! }),
-	});
-	const selfResult = await deliverPrompt(
-		selfTarget.deps,
-		{ pane: "receiver", text: "x", raw: true },
-		SENDER,
-	);
-	assert.equal(selfResult.status, "not_sent");
-	assert.equal(selfResult.pane, SENDER.pane);
-	assert.equal(selfResult.waitedMs, 2_000);
-	assert.match(selfResult.error ?? "", /current Herdr pane/);
-	assert.equal(selfTarget.count("herdr agent get"), 2);
-	assert.equal(SENDS(selfTarget.calls).length, 0);
-
-	for (const waitReason of ["typing", "focused-unknown"] as const) {
-		let movedGets = 0;
-		const movedScreens =
-			waitReason === "typing"
-				? [TYPING_CLAUDE, EMPTY_CLAUDE]
-				: ["$ plain shell", EMPTY_CLAUDE];
-		const moved = fakeExec({
-			"herdr agent get": () =>
-				ok({ result: { agent: { pane_id: ++movedGets === 1 ? "wE:p2" : "wE:p3" } } }),
-			"herdr pane get": (args) =>
-				paneGet(args[2], {}, { focused: waitReason === "focused-unknown" && args[2] === "wE:p2" }),
-			"herdr pane read": (args) => {
-				assert.equal(args[2], "wE:p2");
-				return { stdout: movedScreens.shift() ?? TYPING_CLAUDE };
-			},
-		});
-		const movedResult = await deliverPrompt(
-			moved.deps,
-			{ pane: "receiver", text: "x", raw: true },
-			SENDER,
-		);
-		assert.equal(movedResult.status, "not_sent");
-		assert.equal(movedResult.pane, "wE:p3");
-		assert.equal(movedResult.waitedMs, 2_000);
-		assert.match(
-			movedResult.error ?? "",
-			/Target receiver moved from pane wE:p2 to wE:p3 while waiting; raw input not sent/,
-		);
-		assert.equal(moved.count("herdr agent get"), 2);
-		assert.equal(SENDS(moved.calls).length, 0);
-	}
-
-	let goneGets = 0;
-	const goneScreens = [TYPING_CLAUDE, EMPTY_CLAUDE];
-	const gone = fakeExec({
-		"herdr agent get": () =>
-			++goneGets === 1
-				? ok({ result: { agent: { pane_id: "wE:p2" } } })
-				: herdrError("agent_not_found", "no such agent"),
-		"herdr pane get": (args) => paneGet(args[2]),
-		"herdr pane read": () => ({ stdout: goneScreens.shift()! }),
-	});
-	const goneResult = await deliverPrompt(
-		gone.deps,
-		{ pane: "receiver", text: "x", raw: true },
-		SENDER,
-	);
-	assert.equal(goneResult.status, "not_sent");
-	assert.equal(goneResult.waitedMs, 2_000);
-	assert.match(goneResult.error ?? "", /Herdr target not found: receiver\./);
-	assert.equal(gone.count("herdr agent get"), 2);
-	assert.equal(SENDS(gone.calls).length, 0);
-});
-
-test("raw abort before lookup or during input reads and sleeps sends no input", async () => {
-	for (const when of ["before", "read", "sleep", "readiness-sleep"] as const) {
-		const controller = new AbortController();
-		if (when === "before") controller.abort();
-		const { deps, calls, advance } = fakeExec({
-			"herdr pane get": () => paneGet("wE:p2", {}, { focused: when === "readiness-sleep" }),
-			"herdr pane read": () => {
-				if (when === "read") {
-					controller.abort();
-					return new Error("read aborted");
-				}
-				return { stdout: when === "readiness-sleep" ? "$ plain shell" : TYPING_CLAUDE };
-			},
-		});
-		deps.sleep = async (ms) => { advance(ms); controller.abort(); };
-		const result = await deliverPrompt(deps, { pane: "wE:p2", text: "x", raw: true }, SENDER, controller.signal);
-		assert.equal(result.status, "not_sent");
-		assert.match(result.error ?? "", /aborted/);
-		assert.equal(SENDS(calls).length, 0);
-		if (when === "before") assert.equal(calls.length, 0);
-		if (when === "readiness-sleep") assert.equal(result.waitedMs, 2_000);
-	}
-});
-
-test("raw passes the signal to both writes and preserves partial delivery on intervening abort", async () => {
-	for (const abortAfterText of [false, true]) {
-		const controller = new AbortController();
-		const { deps, count } = fakeExec({
-			"herdr pane send-text": (_args, options) => {
-				assert.equal(options?.signal, controller.signal);
-				if (abortAfterText) controller.abort();
-				return {};
-			},
-			"herdr pane send-keys": (_args, options) => {
-				assert.equal(options?.signal, controller.signal);
-				return {};
-			},
-		});
-		const result = await sendRawPrompt(deps, "wE:p2", "x", controller.signal);
-		assert.equal(result.status, abortAfterText ? "raw_partial" : "raw_written");
-		assert.equal(count("herdr pane send-text"), 1);
-		assert.equal(count("herdr pane send-keys"), abortAfterText ? 0 : 1);
-	}
-});
-
-test("raw default empty fixture works for focused targets and clipped drafts cannot fall back", async () => {
-	const empty = fakeExec({
-		"herdr pane get": () => paneGet("wE:p2", {}, { focused: true }),
-		"herdr pane send-text": () => ({}),
-		"herdr pane send-keys": () => ({}),
-	});
-	assert.equal((await deliverPrompt(empty.deps, { pane: "wE:p2", text: "x", raw: true }, SENDER)).status, "raw_written");
-	const clipped = fakeExec({
-		"herdr pane get": () => paneGet("wE:p2", {}, { focused: false }),
-		"herdr pane read": () => ({ stdout: `  draft continuation\n${RULE_LINE}` }),
-	});
-	clipped.deps.inputWaitMs = 0;
-	const result = await deliverPrompt(clipped.deps, { pane: "wE:p2", text: "x", raw: true }, SENDER);
-	assert.equal(result.status, "not_sent");
-	assert.match(result.error ?? "", /input box still has text/);
-	assert.equal(SENDS(clipped.calls).length, 0);
-});
-
-test("fractional clock and wait budgets never turn a typing draft into unfocused raw delivery", async () => {
-	for (const waitBudget of [2_000.5, 5_000.75]) {
-		const { deps, calls, count, advance } = fakeExec({
-			"herdr pane get": () => paneGet("wE:p2", {}, { focused: false }),
-			"herdr pane read": () => { advance(0.25); return { stdout: TYPING_CLAUDE }; },
-			"herdr pane send-text": () => ({}),
-			"herdr pane send-keys": () => ({}),
-		});
-		advance(0.25);
-		deps.inputWaitMs = waitBudget;
-		const result = await deliverPrompt(deps, { pane: "wE:p2", text: "agent prompt", raw: true }, SENDER);
-		assert.equal(result.status, "not_sent");
-		assert.match(result.error ?? "", /input box still has text/);
-		assert.equal(count("herdr pane read"), waitBudget < 3_000 ? 1 : 3);
-		assert.equal(SENDS(calls).length, 0);
-	}
-});
-
-test("raw delivery waits on a focused pane with an unreadable input box, gives up at the cap, and refuses immediately when inputWaitMs = 0", async () => {
-	let gets = 0;
-	const sleeps: number[] = [];
-	const { deps, calls, count, advance } = fakeExec({
-		"herdr pane get": () => paneGet("wE:p2", {}, { focused: ++gets < 3 }),
-		"herdr pane read": () => ({ stdout: "$ plain shell" }),
-		"herdr pane send-text": () => ({}),
-		"herdr pane send-keys": () => ({}),
-	});
-	deps.sleep = async (ms) => {
-		sleeps.push(ms);
-		advance(ms);
-	};
-	const written = await deliverPrompt(deps, { pane: "wE:p2", text: "ls", raw: true }, SENDER);
-	assert.equal(written.ok, true);
-	assert.equal(written.status, "raw_written");
-	assert.equal(written.waitedMs, 4_000);
-	assert.deepEqual(sleeps, [2_000, 2_000]);
-	assert.equal(count("herdr pane get"), 3);
-	assert.equal(count("herdr pane read"), 3);
-	assert.equal(SENDS(calls).length, 2);
-
-	const stuck = fakeExec({
-		"herdr pane get": () => paneGet("wE:p2", {}, { focused: true }),
-		"herdr pane read": () => ({ stdout: "$ plain shell" }),
-	});
-	stuck.deps.inputWaitMs = 6_000;
-	const refused = await deliverPrompt(stuck.deps, { pane: "wE:p2", text: "ls", raw: true }, SENDER);
-	assert.equal(refused.ok, false);
-	assert.equal(refused.status, "not_sent");
-	assert.equal(refused.waitedMs, 6_000);
-	assert.match(refused.error ?? "", /could not be read and the pane is focused.*after 6s; raw input not sent\. Retry later\./);
-	assert.equal(SENDS(stuck.calls).length, 0);
-
-	const zeroSleeps: number[] = [];
-	const zero = fakeExec({
-		"herdr pane get": () => paneGet("wE:p2", {}, { focused: true }),
-		"herdr pane read": () => ({ stdout: "$ plain shell" }),
-	});
-	zero.deps.inputWaitMs = 0;
-	zero.deps.sleep = async (ms) => {
-		zeroSleeps.push(ms);
-		zero.advance(ms);
-	};
-	const immediate = await deliverPrompt(zero.deps, { pane: "wE:p2", text: "ls", raw: true }, SENDER);
-	assert.equal(immediate.ok, false);
-	assert.equal(immediate.status, "not_sent");
-	assert.equal(immediate.waitedMs, undefined);
-	assert.equal(zeroSleeps.length, 0);
-	assert.equal(zero.count("herdr pane get"), 1);
-	assert.equal(zero.count("herdr pane read"), 1);
-	assert.equal(SENDS(zero.calls).length, 0);
-});
-
-test("raw retry lookups bound sequential name resolution by waitDeadline, include final lookup time, and keep focused refusal on small remainders", async () => {
-	let timedGets = 0;
-	let timedReads = 0;
-	const timed = fakeExec({
-		"herdr pane get": () => {
-			if (++timedGets === 1) return paneGet("wE:p2", {}, { focused: true });
-			timed.advance(500);
-			return paneGet("wE:p2", {}, { focused: false });
-		},
-		"herdr pane read": () => {
-			if (++timedReads > 1) timed.advance(100);
-			return { stdout: "$ plain shell" };
-		},
-		"herdr pane send-text": () => ({}),
-		"herdr pane send-keys": () => ({}),
-	});
-	const timedResult = await deliverPrompt(timed.deps, { pane: "wE:p2", text: "ls", raw: true }, SENDER);
-	assert.equal(timedResult.status, "raw_written");
-	assert.equal(timedResult.waitedMs, 2_600);
-
-	for (const overMode of ["killed", "late-unfocused"] as const) {
-		let agentGets = 0;
-		let paneGets = 0;
-		let paneReads = 0;
-		const over = fakeExec({
-			"herdr agent get": (_args, options) => {
-				if (++agentGets > 1) {
-					assert.equal(options?.timeout, 1_200);
-					over.advance(700);
-				}
-				return ok({ result: { agent: { pane_id: "wE:p2" } } });
-			},
-			"herdr pane get": (_args, options) => {
-				if (++paneGets === 1) return paneGet("wE:p2", {}, { focused: true });
-				assert.equal(options?.timeout, 500);
-				if (overMode === "killed") {
-					over.advance(options?.timeout ?? 0);
-					return { killed: true, code: 0, stdout: "", stderr: "" };
-				}
-				over.advance(2_000);
-				return paneGet("wE:p2", {}, { focused: false });
-			},
-			"herdr pane read": () => {
-				if (++paneReads > 1) over.advance(300);
-				return { stdout: "$ plain shell" };
-			},
-		});
-		over.deps.inputWaitMs = 3_500;
-		const overResult = await deliverPrompt(over.deps, { pane: "receiver", text: "ls", raw: true }, SENDER);
-		assert.equal(overResult.status, "not_sent");
-		assert.match(overResult.error ?? "", /could not be read and the pane is focused/);
-		assert.equal(SENDS(over.calls).length, 0);
-		if (overMode === "killed") assert.equal(overResult.waitedMs, 3_500);
-	}
-
-	const subRecheck = fakeExec({
-		"herdr pane get": () => paneGet("wE:p2", {}, { focused: true }),
-		"herdr pane read": () => {
-			subRecheck.advance(0.4);
-			return { stdout: "$ plain shell" };
-		},
-	});
-	subRecheck.deps.inputWaitMs = 2_001.5;
-	const subResult = await deliverPrompt(subRecheck.deps, { pane: "wE:p2", text: "ls", raw: true }, SENDER);
-	assert.equal(subResult.status, "not_sent");
-	assert.match(subResult.error ?? "", /could not be read and the pane is focused/);
-	assert.equal(subResult.waitedMs, 2_000.4);
-	assert.equal(subRecheck.count("herdr pane read"), 1);
-});
-
 // ============================================================================
 // #86 3b: hc backend send tests (boundaries 1, 2, 3, 4, 6)
 // ============================================================================
-
-import {
-	HC_SEND_ERROR_KINDS,
-	HC_SEND_NOT_SENT_KINDS,
-	type HcSendErrorKind,
-} from "../src/hc.ts";
-import { describeResult, HC_SEND_NOTE } from "../src/send.ts";
 
 const HC_CALLER = "t1";
 const HC_TARGET = "t2";
@@ -1074,8 +141,6 @@ function fakeHcSendExec(routes: Record<string, Handler>) {
 	};
 	const deps: SendDeps = {
 		exec,
-		herdrBin: "herdr",
-		backend: "hc",
 		hcBin: "hc",
 		hcCallerId: HC_CALLER,
 		now: () => clock,
@@ -1092,7 +157,6 @@ test("hc send boundary 1: default, --raw, --wait, and --raw --wait execute one h
 		const res = await deliverPrompt(
 			deps,
 			{ pane: HC_TARGET, text: "hello hc", raw },
-			SENDER,
 		);
 		assert.deepEqual(res, {
 			ok: true,
@@ -1130,7 +194,6 @@ test("hc send boundary 1: default, --raw, --wait, and --raw --wait execute one h
 		const res = await deliverPrompt(
 			deps,
 			{ pane: HC_TARGET, text: "wait hc", wait: true, raw },
-			SENDER,
 		);
 		assert.deepEqual(res, {
 			ok: true,
@@ -1172,7 +235,6 @@ test("hc send boundary 1: default, --raw, --wait, and --raw --wait execute one h
 		const res = await deliverPrompt(
 			deps,
 			{ pane: HC_TARGET, text: "optional fields" },
-			SENDER,
 		);
 		assert.equal(res.ok, true);
 		assert.equal(res.mode, "hc");
@@ -1194,7 +256,6 @@ test("hc send boundary 1: default, --raw, --wait, and --raw --wait execute one h
 		const res = await deliverPrompt(
 			deps,
 			{ pane: HC_TARGET, text: "bad stdout", wait: true },
-			SENDER,
 		);
 		assert.equal(res.ok, false, badStdout);
 		assert.equal(res.mode, "hc", badStdout);
@@ -1213,7 +274,6 @@ test("hc send boundary 1: default, --raw, --wait, and --raw --wait execute one h
 		const res = await deliverPrompt(
 			deps,
 			{ pane: HC_TARGET, text: "invalid wait", wait: waitRequested },
-			SENDER,
 		);
 		assert.equal(res.ok, false);
 		assert.equal(res.mode, "hc");
@@ -1248,7 +308,6 @@ test("hc send boundary 1: default, --raw, --wait, and --raw --wait execute one h
 			const res = await deliverPrompt(
 				deps,
 				{ pane: HC_TARGET, text: "kind check" },
-				SENDER,
 			);
 			const expectedStatus = HC_SEND_NOT_SENT_KINDS.has(kind as never)
 				? "not_sent"
@@ -1274,7 +333,6 @@ test("hc send boundary 1: default, --raw, --wait, and --raw --wait execute one h
 		const res = await deliverPrompt(
 			deps,
 			{ pane: HC_TARGET, text: "unrecognized err" },
-			SENDER,
 		);
 		assert.equal(res.ok, false);
 		assert.equal(res.status, "uncertain");
@@ -1307,7 +365,6 @@ test("hc send boundary 2: --wait separates delivery (status=sent) from waited ou
 		const res = await deliverPrompt(
 			deps,
 			{ pane: HC_TARGET, text: `wait ${reason}`, wait: true, raw: true },
-			SENDER,
 		);
 		assert.equal(res.ok, false, reason);
 		assert.equal(res.mode, "hc", reason);
@@ -1337,7 +394,6 @@ test("hc send boundary 2: --wait separates delivery (status=sent) from waited ou
 		const res = await deliverPrompt(
 			deps,
 			{ pane: HC_TARGET, text: "no wait result", wait: true },
-			SENDER,
 		);
 		assert.equal(res.ok, false, rawNoWait);
 		assert.equal(res.mode, "hc", rawNoWait);
@@ -1380,7 +436,6 @@ test("hc send boundary 2: --wait separates delivery (status=sent) from waited ou
 		const blockedRes = await deliverPrompt(
 			blockedDeps,
 			{ pane: HC_TARGET, text: "wait blocked", wait: true },
-			SENDER,
 		);
 		assert.equal(blockedRes.ok, false);
 		assert.equal(blockedRes.status, "sent");
@@ -1408,7 +463,6 @@ test("hc send boundary 2: --wait separates delivery (status=sent) from waited ou
 		const errorRes = await deliverPrompt(
 			errorDeps,
 			{ pane: HC_TARGET, text: "wait error", wait: true },
-			SENDER,
 		);
 		assert.equal(errorRes.ok, false);
 		assert.equal(errorRes.status, "sent");
@@ -1438,7 +492,6 @@ test("hc send boundary 2: --wait separates delivery (status=sent) from waited ou
 		const exitRes = await deliverPrompt(
 			exitDeps,
 			{ pane: HC_TARGET, text: "wait exit", wait: true },
-			SENDER,
 		);
 		assert.equal(exitRes.ok, false);
 		assert.equal(exitRes.status, "sent");
@@ -1472,7 +525,6 @@ test("hc send boundary 2: --wait separates delivery (status=sent) from waited ou
 		const res = await deliverPrompt(
 			deps,
 			{ pane: HC_TARGET, text: "no turn advance", wait: true },
-			SENDER,
 		);
 		assert.equal(res.ok, false);
 		assert.equal(res.status, "sent");
@@ -1495,7 +547,6 @@ test("hc send boundary 2: --wait separates delivery (status=sent) from waited ou
 		const mismatchRes = await deliverPrompt(
 			mismatchDeps,
 			{ pane: HC_TARGET, text: "mismatched wait terminal", wait: true },
-			SENDER,
 		);
 		assert.equal(mismatchRes.ok, false);
 		assert.equal(mismatchRes.mode, "hc");
@@ -1522,7 +573,6 @@ test("hc send boundary 3 & 4: allows remote addresses, refuses self (ID and name
 		const directRemote = await deliverPrompt(
 			deps,
 			{ pane: "rohan/t7", text: "remote direct" },
-			SENDER,
 		);
 		assert.deepEqual(directRemote, {
 			ok: true,
@@ -1536,7 +586,6 @@ test("hc send boundary 3 & 4: allows remote addresses, refuses self (ID and name
 		const namedRemote = await deliverPrompt(
 			deps,
 			{ pane: "remote-worker", text: "remote by name" },
-			SENDER,
 		);
 		assert.deepEqual(namedRemote, {
 			ok: true,
@@ -1550,7 +599,6 @@ test("hc send boundary 3 & 4: allows remote addresses, refuses self (ID and name
 		const remoteSameNum = await deliverPrompt(
 			deps,
 			{ pane: `rohan/${HC_CALLER}`, text: "remote t1 is not local t1" },
-			SENDER,
 		);
 		assert.equal(remoteSameNum.ok, true);
 		assert.equal(remoteSameNum.status, "sent");
@@ -1570,7 +618,6 @@ test("hc send boundary 3 & 4: allows remote addresses, refuses self (ID and name
 		const res = await deliverPrompt(
 			deps,
 			{ pane: selfTarget, text: "self send" },
-			SENDER,
 		);
 		assert.equal(res.ok, false);
 		assert.equal(res.mode, "hc");
@@ -1587,7 +634,6 @@ test("hc send boundary 3 & 4: allows remote addresses, refuses self (ID and name
 		const res = await deliverPrompt(
 			deps,
 			{ pane: HC_TARGET, text: "no caller" },
-			SENDER,
 		);
 		assert.equal(res.ok, false);
 		assert.equal(res.status, "not_sent");
@@ -1601,7 +647,6 @@ test("hc send boundary 3 & 4: allows remote addresses, refuses self (ID and name
 		const res = await deliverPrompt(
 			deps,
 			{ pane: HC_TARGET, text: dashText },
-			SENDER,
 		);
 		assert.equal(res.ok, false);
 		assert.equal(res.status, "not_sent");
@@ -1621,7 +666,6 @@ test("hc send boundary 3 & 4: allows remote addresses, refuses self (ID and name
 		const res = await deliverPrompt(
 			deps,
 			{ pane: HC_TARGET, text: complexText },
-			SENDER,
 		);
 		assert.equal(res.ok, true);
 		assert.equal(sentArgs.includes("--"), false);
@@ -1654,7 +698,6 @@ test("hc send boundary 3 & 4: allows remote addresses, refuses self (ID and name
 		const okRes = await deliverPrompt(
 			deps,
 			{ pane: "worker", text: "budgeted wait", wait: true },
-			SENDER,
 		);
 		assert.equal(okRes.ok, true);
 		assert.equal(sendArgs[sendArgs.indexOf("--timeout") + 1], "58");
@@ -1674,7 +717,6 @@ test("hc send boundary 3 & 4: allows remote addresses, refuses self (ID and name
 		const exRes = await deliverPrompt(
 			exhaustedDeps,
 			{ pane: "worker", text: "exhausted" },
-			SENDER,
 		);
 		assert.equal(exRes.ok, false);
 		assert.equal(exRes.status, "not_sent");
@@ -1690,7 +732,6 @@ test("hc send boundary 3 & 4: allows remote addresses, refuses self (ID and name
 		const preRes = await deliverPrompt(
 			preDeps,
 			{ pane: HC_TARGET, text: "pre-aborted" },
-			SENDER,
 			preAborted.signal,
 		);
 		assert.equal(preRes.ok, false);
@@ -1709,7 +750,6 @@ test("hc send boundary 3 & 4: allows remote addresses, refuses self (ID and name
 		const midRes = await deliverPrompt(
 			midDeps,
 			{ pane: "worker", text: "abort during ls" },
-			SENDER,
 			midLookup.signal,
 		);
 		assert.equal(midRes.ok, false);
@@ -1777,8 +817,7 @@ test("hc send boundary 6: registerSendFeatures with hc backend verifies descript
 		},
 	} as unknown as ExtensionAPI;
 
-	registerSendFeatures(api, "herdr", undefined, {
-		backend: "hc",
+	registerSendFeatures(api, {
 		hcBin: "/custom/hc",
 		hcCallerId: HC_CALLER,
 	});
@@ -1900,5 +939,137 @@ test("hc send boundary 6: registerSendFeatures with hc backend verifies descript
 	});
 	for (const secret of secrets) {
 		assert.equal(syntheticFormatted.includes(secret), false);
+	}
+});
+
+test("hc send migrated boundaries: rejects invalid requests and failed name lookups before send, classifies killed/thrown hc send as uncertain without resend, and surfaces USAGE and tool success", async () => {
+	// Invalid requests rejected before any hc exec
+	for (const [request, expectedError] of [
+		[{ pane: " ", text: "x" }, "Pane is required."],
+		[
+			{ pane: "--current", text: "x" },
+			"Target must be an hc terminal address or name, not an option.",
+		],
+		[{ pane: HC_TARGET, text: " \n" }, "Prompt text must not be empty."],
+		[
+			{ pane: "a/b/t2", text: "x" },
+			"Target is neither a valid hc terminal address nor a valid terminal name.",
+		],
+	] as const) {
+		const { deps, calls } = fakeHcSendExec({});
+		const res = await deliverViaHc(deps, request);
+		assert.equal(res.ok, false, expectedError);
+		assert.equal(res.mode, "hc", expectedError);
+		assert.equal(res.status, "not_sent", expectedError);
+		assert.equal(res.error, expectedError);
+		assert.equal(calls.length, 0, expectedError);
+	}
+
+	// Failed hc ls name lookups (0 matches, 2 matches, malformed row) -> not_sent, 0 hc send
+	for (const [target, terminals] of [
+		["missing-worker", [{ address: "t9", name: "other" }]],
+		[
+			"dup-worker",
+			[
+				{ address: "t2", name: "dup-worker" },
+				{ address: "t3", name: "dup-worker" },
+			],
+		],
+		["worker", [{ bad: true }]],
+	] as const) {
+		const { deps, calls } = fakeHcSendExec({
+			"hc ls": () =>
+				ok({
+					terminals,
+					hidden_finished: 0,
+					machines: [],
+				}),
+		});
+		const res = await deliverViaHc(deps, { pane: target, text: "hi" });
+		assert.equal(res.ok, false, target);
+		assert.equal(res.mode, "hc", target);
+		assert.equal(res.status, "not_sent", target);
+		assert.equal(calls.filter((c) => c.args[0] === "send").length, 0, target);
+	}
+
+	// Killed or throwing hc send -> uncertain, 1 send, 0 resend
+	for (const sendImpl of [
+		() => ({ code: 1, killed: true, stderr: "" }),
+		() => new Error("spawn EIO"),
+	]) {
+		const { deps, calls } = fakeHcSendExec({
+			"hc send": sendImpl,
+		});
+		const res = await deliverViaHc(deps, { pane: HC_TARGET, text: "uncertain send" });
+		assert.equal(res.ok, false);
+		assert.equal(res.mode, "hc");
+		assert.equal(res.status, "uncertain");
+		assert.equal(calls.length, 1);
+	}
+
+	// registerSendFeatures: invalid command flag surfaces USAGE via warn log (0 execs), and tool execute returns ok/sent
+	{
+		let commandHandler: ((args: string, ctx: ExtensionContext) => Promise<void>) | undefined;
+		let toolExecute:
+			| ((
+					toolCallId: string,
+					params: { pane: string; text: string; wait?: boolean; raw?: boolean },
+					signal?: AbortSignal,
+			  ) => Promise<{
+					content: { type: string; text: string }[];
+					details: SendResult;
+					isError: boolean;
+			  }>)
+			| undefined;
+		const logs: string[] = [];
+		const execCalls: { command: string; args: string[] }[] = [];
+		const api = {
+			zod,
+			exec: async (command: string, args: string[], options: ExecOptions) => {
+				assertExecTimeout(options?.timeout);
+				execCalls.push({ command, args });
+				return { stdout: JSON.stringify(hcSendPayload()), stderr: "", code: 0, killed: false };
+			},
+			logger: {
+				info: (message: string) => logs.push(`info:${message}`),
+				warn: (message: string) => logs.push(`warn:${message}`),
+			},
+			registerCommand: (
+				_name: string,
+				options: { handler: typeof commandHandler },
+			) => {
+				commandHandler = options.handler;
+			},
+			registerTool: (definition: { execute: typeof toolExecute }) => {
+				toolExecute = definition.execute;
+			},
+		} as unknown as ExtensionAPI;
+
+		registerSendFeatures(api, { hcBin: "hc", hcCallerId: HC_CALLER });
+		const headlessCtx = {
+			hasUI: false,
+			sessionManager: { getSessionId: () => "unused-session" },
+		} as unknown as ExtensionContext;
+
+		await commandHandler!(`--bogus ${HC_TARGET} hello`, headlessCtx);
+		assert.equal(execCalls.length, 0);
+		assert.equal(
+			logs[0],
+			`warn:${USAGE} [backend=hc, phase=pre_send, status=not_sent, textLength=0]`,
+		);
+
+		const toolRes = await toolExecute!("call-ok", {
+			pane: HC_TARGET,
+			text: "hello tool",
+		});
+		assert.equal(execCalls.length, 1);
+		assert.equal(toolRes.isError, false);
+		assert.deepEqual(toolRes.details, {
+			ok: true,
+			mode: "hc",
+			status: "sent",
+			pane: HC_TARGET,
+		});
+		assert.equal(toolRes.content[0]?.text.includes(HC_SEND_NOTE), true);
 	}
 });

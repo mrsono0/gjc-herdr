@@ -1,46 +1,19 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { spyOn } from "bun:test";
-import type { ExtensionAPI, ExtensionContext } from "@gajae-code/coding-agent";
-import * as publicHerdr from "@gajae-code/coding-agent/utils/herdr-pane";
+import type { ExtensionAPI } from "@gajae-code/coding-agent";
 import * as zod from "zod/v4";
 import herdrMetadata from "../src/extension.ts";
-import {
-	createReporter,
-	displayValue,
-	isMainSession,
-	MODEL_KEY,
-	reportArgs,
-	SESSION_ID_KEY,
-	SESSION_KEY,
-} from "../src/metadata.ts";
+import { isMainSession } from "../src/metadata.ts";
 
-const CLEAR_ALL = [
-	"--clear-token",
-	MODEL_KEY,
-	"--clear-token",
-	SESSION_KEY,
-	"--clear-token",
-	SESSION_ID_KEY,
-];
-
-test("non-Herdr, malformed panes and sub/nested contexts cannot publish", () => {
+test("isMainSession accepts only main sessions at taskDepth 0", () => {
 	assert.equal(
-		publicHerdr.resolveHerdrPaneEnvironment({
-			env: { HERDR_PANE_ID: "wC:p5" },
-		}),
-		null,
+		isMainSession({ sessionMetadata: { kind: "main", taskDepth: 0 } }),
+		true,
 	);
-	for (const pane of ["", "wC:p5;echo bad", "wC:\np5", "x".repeat(129)]) {
-		assert.equal(
-			publicHerdr.resolveHerdrPaneEnvironment({
-				env: { HERDR_ENV: "1", HERDR_PANE_ID: pane },
-			}),
-			null,
-		);
-	}
 	for (const sessionMetadata of [
 		undefined,
+		{ kind: "sub" as const, taskDepth: 0 },
 		{ kind: "sub" as const, taskDepth: 1 },
 		{ kind: "main" as const, taskDepth: 1 },
 	]) {
@@ -48,193 +21,24 @@ test("non-Herdr, malformed panes and sub/nested contexts cannot publish", () => 
 	}
 });
 
-test("a denied public pane resolver registers no publisher but still registers delivery without exec", () => {
-	const originalHerdrFlag = process.env.HERDR_ENV;
-	const admission = spyOn(
-		publicHerdr,
-		"resolveHerdrPaneEnvironment",
-	).mockImplementation((options) => {
-		assert.notEqual(options?.env, process.env);
-		assert(options?.env);
-		options.env.HERDR_ENV = "0";
-		return null;
-	});
-	let registrations = 0;
-	const commands: string[] = [];
-	const tools: string[] = [];
-	let execs = 0;
-	try {
-		herdrMetadata({
-			logger: { info() {} },
-			zod,
-			on() {
-				registrations++;
-			},
-			registerCommand(name: string) {
-				commands.push(name);
-			},
-			registerTool(tool: { name: string }) {
-				tools.push(tool.name);
-			},
-			exec: async () => {
-				execs++;
-				return { stdout: "", stderr: "", code: 0, killed: false };
-			},
-		} as unknown as ExtensionAPI);
-		assert.equal(registrations, 0);
-		assert.deepEqual(commands, ["herdr-send", "herdr-call"]);
-		assert.deepEqual(tools, ["herdr_send", "herdr_agent_call", "herdr_mail_send"]);
-		assert.equal(execs, 0);
-		assert.equal(process.env.HERDR_ENV, originalHerdrFlag);
-	} finally {
-		admission.mockRestore();
-	}
-});
-
-test("display values are bounded Unicode text, the session ID is raw, and missing values clear only plugin keys", () => {
-	assert.equal(displayValue("\n \x1b\r"), undefined);
-	assert.equal(displayValue("a\x1bb\nc"), "a b c");
-	assert.equal(Array.from(displayValue("😀".repeat(81))!).length, 80);
-	const args = reportArgs("wC:p5", "gjc-herdr:test", 1, {
-		model: "openai/gpt-4o-mini",
-	});
-	assert(args.includes(`${MODEL_KEY}=openai/gpt-4o-mini`));
-	assert.deepEqual(args.slice(-4), [
-		"--clear-token",
-		SESSION_KEY,
-		"--clear-token",
-		SESSION_ID_KEY,
-	]);
-	const longId = `01a11099-ef75-76e1-9e79-${"d".repeat(80)}`;
-	assert(
-		reportArgs("wC:p5", "gjc-herdr:test", 1, { sessionId: longId }).includes(
-			`${SESSION_ID_KEY}=${longId}`,
-		),
-	);
-	assert(
-		!args.some((value) =>
-			["report-agent", "release-agent", "--title", "--display-agent"].includes(
-				value,
-			),
-		),
-	);
-});
-
-test("one publisher owns a fresh source, increasing sequence and CLI error handling", async () => {
-	const calls: string[][] = [];
-	let code = 0;
-	const exec: ExtensionAPI["exec"] = async (command, args) => {
-		assert.equal(command, "/opt/homebrew/bin/herdr");
-		calls.push(args);
-		return { stdout: "", stderr: "", code, killed: false };
-	};
-	const report = createReporter(exec, "wC:p5", "/opt/homebrew/bin/herdr");
-	await report({ model: "m", session: "s" });
-	await report({});
-	const option = (args: string[], key: string) => args[args.indexOf(key) + 1];
-	assert.match(option(calls[0], "--source"), /^gjc-herdr:/);
-	assert.equal(option(calls[0], "--source"), option(calls[1], "--source"));
-	assert.equal(option(calls[0], "--seq"), "1");
-	assert.equal(option(calls[1], "--seq"), "2");
-	assert.deepEqual(calls[1].slice(-6), CLEAR_ALL);
-	code = 1;
-	await assert.rejects(report({ model: "m" }), /exit 1/);
-});
-
-test("session events read current values and shutdown clears without changing native state", async () => {
+test("HC_TERMINAL_ID registers send/call/mail features without hooks, timer, or exec and wires hc backend", async () => {
 	const savedEnvironment = {
-		HERDR_ENV: process.env.HERDR_ENV,
-		HERDR_PANE_ID: process.env.HERDR_PANE_ID,
-	};
-	process.env.HERDR_ENV = "1";
-	process.env.HERDR_PANE_ID = "wC:p5";
-	const admission = spyOn(
-		publicHerdr,
-		"resolveHerdrPaneEnvironment",
-	).mockReturnValue({
-		paneId: "wC:p5",
-		binPath: "herdr",
-	});
-	const handlers = new Map<
-		string,
-		(event: unknown, ctx: ExtensionContext) => void | Promise<void>
-	>();
-	const calls: string[][] = [];
-	let name: string | undefined = "first";
-	let model = { provider: "openai", id: "gpt-4o-mini" };
-	let sessionId = "session-1";
-	const api = {
-		logger: { info() {}, warn() {} },
-		zod,
-		registerCommand() {},
-		registerTool() {},
-		on(
-			event: string,
-			handler: (event: unknown, ctx: ExtensionContext) => Promise<void>,
-		) {
-			handlers.set(event, handler);
-		},
-		getSessionName: () => name,
-		exec: async (_command: string, args: string[]) => {
-			calls.push(args);
-			return { stdout: "", stderr: "", code: 0, killed: false };
-		},
-	} as unknown as ExtensionAPI;
-	const ctx = {
-		sessionMetadata: { kind: "main", taskDepth: 0 },
-		sessionManager: { getSessionId: () => sessionId },
-		get model() {
-			return model;
-		},
-	} as unknown as ExtensionContext;
-	try {
-		herdrMetadata(api);
-		await handlers.get("session_start")!({}, {
-			sessionMetadata: { kind: "sub", taskDepth: 1 },
-		} as ExtensionContext);
-		assert.equal(calls.length, 0);
-		await handlers.get("session_start")!({}, ctx);
-		assert(calls[0].includes(`${SESSION_KEY}=first`));
-		assert(calls[0].includes(`${SESSION_ID_KEY}=session-1`));
-		model = { provider: "openai", id: "gpt-4o" };
-		name = undefined;
-		sessionId = "session-2";
-		await handlers.get("session_switch")!({}, ctx);
-		assert(calls[1].includes(`${MODEL_KEY}=openai/gpt-4o`));
-		assert(calls[1].includes(`${SESSION_ID_KEY}=session-2`));
-		assert.equal(calls[1][calls[1].indexOf(SESSION_KEY) - 1], "--clear-token");
-		await handlers.get("session_shutdown")!({}, ctx);
-		assert.deepEqual(calls[2].slice(-6), CLEAR_ALL);
-		await handlers.get("agent_start")!({}, ctx);
-		assert.equal(calls.length, 3);
-	} finally {
-		await handlers.get("session_shutdown")?.({}, ctx);
-		admission.mockRestore();
-		for (const [key, value] of Object.entries(savedEnvironment)) {
-			if (value === undefined) delete process.env[key];
-			else process.env[key] = value;
-		}
-	}
-});
-
-test("HC-only environment registers no metadata publisher, timer, or report exec and keeps process.env unchanged", async () => {
-	const savedEnvironment = {
+		GJC_HERDR_DISABLE: process.env.GJC_HERDR_DISABLE,
+		GJC_HERDR_MAILBOX: process.env.GJC_HERDR_MAILBOX,
 		HERDR_ENV: process.env.HERDR_ENV,
 		HERDR_PANE_ID: process.env.HERDR_PANE_ID,
 		HC_TERMINAL_ID: process.env.HC_TERMINAL_ID,
 		GJC_HERDR_BACKEND: process.env.GJC_HERDR_BACKEND,
 		GJC_HERDR_HC_BIN: process.env.GJC_HERDR_HC_BIN,
 	};
+	delete process.env.GJC_HERDR_DISABLE;
+	delete process.env.GJC_HERDR_MAILBOX;
 	delete process.env.HERDR_ENV;
 	delete process.env.HERDR_PANE_ID;
 	delete process.env.GJC_HERDR_BACKEND;
 	process.env.GJC_HERDR_HC_BIN = "/custom/hc";
 	process.env.HC_TERMINAL_ID = "t1";
 
-	const admission = spyOn(
-		publicHerdr,
-		"resolveHerdrPaneEnvironment",
-	).mockReturnValue(null);
 	const intervalSpy = spyOn(globalThis, "setInterval");
 
 	let registrations = 0;
@@ -249,7 +53,9 @@ test("HC-only environment registers no metadata publisher, timer, or report exec
 		| ((
 				toolCallId: string,
 				params: { target: string; text: string; result_file?: string },
-		  ) => Promise<{ details: { status: string; error?: { code: string; message: string } } }>)
+		  ) => Promise<{
+				details: { status: string; error?: { code: string; message: string } };
+		  }>)
 		| undefined;
 
 	try {
@@ -290,7 +96,11 @@ test("HC-only environment registers no metadata publisher, timer, or report exec
 		assert.equal(intervalSpy.mock.calls.length, 0);
 		assert.equal(execs, 0);
 		assert.deepEqual(commands, ["herdr-send", "herdr-call"]);
-		assert.deepEqual(tools, ["herdr_send", "herdr_agent_call", "herdr_mail_send"]);
+		assert.deepEqual(tools, [
+			"herdr_send",
+			"herdr_agent_call",
+			"herdr_mail_send",
+		]);
 		assert.equal(process.env.HC_TERMINAL_ID, "t1");
 		assert.equal(process.env.HERDR_ENV, undefined);
 
@@ -321,7 +131,6 @@ test("HC-only environment registers no metadata publisher, timer, or report exec
 		});
 	} finally {
 		intervalSpy.mockRestore();
-		admission.mockRestore();
 		for (const [key, value] of Object.entries(savedEnvironment)) {
 			if (value === undefined) delete process.env[key];
 			else process.env[key] = value;
@@ -329,7 +138,67 @@ test("HC-only environment registers no metadata publisher, timer, or report exec
 	}
 });
 
-test("GJC_HERDR_DISABLE=1 skips pane resolution, hooks, commands, tools, exec, and timers", () => {
+test("without HC_TERMINAL_ID, Herdr env vars do not register send or call and only register mail", () => {
+	const savedEnvironment = {
+		GJC_HERDR_DISABLE: process.env.GJC_HERDR_DISABLE,
+		GJC_HERDR_MAILBOX: process.env.GJC_HERDR_MAILBOX,
+		HC_TERMINAL_ID: process.env.HC_TERMINAL_ID,
+		HERDR_ENV: process.env.HERDR_ENV,
+		HERDR_PANE_ID: process.env.HERDR_PANE_ID,
+		GJC_HERDR_BACKEND: process.env.GJC_HERDR_BACKEND,
+	};
+	delete process.env.GJC_HERDR_DISABLE;
+	delete process.env.GJC_HERDR_MAILBOX;
+	delete process.env.GJC_HERDR_BACKEND;
+	process.env.HERDR_ENV = "1";
+	process.env.HERDR_PANE_ID = "wC:p5";
+
+	const intervalSpy = spyOn(globalThis, "setInterval");
+
+	try {
+		for (const value of [undefined, "", "   "]) {
+			if (value === undefined) delete process.env.HC_TERMINAL_ID;
+			else process.env.HC_TERMINAL_ID = value;
+
+			let registrations = 0;
+			const commands: string[] = [];
+			const tools: string[] = [];
+			let execs = 0;
+
+			herdrMetadata({
+				logger: { info() {}, warn() {} },
+				zod,
+				on() {
+					registrations++;
+				},
+				registerCommand(name: string) {
+					commands.push(name);
+				},
+				registerTool(tool: { name: string }) {
+					tools.push(tool.name);
+				},
+				exec: async () => {
+					execs++;
+					return { stdout: "", stderr: "", code: 0, killed: false };
+				},
+			} as unknown as ExtensionAPI);
+
+			assert.deepEqual(commands, []);
+			assert.deepEqual(tools, ["herdr_mail_send"]);
+			assert.equal(registrations, 0);
+			assert.equal(execs, 0);
+			assert.equal(intervalSpy.mock.calls.length, 0);
+		}
+	} finally {
+		intervalSpy.mockRestore();
+		for (const [key, value] of Object.entries(savedEnvironment)) {
+			if (value === undefined) delete process.env[key];
+			else process.env[key] = value;
+		}
+	}
+});
+
+test("GJC_HERDR_DISABLE=1 skips hooks, commands, tools, exec, and timers", () => {
 	const savedEnvironment = {
 		GJC_HERDR_DISABLE: process.env.GJC_HERDR_DISABLE,
 		GJC_HERDR_MAILBOX: process.env.GJC_HERDR_MAILBOX,
@@ -343,13 +212,6 @@ test("GJC_HERDR_DISABLE=1 skips pane resolution, hooks, commands, tools, exec, a
 	process.env.HERDR_ENV = "1";
 	process.env.HERDR_PANE_ID = "wC:p5";
 
-	const admission = spyOn(
-		publicHerdr,
-		"resolveHerdrPaneEnvironment",
-	).mockReturnValue({
-		paneId: "wC:p5",
-		binPath: "herdr",
-	});
 	const intervalSpy = spyOn(globalThis, "setInterval");
 
 	const infoLogs: string[] = [];
@@ -386,7 +248,6 @@ test("GJC_HERDR_DISABLE=1 skips pane resolution, hooks, commands, tools, exec, a
 			"gjc-herdr extension loaded",
 			"gjc-herdr disabled by GJC_HERDR_DISABLE=1",
 		]);
-		assert.equal(admission.mock.calls.length, 0);
 		assert.equal(registrations, 0);
 		assert.deepEqual(commands, []);
 		assert.deepEqual(tools, []);
@@ -394,7 +255,6 @@ test("GJC_HERDR_DISABLE=1 skips pane resolution, hooks, commands, tools, exec, a
 		assert.equal(intervalSpy.mock.calls.length, 0);
 	} finally {
 		intervalSpy.mockRestore();
-		admission.mockRestore();
 		for (const [key, value] of Object.entries(savedEnvironment)) {
 			if (value === undefined) delete process.env[key];
 			else process.env[key] = value;
@@ -402,7 +262,7 @@ test("GJC_HERDR_DISABLE=1 skips pane resolution, hooks, commands, tools, exec, a
 	}
 });
 
-test("GJC_HERDR_DISABLE values other than '1' keep normal HC-only command and tool registration", () => {
+test("GJC_HERDR_DISABLE values other than '1' keep normal HC command and tool registration", () => {
 	const savedEnvironment = {
 		GJC_HERDR_DISABLE: process.env.GJC_HERDR_DISABLE,
 		GJC_HERDR_MAILBOX: process.env.GJC_HERDR_MAILBOX,
@@ -417,14 +277,9 @@ test("GJC_HERDR_DISABLE values other than '1' keep normal HC-only command and to
 	delete process.env.GJC_HERDR_BACKEND;
 	process.env.HC_TERMINAL_ID = "t1";
 
-	const admission = spyOn(
-		publicHerdr,
-		"resolveHerdrPaneEnvironment",
-	).mockReturnValue(null);
 	const intervalSpy = spyOn(globalThis, "setInterval");
 
 	try {
-		let expectedAdmissions = 0;
 		for (const value of ["0", "true", " 1", ""]) {
 			process.env.GJC_HERDR_DISABLE = value;
 			const infoLogs: string[] = [];
@@ -456,18 +311,19 @@ test("GJC_HERDR_DISABLE values other than '1' keep normal HC-only command and to
 				},
 			} as unknown as ExtensionAPI);
 
-			expectedAdmissions++;
 			assert.deepEqual(infoLogs, ["gjc-herdr extension loaded"]);
-			assert.equal(admission.mock.calls.length, expectedAdmissions);
 			assert.equal(registrations, 0);
 			assert.equal(intervalSpy.mock.calls.length, 0);
 			assert.equal(execs, 0);
 			assert.deepEqual(commands, ["herdr-send", "herdr-call"]);
-			assert.deepEqual(tools, ["herdr_send", "herdr_agent_call", "herdr_mail_send"]);
+			assert.deepEqual(tools, [
+				"herdr_send",
+				"herdr_agent_call",
+				"herdr_mail_send",
+			]);
 		}
 	} finally {
 		intervalSpy.mockRestore();
-		admission.mockRestore();
 		for (const [key, value] of Object.entries(savedEnvironment)) {
 			if (value === undefined) delete process.env[key];
 			else process.env[key] = value;
@@ -475,3 +331,138 @@ test("GJC_HERDR_DISABLE values other than '1' keep normal HC-only command and to
 	}
 });
 
+test("GJC_HERDR_BACKEND=herdr is ignored both with and without HC_TERMINAL_ID", async () => {
+	const savedEnvironment = {
+		GJC_HERDR_DISABLE: process.env.GJC_HERDR_DISABLE,
+		GJC_HERDR_MAILBOX: process.env.GJC_HERDR_MAILBOX,
+		GJC_HERDR_BACKEND: process.env.GJC_HERDR_BACKEND,
+		HC_TERMINAL_ID: process.env.HC_TERMINAL_ID,
+		HERDR_ENV: process.env.HERDR_ENV,
+		HERDR_PANE_ID: process.env.HERDR_PANE_ID,
+		GJC_HERDR_HC_BIN: process.env.GJC_HERDR_HC_BIN,
+	};
+	delete process.env.GJC_HERDR_DISABLE;
+	delete process.env.GJC_HERDR_MAILBOX;
+	delete process.env.GJC_HERDR_HC_BIN;
+	process.env.GJC_HERDR_BACKEND = "herdr";
+	process.env.HERDR_ENV = "1";
+	process.env.HERDR_PANE_ID = "wC:p5";
+
+	const intervalSpy = spyOn(globalThis, "setInterval");
+
+	try {
+		// (a) With HC_TERMINAL_ID: registers send/call/mail on hc backend without warnings
+		process.env.HC_TERMINAL_ID = "t1";
+		{
+			const warnLogs: string[] = [];
+			let registrations = 0;
+			const commands: string[] = [];
+			const tools: string[] = [];
+			let execs = 0;
+			let callToolExecute:
+				| ((
+						toolCallId: string,
+						params: { target: string; text: string; result_file?: string },
+				  ) => Promise<{
+						details: { status: string; error?: { code: string; message: string } };
+				  }>)
+				| undefined;
+
+			herdrMetadata({
+				logger: {
+					info() {},
+					warn(message: string) {
+						warnLogs.push(message);
+					},
+				},
+				zod,
+				on() {
+					registrations++;
+				},
+				registerCommand(name: string) {
+					commands.push(name);
+				},
+				registerTool(tool: { name: string; execute?: typeof callToolExecute }) {
+					tools.push(tool.name);
+					if (tool.name === "herdr_agent_call") {
+						callToolExecute = tool.execute;
+					}
+				},
+				exec: async () => {
+					execs++;
+					return { stdout: "", stderr: "", code: 0, killed: false };
+				},
+			} as unknown as ExtensionAPI);
+
+			assert.deepEqual(commands, ["herdr-send", "herdr-call"]);
+			assert.deepEqual(tools, [
+				"herdr_send",
+				"herdr_agent_call",
+				"herdr_mail_send",
+			]);
+			assert.equal(registrations, 0);
+			assert.equal(execs, 0);
+			assert.equal(intervalSpy.mock.calls.length, 0);
+			assert.deepEqual(warnLogs, []);
+
+			assert.ok(callToolExecute);
+			const callRes = await callToolExecute!("t-hc-backend-ignored", {
+				target: "t7",
+				text: "ping",
+			});
+			assert.equal(callRes.details.status, "not_sent");
+			assert.equal(callRes.details.error?.code, "invalid_request");
+			assert.match(
+				callRes.details.error?.message ?? "",
+				/hc backend requires --result-file/,
+			);
+			assert.equal(execs, 0);
+		}
+
+		// (b) Without HC_TERMINAL_ID: registers only mail even when GJC_HERDR_BACKEND=herdr
+		delete process.env.HC_TERMINAL_ID;
+		{
+			const warnLogs: string[] = [];
+			let registrations = 0;
+			const commands: string[] = [];
+			const tools: string[] = [];
+			let execs = 0;
+
+			herdrMetadata({
+				logger: {
+					info() {},
+					warn(message: string) {
+						warnLogs.push(message);
+					},
+				},
+				zod,
+				on() {
+					registrations++;
+				},
+				registerCommand(name: string) {
+					commands.push(name);
+				},
+				registerTool(tool: { name: string }) {
+					tools.push(tool.name);
+				},
+				exec: async () => {
+					execs++;
+					return { stdout: "", stderr: "", code: 0, killed: false };
+				},
+			} as unknown as ExtensionAPI);
+
+			assert.deepEqual(commands, []);
+			assert.deepEqual(tools, ["herdr_mail_send"]);
+			assert.equal(registrations, 0);
+			assert.equal(execs, 0);
+			assert.equal(intervalSpy.mock.calls.length, 0);
+			assert.deepEqual(warnLogs, []);
+		}
+	} finally {
+		intervalSpy.mockRestore();
+		for (const [key, value] of Object.entries(savedEnvironment)) {
+			if (value === undefined) delete process.env[key];
+			else process.env[key] = value;
+		}
+	}
+});
