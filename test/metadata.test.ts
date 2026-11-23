@@ -83,6 +83,20 @@ test("HC_TERMINAL_ID registers send/call/mail features without hooks, timer, or 
 			exec: async (command: string, args: string[]) => {
 				execs++;
 				execCalls.push({ command, args });
+				if (args[0] === "get") {
+					return {
+						stdout: JSON.stringify({
+							address: args[2],
+							state: "live",
+							reported: true,
+							turn: 4,
+							status: { state: "idle", kind: null, msg: "idle" },
+						}),
+						stderr: "",
+						code: 0,
+						killed: false,
+					};
+				}
 				return {
 					stdout: JSON.stringify({ turn: 4, started: true, status: "working" }),
 					stderr: "",
@@ -124,8 +138,12 @@ test("HC_TERMINAL_ID registers send/call/mail features without hooks, timer, or 
 			hasUI: false,
 			sessionManager: { getSessionId: () => "session-hc" },
 		});
-		assert.equal(execs, 1);
+		assert.equal(execs, 2);
 		assert.deepEqual(execCalls[0], {
+			command: "/custom/hc",
+			args: ["get", "--json", "t7"],
+		});
+		assert.deepEqual(execCalls[1], {
 			command: "/custom/hc",
 			args: ["send", "--json", "--if", "idle", "t7", "ping"],
 		});

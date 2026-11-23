@@ -17,6 +17,7 @@ import {
 	isValidHcAddress,
 	type HcExecDeps,
 } from "./hc.ts";
+import { HC_DONE_NON_ATOMIC_NOTE } from "./send.ts";
 
 type Exec = ExtensionAPI["exec"];
 
@@ -30,7 +31,7 @@ const RESULT_FILE_OPEN_FLAGS =
 	(fsConstants.O_NONBLOCK ?? 0);
 
 export const USAGE =
-	"Usage: /herdr-call [--result-file <abs-path>] <pane-id-or-unique-agent-name> <text>";
+	"Usage: /herdr-call --result-file <abs-path> <terminal> <text>";
 
 export interface AgentCallRequest {
 	target: string;
@@ -99,6 +100,8 @@ export interface AgentCallResult {
 	answer?: string;
 	resultFile?: string;
 	markerVerified?: boolean;
+	/** True when `hc send` ran without `--if` for a preflight `done` target (non-atomic). */
+	nonAtomicDone?: boolean;
 	error?: {
 		code: string;
 		message: string;
@@ -547,12 +550,19 @@ export function parseCallCommandArgs(args: string): AgentCallRequest | string {
 
 export function describeCallResult(result: AgentCallResult): string {
 	const header = `herdr-call ${result.status} (delivery ${result.delivery}, request ${result.requestId}${result.pane ? `, pane ${result.pane}` : ""}${result.resultFile ? `, resultFile ${result.resultFile}` : ""})`;
+	const includeDoneNote =
+		result.nonAtomicDone === true && result.delivery !== "not_sent";
 	if (result.ok && result.status === "answered") {
-		return `${header}\n\n${result.answer}`;
+		return includeDoneNote
+			? `${header}\n${HC_DONE_NON_ATOMIC_NOTE}\n\n${result.answer}`
+			: `${header}\n\n${result.answer}`;
 	}
 	const parts = [header];
 	if (result.error) {
 		parts.push(result.error.message);
+	}
+	if (includeDoneNote) {
+		parts.push(HC_DONE_NON_ATOMIC_NOTE);
 	}
 	return parts.join("\n");
 }
@@ -563,7 +573,7 @@ export interface RegisterCallOptions {
 }
 
 export const HC_CALL_BACKEND_NOTE =
-	"hc: unattended target assumed (not verified by the plugin); a target left in done cannot take a follow-up automatically; text delivery only, no GJC session token";
+	"hc: unattended target assumed (not verified by the plugin); idle or done targets only (done omits --if and is not atomic); text delivery only, no GJC session token";
 
 export function registerCallFeatures(
 	api: ExtensionAPI,
@@ -602,12 +612,12 @@ export function registerCallFeatures(
 	}
 
 	const commandDescription =
-		"Call an hc terminal agent in another local terminal and recover its answer from --result-file: --result-file <abs-path> <terminal-id-or-unique-name> <text> " +
-		`(--result-file required, idle targets only, local address only, no screen read; ${HC_CALL_BACKEND_NOTE})`;
+		"Call an hc terminal agent in another local terminal and recover its answer from --result-file: --result-file <abs-path> <terminal> <text> " +
+		`(--result-file required, idle or done targets only, done is not atomic, local address only, no screen read; ${HC_CALL_BACKEND_NOTE})`;
 
 	const toolDescription =
 		"Call an hc terminal agent in another local terminal and recover its answer text from `result_file` (60s total budget, 5s reserved for file recovery). " +
-		"`target` must be an explicit local hc terminal ID (e.g. t2) or a name that resolves to exactly one terminal, and `result_file` is required (--result-file required, idle targets only, local address only, no screen read). " +
+		"`target` must be an explicit local hc terminal ID (e.g. t2) or a name that resolves to exactly one terminal, and `result_file` is required (--result-file required, idle or done targets only, done omits `--if` and is not atomic, local address only, no screen read). " +
 		`${HC_CALL_BACKEND_NOTE}. ` +
 		"No remote approvals, key presses, or retries are ever sent.";
 
@@ -696,8 +706,9 @@ function isValidResultFilePath(rawResultFile: string): boolean {
 /**
  * Calls an `hc` terminal agent and recovers its answer from `--result-file`:
  * result-file required & pre-check -> resolve target (local only) -> caller/self check ->
- * inFlight -> preflight `hc get` (live, reported===true, status.state==="idle") ->
- * pre-send result-file re-check -> `hc send --json --if idle --wait --timeout` ->
+ * inFlight -> preflight `hc get` (live, reported===true, status.state==="idle"|"done") ->
+ * pre-send result-file re-check -> `hc send --json [--if idle] --wait --timeout`
+ * (`--if idle` for idle, no `--if` for done) ->
  * turn/wait correlation (with follow-up `hc wait` on ended=false timeout/message) ->
  * `recoverResultFile` (`markerVerified: false`, no screen read).
  */
@@ -712,6 +723,7 @@ export async function callViaHc(
 	const waitDeadline = deadline - HC_FILE_RESERVE_MS;
 	const requestId = randomUUID();
 	const rawResultFile = request.resultFile ?? request.result_file;
+	let sentAsNonAtomicDone = false;
 	const finish = (
 		partial: Partial<AgentCallResult> & {
 			status: AgentCallStatus;
@@ -722,6 +734,9 @@ export async function callViaHc(
 		requestId,
 		elapsedMs: now() - startedAt,
 		...(rawResultFile !== undefined ? { resultFile: rawResultFile } : {}),
+		...(sentAsNonAtomicDone && partial.delivery !== "not_sent"
+			? { nonAtomicDone: true }
+			: {}),
 		...partial,
 	});
 
@@ -980,18 +995,6 @@ export async function callViaHc(
 				},
 			});
 		}
-		if (facts.statusState === "done") {
-			return finish({
-				status: "not_sent",
-				delivery: "not_sent",
-				pane: addr,
-				state: "done",
-				error: {
-					code: "agent_done",
-					message: "target finished its last turn; a new turn needs idle",
-				},
-			});
-		}
 		if (facts.statusState === "working") {
 			return finish({
 				status: "not_sent",
@@ -1017,7 +1020,7 @@ export async function callViaHc(
 				},
 			});
 		}
-		if (facts.statusState !== "idle") {
+		if (facts.statusState !== "idle" && facts.statusState !== "done") {
 			return finish({
 				status: "not_sent",
 				delivery: "not_sent",
@@ -1025,10 +1028,12 @@ export async function callViaHc(
 				...(facts.statusState ? { state: facts.statusState } : {}),
 				error: {
 					code: "agent_state_unknown",
-					message: "Target agent state is not idle; no input was sent.",
+					message: "Target agent state is not idle or done; no input was sent.",
 				},
 			});
 		}
+		const preflightState: "idle" | "done" = facts.statusState;
+		const isDoneTarget = preflightState === "done";
 
 		const patchedText =
 			request.text + resultFileInstruction(requestId, rawResultFile);
@@ -1042,7 +1047,7 @@ export async function callViaHc(
 				status: "not_sent",
 				delivery: "not_sent",
 				pane: addr,
-				state: "idle",
+				state: preflightState,
 				error: { code: "aborted", message: "Call aborted before delivery." },
 			});
 		}
@@ -1051,7 +1056,7 @@ export async function callViaHc(
 				status: "not_sent",
 				delivery: "not_sent",
 				pane: addr,
-				state: "idle",
+				state: preflightState,
 				error: {
 					code: "timeout",
 					message: "result file check timed out",
@@ -1063,7 +1068,7 @@ export async function callViaHc(
 				status: "not_sent",
 				delivery: "not_sent",
 				pane: addr,
-				state: "idle",
+				state: preflightState,
 				error: {
 					code: "invalid_request",
 					message: preSendConflict,
@@ -1077,7 +1082,7 @@ export async function callViaHc(
 				status: "not_sent",
 				delivery: "not_sent",
 				pane: addr,
-				state: "idle",
+				state: preflightState,
 				error: {
 					code: "timeout",
 					message: "Call budget exhausted before hc send.",
@@ -1085,11 +1090,16 @@ export async function callViaHc(
 			});
 		}
 		const sendTimeoutSec = Math.max(1, Math.ceil(sendRemMs / 1000));
+		sentAsNonAtomicDone = isDoneTarget;
 		const sent = await hcSend(
 			hcDeps,
 			addr,
 			patchedText,
-			{ wait: true, timeoutSec: sendTimeoutSec },
+			{
+				wait: true,
+				timeoutSec: sendTimeoutSec,
+				...(isDoneTarget ? { ifIdle: false } : {}),
+			},
 			Math.floor(sendRemMs),
 			signal,
 		);
@@ -1439,6 +1449,7 @@ export async function callViaHc(
 			answer: recovered.answer,
 			resultFile: rawResultFile,
 			markerVerified: false,
+			...(isDoneTarget ? { nonAtomicDone: true } : {}),
 			elapsedMs: now() - startedAt,
 		};
 	} finally {

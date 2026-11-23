@@ -557,3 +557,69 @@ test("hcSend rejects text starting with '-', builds exact argv without '--', and
 	assert.deepEqual(parseWaitFacts(undefined), { wait: undefined, valid: true });
 	assert.equal(parseWaitFacts({ terminal: "t7" }).valid, false);
 });
+
+test("hcSend includes --if idle by default and when ifIdle is true, and omits --if idle only when ifIdle is false", async () => {
+	const { deps, calls } = makeDeps(() => ({
+		stdout: JSON.stringify({ turn: 4, started: true, status: "working" }),
+	}));
+
+	const defaultRes = await hcSend(deps, "t7", "hello", {}, 3000);
+	assert.equal(defaultRes.ok, true);
+	assert.deepEqual(calls[0]?.args, [
+		"send",
+		"--json",
+		"--if",
+		"idle",
+		"t7",
+		"hello",
+	]);
+
+	const explicitTrueRes = await hcSend(
+		deps,
+		"t7",
+		"hello",
+		{ ifIdle: true, wait: true, timeoutSec: 12.2 },
+		12200,
+	);
+	assert.equal(explicitTrueRes.ok, true);
+	assert.deepEqual(calls[1]?.args, [
+		"send",
+		"--json",
+		"--if",
+		"idle",
+		"--wait",
+		"--timeout",
+		"13",
+		"t7",
+		"hello",
+	]);
+
+	const omitNoWaitRes = await hcSend(
+		deps,
+		"t7",
+		"hello",
+		{ ifIdle: false },
+		3000,
+	);
+	assert.equal(omitNoWaitRes.ok, true);
+	assert.deepEqual(calls[2]?.args, ["send", "--json", "t7", "hello"]);
+
+	const omitWithWaitRes = await hcSend(
+		deps,
+		"rohan/t7",
+		"hello",
+		{ ifIdle: false, wait: true, timeoutSec: 9.1 },
+		9100,
+	);
+	assert.equal(omitWithWaitRes.ok, true);
+	assert.deepEqual(calls[3]?.args, [
+		"send",
+		"--json",
+		"--wait",
+		"--timeout",
+		"10",
+		"rohan/t7",
+		"hello",
+	]);
+	assert.equal(calls.length, 4);
+});

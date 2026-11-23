@@ -1,6 +1,8 @@
 # gjc-herdr
 
-GJC의 native 상태·세션/resume 처리를 유지하면서 Herdr sidebar에 **모델 ID와 세션 이름**을 표시하고, 한 Herdr pane의 GJC에서 **다른 pane의 GJC로 프롬프트를 전달**하며, **Herdr가 감지한 다른 에이전트(Claude Code·Codex 등)를 호출해 답변 본문을 회수**하는 설치형 플러그인이다. GJC·Herdr 본체를 수정하지 않으며 별도 launcher나 서비스를 설치하지 않는다.
+herdr-core(`hc`) 터미널 안의 GJC에서 **다른 `hc` 터미널로 프롬프트를 보내고**(`/herdr-send`·`herdr_send`), **다른 로컬 에이전트를 호출해 결과 파일로 답변을 받으며**(`/herdr-call`·`herdr_agent_call`), **파일 우편함**(`herdr_mail_send`·우편 받기)을 쓰는 설치형 플러그인이다. GJC·`hc` 본체를 수정하지 않으며 별도 launcher나 서비스를 설치하지 않는다.
+
+v0.7.0부터 `herdr-core`(`hc`) 전용이다. 옛 `herdr server` 경로(sidebar 메타데이터 token·`herdr` CLI·GJC SDK 전달·화면 읽기 회수)가 필요하면 `v0.6.1` tag를 설치한다.
 
 배포 정책: **npm registry에는 발행하지 않는다.** 이 Git 저장소에서 직접 설치한다. 실행 파일 `dist/extension.js`는 저장소에 포함되어 있어 설치 시 build가 필요 없다.
 
@@ -24,21 +26,22 @@ Herdr 안에서 Claude Code(팀장)가 agy(구현 팀원)와 선택 Codex(독립
 
 | 프로그램 | 용도 | 설치 | 확인 |
 |---|---|---|---|
-| [Herdr](https://herdr.dev) | agent pane 관리자. 팀 구성과 sidebar 표시의 바탕 (0.9.3에서 검증) | `brew install herdr` 또는 `curl -fsSL https://herdr.dev/install.sh \| sh` | `herdr --version` |
+| `herdr-core` (`hc`) | 플러그인 실행 환경(필수) — `/herdr-send`·`/herdr-call`은 `hc` 터미널 안 GJC에서만 등록. 팀 Core 모드(`GJCH_CORE=1`)의 바탕 | herdr-core 설치 안내 참조 | `hc --version` |
+| [Herdr](https://herdr.dev) | 팀 개발 환경(기본 모드)의 agent pane 관리자 (0.9.3에서 검증) | `brew install herdr` 또는 `curl -fsSL https://herdr.dev/install.sh \| sh` | `herdr --version` |
 | [Claude Code CLI](https://docs.claude.com/en/docs/claude-code) | 팀장 (2.1.295에서 사용) | `brew install --cask claude-code@latest` 또는 공식 문서의 설치 방법 | `claude --version` |
 | Antigravity CLI (`agy`) | 구현 팀원 (`gjc-herdr-mate`, `--mode accept-edits --sandbox`) | Antigravity CLI 설치 안내 참조 | `agy --version` |
 | [GJC (Gajae Code)](https://github.com/Yeachan-Heo/gajae-code) | 이 플러그인의 설치·관측 대상 (0.18.8에서 사용, 설치 검증은 0.18.7) | 해당 저장소의 [설치 문서](https://github.com/Yeachan-Heo/gajae-code/blob/main/docs/install.md)에서 태그된 설치 스크립트를 내려받아 실행 | `gjc --version` |
 | [Codex CLI](https://github.com/openai/codex) (선택) | 독립 검토·조사 팀원. `GJCH_TEAM_CODEX=0`으로 끌 수 있음 | 공식 설치 안내 또는 `npm install -g @openai/codex` | `codex --version` |
 | [Bun](https://bun.sh) 1.4.3 | GJC가 Git 플러그인을 설치할 때 필요, build는 1.4.3 고정 | `curl -fsSL https://bun.sh/install \| bash` (특정 버전은 Bun 문서 참조) | `bun --version` |
 | git, python3 | clone, `team-up.sh`의 JSON 처리 | macOS는 보통 기본 포함 또는 `brew install git python` | `git --version`, `python3 --version` |
-| `gjc-herdr` 플러그인 | 모델·세션 표시, `/herdr-send`, `/herdr-call` | 아래 "설치 (한 줄)" | `gjc plugin list --json` |
+| `gjc-herdr` 플러그인 | `hc` 프롬프트 전달(`/herdr-send`), 에이전트 호출(`/herdr-call`), 파일 우편함 | 아래 "설치 (한 줄)" | `gjc plugin list --json` |
 | Node.js/npm (개발 시에만) | `npm ci`, 단위 테스트, typecheck | `brew install node` | `npm --version` |
 
-Herdr 밖에서 실행하면 기본 모드에서는 팀 자동 구성과 표시 token이 동작하지 않는다(정상). Herdr 밖(데스크톱 앱 Code 탭 등)에서 팀장을 맡는 외부 팀장 모드와 팀장 이관 절차는 [docs/dev-environment.md](docs/dev-environment.md) §2.1–§2.2를 참조한다. 설치 상태는 언제든 `scripts/check-env.sh`로 다시 점검할 수 있다. 자세한 구성·대화 방법·문제 해결은 [docs/dev-environment.md](docs/dev-environment.md).
+Herdr 밖에서 실행하면 기본 모드에서는 팀 자동 구성이 동작하지 않는다(정상). 플러그인의 전달·호출은 Herdr가 아니라 `hc` 터미널 안에서만 쓸 수 있다(v0.7.0부터). Herdr 밖(데스크톱 앱 Code 탭 등)에서 팀장을 맡는 외부 팀장 모드와 팀장 이관 절차는 [docs/dev-environment.md](docs/dev-environment.md) §2.1–§2.2를 참조한다. 설치 상태는 언제든 `scripts/check-env.sh`로 다시 점검할 수 있다. 자세한 구성·대화 방법·문제 해결은 [docs/dev-environment.md](docs/dev-environment.md).
 
 **Core(`herdr-core`, `hc`) 변형**
 
-Herdr 서버 대신 `herdr-core`(`hc`) 데몬에서 팀장(`gjch-lead`)·구현 팀원(`gjch-mate`)·검토 팀원(`gjch-critic`)을 운용할 때는 `GJCH_CORE=1`(외부 팀장 `GJCH_EXTERNAL_LEAD=1` 함께 사용) 스위치를 켠다.
+이 절은 팀 개발 환경을 Core에서 운용하는 방법이며, 플러그인 자체는 팀 개발 모드와 상관없이 `hc` 터미널에서 동작한다. Herdr 서버 대신 `herdr-core`(`hc`) 데몬에서 팀장(`gjch-lead`)·구현 팀원(`gjch-mate`)·검토 팀원(`gjch-critic`)을 운용할 때는 `GJCH_CORE=1`(외부 팀장 `GJCH_EXTERNAL_LEAD=1` 함께 사용) 스위치를 켠다.
 
 ```sh
 hc --version && hc server status --json
@@ -59,7 +62,7 @@ gjc plugin install "gjc-herdr@git+https://github.com/mrsono0/gjc-herdr.git"
 - `gjc-herdr@` 접두사를 그대로 쓴다. 접두사 없이 URL만 주면 GJC는 다른 설치 형식(bundle)으로 분류해 실패한다.
 - `--user`·`--scope`·`--project`를 붙이지 않는다.
 - 설치는 실행한 사용자의 `~/.gjc/plugins/` registry만 변경한다. Bun이 Git에서 가져오며 npm registry를 사용하지 않는다.
-- 특정 버전으로 고정하려면 tag를 붙인다: `gjc plugin install "gjc-herdr@git+https://github.com/mrsono0/gjc-herdr.git#v0.3.0"`.
+- 특정 버전으로 고정하려면 tag를 붙인다(예: 옛 `herdr server` 경로가 필요할 때 `#v0.6.1` 설치): `gjc plugin install "gjc-herdr@git+https://github.com/mrsono0/gjc-herdr.git#v0.6.1"`.
 
 ### 최신 버전으로 업데이트
 
@@ -80,47 +83,31 @@ gjc plugin install "gjc-herdr@git+https://github.com/mrsono0/gjc-herdr.git"
 1. **사전 확인**
    ```sh
    gjc --version      # Git 설치는 0.18.7에서 검증 (플러그인 동작은 0.18.6에서도 검증)
-   herdr --version    # 0.9.3에서 검증
+   hc --version       # herdr-core CLI 확인
    bun --version      # GJC plugin 설치에 필요
    git --version
-   echo "$HERDR_ENV $HERDR_PANE_ID"   # Herdr pane 안에서 실행 중인지 (1 과 pane id가 보여야 표시 대상)
+   echo "$HC_TERMINAL_ID"   # hc 터미널 안에서 실행 중인지 (값이 있어야 /herdr-send·/herdr-call 등록)
    ```
-   Herdr 밖에서 실행한 GJC에는 아무것도 표시되지 않는다(정상).
+   `hc` 터미널 밖(`HC_TERMINAL_ID` 없음)에서 실행한 GJC에는 `/herdr-send`·`/herdr-call`과 `herdr_send`·`herdr_agent_call`이 등록되지 않고 파일 우편함만 등록된다(정상).
 2. **기존 설치 확인**: `gjc plugin list --json`의 `npm` 배열에 `gjc-herdr`가 있으면 `~/.gjc/plugins/package.json`의 `dependencies["gjc-herdr"]`와 설치된 version을 확인한다. 최신 release가 이미 설치되어 있으면 설치 단계를 건너뛴다. 이전 버전이거나 다른 source(tag 고정·로컬 tarball 등)면 `gjc plugin uninstall gjc-herdr` 후 위 한 줄로 설치한다.
 3. **설치**: 위 한 줄 명령. 성공 판정은 `gjc plugin list --json`에 `gjc-herdr`가 `enabled: true`이고 version이 저장소 `main`의 `package.json` version과 같으며, `~/.gjc/plugins/node_modules/gjc-herdr/dist/extension.js`가 존재하는 것이다.
-4. **Sidebar 설정**: 아래 "Sidebar 설정" 절대로 `~/.config/herdr/config.toml`에 두 행만 추가한다. 기존 행은 지우지 않는다. 파일이 없거나 `[ui.sidebar.agents]`가 없으면 그 섹션만 새로 만든다.
-5. **표시 확인** (설치됨 ≠ 로드됨 ≠ 표시됨):
+4. **로드 확인** (설치됨 ≠ 로드됨):
    - 플러그인이 로드되기 전 실행 중이던 GJC는 종료 후 **새로 시작**한다.
-   - Herdr pane 안에서 `gjc`를 새로 시작한 뒤 다른 터미널에서 `herdr pane get <pane-id>`를 실행해 `tokens.gjc_herdr_model`이 보이면 로드·발행 성공이다. `/rename 이름` 후 최대 20초 안에 `tokens.gjc_herdr_session`이 갱신된다.
-   - sidebar에 모델 행·세션 이름 행이 보이면 표시 성공이다. 세션 이름은 sidebar 폭에 따라 잘려 보일 수 있다.
-6. **보고**: 설치·설정·표시 각각을 실제 출력으로 구분해 보고한다. 확인하지 못한 항목을 성공으로 적지 않는다.
+   - `hc` 터미널 안에서 `gjc`를 새로 시작했을 때 `/herdr-send`·`/herdr-call` 명령이 보이면 로드·등록됨을 확인한 것이다.
+   - `hc` 터미널 밖이면 우편 도구(`herdr_mail_send`)만 등록되는 것이 정상이다.
+5. **보고**: 설치와 로드 확인을 실제 출력으로 구분해 보고한다. 확인하지 못한 항목을 성공으로 적지 않는다.
 
 금지: GJC/Herdr 본체·credentials·다른 플러그인·사용자 모델 설정 변경, `plugin link`로 대체, 설치 실패를 build/소스 수정으로 우회.
 
-## Sidebar 설정
-
-기본 sidebar는 custom token을 자동 표시하지 않는다. `~/.config/herdr/config.toml`의 `[ui.sidebar.agents]`에 `$gjc_herdr_model`·`$gjc_herdr_session` 행을 추가한다. 플러그인은 이 파일을 건드리지 않는다. 아래는 실제 검증한 설정 형태다(앞의 두 행은 예시이며 기존 행을 그대로 두고 마지막 두 행만 추가한다).
-
-```toml
-[ui.sidebar.agents]
-rows = [
-  ["state_icon", "machine", "workspace", "tab"],
-  ["agent"],
-  ["$gjc_herdr_model"],
-  ["$gjc_herdr_session"],
-]
-```
-
 ## 동작
 
-- `gjc_herdr_model`: 현재 공개 context의 `provider/model-id`.
-- `gjc_herdr_session`: 현재 세션 이름. GJC의 `/rename <이름>`으로 변경한다.
-- 수락된 값은 `herdr pane get <pane-id>`의 `tokens`에서 확인한다.
-- Startup·session switch·agent 시작/종료 및 20초 주기로 갱신하며 TTL은 60초다.
-- 값이 없으면 자기 키를 제거한다. 표시 값은 제어 문자를 정리하고 80 Unicode 문자로 제한한다.
-- 공개 SDK pane admission과 main/depth-0 조건을 적용한다. Sub/nested·무Herdr·invalid pane에는 발행하지 않는다.
-- `gjc_herdr_session_id`: 현재 GJC session ID. 프롬프트 전달 대상 식별용이며 정규화·길이 제한 없이 그대로 발행한다(sidebar 행 추가 불필요).
-- 독립 source·증가 seq·전용 키를 사용하며 native lifecycle report/release를 호출하지 않는다. 정상 종료는 자기 세 키만 clear하고, crash/SIGKILL의 즉시 정리는 보장하지 않는다.
+플러그인은 시작 시 환경변수를 보고 아래 순서로 기능을 등록한다.
+
+- `GJC_HERDR_DISABLE`이 정확히 `1`이면 아무것도 등록하지 않고 종료한다(아래 절).
+- `HC_TERMINAL_ID`(앞뒤 공백 제거)가 비어 있지 않을 때만 `/herdr-send`·`/herdr-call` 명령과 `herdr_send`·`herdr_agent_call` 도구를 등록한다. `hc` 실행 파일은 `GJC_HERDR_HC_BIN`으로 지정할 수 있다(기본 `hc`).
+- `HC_TERMINAL_ID`가 없으면 위 전달·호출 명령과 도구를 등록하지 않는다(주소 형식 검사는 진입부가 아니라 실행 시점에 `hc` 경로가 수행한다).
+- 파일 우편함 도구(`herdr_mail_send`)와 우편 받기는 `HC_TERMINAL_ID` 유무와 무관하게 항상 등록한다(우편 받기 활성화 조건은 아래 "파일 우편함 보내기·받기" 절).
+- v0.7.0에서는 Herdr 메타데이터 token 보고와 그것을 위한 타이머·세션 이벤트 훅을 등록하지 않으며(우편 받기는 켜면 자기 타이머·훅을 씀), `GJC_HERDR_BACKEND`·`HERDR_ENV`·`HERDR_PANE_ID`를 읽지 않는다.
 
 ### 끄기 (`GJC_HERDR_DISABLE`, v0.6.1)
 
@@ -137,136 +124,66 @@ GJC_HERDR_DISABLE=1 gjc -p "요청"
 
 ## 프롬프트 전달
 
-이 플러그인이 로드된 GJC(보내는 쪽)에서 다른 Herdr pane의 GJC(받는 쪽)로 프롬프트를 보낸다. 전달은 GJC 공식 `gjc sdk session send`를 사용하므로 받는 쪽 입력창을 건드리지 않고, 받는 쪽이 작업 중이면 GJC가 진행 중인 turn에 이어 처리한다.
-
-### 화면 읽기 없는 직접 통신 — v0.2.0 지원 범위
-
-| 기능 | 지원 여부 |
-|---|---|
-| 다른 pane의 GJC에게 요청 전달 | 지원 — 화면 읽기 불필요 |
-| 상대 입력창을 건드리지 않고 전달 | 지원 — 기본 모드는 공식 GJC session API 사용 |
-| 에이전트 모델이 직접 전달 | 지원 — `herdr_send` 도구 사용 |
-| 상대 작업 완료·실패 확인 | 지원 — `wait`로 최대 30초 대기 |
-| 상대 답변 본문을 보내는 쪽으로 자동 반환 | GJC 대상은 미지원(`wait`도 완료 상태만 반환). **감지 에이전트(Claude Code·Codex 등) 대상은 v0.3.0부터 `/herdr-call`·`herdr_agent_call`로 지원** — 아래 "감지 agent 호출" 절 |
-| Claude Code·Codex 등 모든 종류의 에이전트와 동일한 방식으로 통신 | 부분 지원 — 감지·등록된 에이전트 대상 호출(`herdr agent prompt`)은 지원. GJC 대상은 여전히 `herdr_send` 경로(아래 표) |
-
-양쪽 GJC에 플러그인이 로드되어 있으면 상대가 `herdr_send`로 답변을 다시 보내는 방식으로 화면 읽기 없는 왕복 대화를 할 수 있다. 자동 회신 기능은 아니므로 요청에 실제 회신 대상 pane ID와 회신 지시를 포함해야 한다. 아래 예시는 보내는 쪽이 `wC:p1`인 경우다.
-
-```text
-/herdr-send wC:p2 이 변경을 검토하고, 결과를 herdr_send로 wC:p1에 회신해 주세요.
-```
-
-### Claude Code와 GJC의 협업 범위
-
-Claude Code와 Claude 모델을 사용하는 GJC는 서로 다른 실행 환경이다. 협업 역할을 지정하는 것만으로 자동 회신 연결이 생기지는 않는다.
-
-| 구성 | 현재 가능한 것 |
-|---|---|
-| Claude Code ↔ GJC | **GJC → 감지 에이전트 방향은 v0.3.0부터 지원**: `/herdr-call`·`herdr_agent_call`로 Claude Code 등 감지 에이전트를 호출하고 답변 본문을 회수한다(아래 절). 반대 방향(Claude Code 등이 이 플러그인 없이 GJC를 자동 호출·회수)은 여전히 미지원 |
-| Claude 모델을 사용하는 GJC ↔ 다른 GJC | 양쪽에 플러그인이 로드되어 있으면 `herdr_send`로 요청·회신 가능. 단, 회신 지시가 필요하며 자동 답변 수집은 아님. GJC 호출에는 `herdr_agent_call`이 아니라 이 경로를 쓴다(Herdr가 `gjc`를 감지 종류로 받지 않음) |
-
-Claude Code가 메인으로 GJC에 작업을 맡기고 답변 본문을 자동으로 받는 기능은 현재 제공하지 않는다. 별도의 요청·응답 연동이 필요하다. GJC의 `--raw`로 Claude Code pane에 직접 입력할 수는 있지만, 기존 입력과 섞일 수 있고 정상 수신·처리를 확인하지 못하므로 자동 회신 채널로 보장하지 않는다.
-
-#### Claude Code 등 플러그인 없는 발신자가 GJC에 보내는 2단계 레시피
-
-플러그인 없이도 공개 CLI만으로 GJC에 프롬프트를 보낼 수 있다(자동 회신 회수는 아니다). 받는 GJC가 이 플러그인을 로드했고 보내는 쪽이 같은 저장소 루트에서 실행한다고 가정한다.
-
-```bash
-# 1) 받는 GJC의 session ID token 읽기 (pane ID 또는 Herdr agent 이름)
-herdr agent get <name> | python3 -c "import sys,json;print(json.load(sys.stdin)['result']['agent']['tokens']['gjc_herdr_session_id'])"
-# 2) 공식 SDK로 전달 (--wait 생략하면 수락만 확인)
-gjc sdk session send <session-id> --text "요청" --wait --timeout-ms 150000
-```
-
-- 받는 쪽이 작업 중이어도 진행 중인 turn에 끼어들어 처리된다(실측: 40초 도구 실행 중 보낸 메시지가 약 5초에 완료. 측정 1회·한 가지 경우). `pane send-text`+`alt+q` 대기열은 turn 종료까지 밀릴 수 있어 이 경로와 다르다.
-- 슬래시 명령(`/rename` 등)은 일반 프롬프트로 처리되어 실행되지 않는다.
-- token이 없는 GJC(플러그인 미로드)는 `gjc sdk session list`와 pane의 foreground PID를 직접 대조해야 한다.
-- 받는 쪽이 승인·질문 창에서 `blocked`이면 먼저 사용자에게 알린다(이 플러그인의 `herdr_send`는 이때 보내지 않는다).
+`herdr-core`(`hc`) 터미널 안의 GJC에서 다른 `hc` 터미널로 프롬프트를 보낸다. 사전 조회(`hc get --json`)로 대상 상태를 확인한 뒤 `hc send --json`을 단 1회 호출해 **텍스트만 전달**하며, 화면 읽기(`hc read`/`attach`)나 별도 Enter 키 전송(`hc keys`), `--force`는 사용하지 않는다.
 
 ### 사용법
 
 ```text
-/herdr-send wC:p2 테스트를 실행하고 결과를 요약해 주세요.
+/herdr-send t2 테스트를 실행하고 결과를 요약해 주세요.
 /herdr-send --wait reviewer 이 변경을 검토해 주세요.
-/herdr-send --raw wC:p3 ls
+/herdr-send machine/t2 상태를 확인해 주세요.
 ```
 
-- 형식: `/herdr-send [--wait|--raw] <pane-id 또는 Herdr agent 이름> <text>`. 대상 뒤 구분 공백 한 글자 다음의 내용은 따옴표·줄바꿈·`--`로 시작하는 단어까지 그대로 전달된다.
-- 모델이 쓰는 도구 `herdr_send`도 같은 기능이다: `{ pane, text, wait?, raw? }`.
-- 기본: 받는 쪽이 프롬프트를 **수락**하면 operationRef와 함께 성공을 표시한다. 수락은 완료가 아니다.
-- `--wait`: 받는 쪽 turn이 끝날 때까지(최대 30초) 기다려 완료/실패를 표시한다. 시간이 넘으면 "이미 수락됐을 수 있음"으로 보고하며 다시 보내지 않는다.
-- `--raw`: SDK 대신 Herdr `pane send-text` + `send-keys enter`로 그 pane에 직접 입력한다. GJC가 아닌 pane(shell 등)에도 입력되며, 입력 중인 내용이 있으면 섞일 수 있다. 그래서 보내기 전에 대상 pane의 입력창(`herdr pane read --source visible --format ansi`)을 읽어, 글이 들어 있으면(사람이 치는 중이든 다른 에이전트가 붙여 넣은 것이든 같은 규칙) 2초 간격으로 다시 확인하며 기다린다. 기본 60초(`GJC_HERDR_INPUT_WAIT_SEC`로 조정, `0`이면 추가 대기 없음) 안에 비면 전달하고 결과에 `waitedMs`를 싣는다. 그래도 차 있으면 아무것도 보내지 않고 `not_sent`로 알린다(v0.3.3부터). 기다린 뒤 `--raw`는 같은 대기 한도 안에서만 대상을 다시 확인해 그사이 `blocked`·자기 pane·다른 pane(이름 재해석)으로 바뀌었으면 보내지 않고, 입력창을 읽지 못하고 `focused`이면 같은 한도 안에서 기다린다. 취소(abort)된 호출은 보내지 않는다(v0.3.4부터). 입력 상자 위쪽이 읽은 화면(60줄)에서 잘려 비었다고 증명할 수 없을 때도 입력 중으로 본다. GJC는 정확한 `Type your message...` 또는 그 뒤에 알려진 안내(`↩`·`⌥`·`⇧`·`⌃`·`…`로 시작)가 붙은 모양만 빈 것으로 보고, 그 문구로 시작하는 사용자 글은 입력 중으로 본다. 단, 알려진 안내 문구와 똑같은 글을 사람이 친 경우는 구별하지 못한다. 입력창은 Claude Code(구분선 사이의 `❯` 행, 흐린 추천 문구는 빈 것으로 본다)와 GJC(`╭│ > │╰` 상자, `Type your message...`는 빈 것)를 인식한다. 대상이 agy(Antigravity CLI)로 감지된 경우에만 구분선 사이의 0번째 칸 `>` 입력란을 인식하며, 그 외에는 `>` 행을 입력 중으로 본다. 인식하지 못하는 화면(셸 등)이나 읽기 실패는 `unknown`으로 보고, 그때 pane이 사람에게 포커스되어 있으면(`focused=true`) 같은 한도(`GJC_HERDR_INPUT_WAIT_SEC`, `0`이면 추가 대기 없음) 안에서 2초 간격으로 대상을 다시 확인하며 기다렸다가 포커스가 풀리거나 빈 입력창이 확인되면 전달하고, 끝까지 그대로면 보내지 않는다(`waitedMs`에 합산). 확인과 전송 사이의 경쟁은 남는다(원자적이지 않음). SDK 전달은 입력창을 거치지 않으므로 이 검사를 하지 않는다. 참고: 받는 GJC가 긴 도구 호출 중이면 SDK 전달은 현재 턴이 끝날 때까지 대기열(Queued)에 머물 수 있다(GJC 본체 동작). 시간이 중요한 메시지는 `--raw`가 바로 전달되지만 위 입력창 검사를 받는다. 완료 신호가 없고 `--wait`와 함께 쓸 수 없다.
-- 대상 식별: 받는 쪽 pane의 `gjc_herdr_session_id` token을 먼저 사용한다. token이 없으면(이 플러그인이 없는 GJC 등) 그 pane의 foreground PID를 보내는 쪽 저장소 범위의 `gjc sdk session list`와 맞춰 본다. agent 이름은 `herdr agent get <name>`의 pane으로 바꾼다.
-- 자기 자신(같은 session, raw는 같은 pane)으로는 보내지 않는다. 대상이 GJC가 아니거나 찾지 못하면 아무것도 보내지 않고 오류를 표시한다.
-
-전제와 한계:
-
-- `gjc`가 보내는 쪽 GJC 프로세스의 `PATH`에 있어야 한다. 없으면 `gjc CLI not found on PATH`.
-- 같은 컴퓨터·같은 사용자·같은 Herdr server만 대상이다. token이 없는 받는 쪽은 보내는 쪽과 같은 저장소에서 실행 중일 때만 찾는다(전역 검색 없음).
-- 받는 쪽이 승인·질문 창에서 `blocked`이면 SDK·raw 모두 보내지 않고 `not_sent`(v0.3.1부터, 단위 테스트 기준이며 실제 blocked GJC 확인은 하지 않음)로 알린다. 재시도·중복 방지·여러 대상 동시 전달은 없다. 오류·timeout 후 자동 재전송이나 raw 전환을 하지 않는다.
-- 이 전달(`herdr_send`) 경로는 Herdr의 `herdr agent prompt`를 사용하지 않는다. Herdr 0.9.3은 알려진 agent 종류만 받으며 `gjc`는 해당되지 않는다([herdrdev/herdr#4732](https://github.com/herdrdev/herdr/issues/4732)). 감지 에이전트 호출은 아래 `/herdr-call` 절이 담당한다.
-
-**주의: 셸 직접 전송은 플러그인의 입력 보호를 우회한다.** 자기 pane/session·`blocked` 거부와 터미널 입력 전송 시 입력창 검사·대기 후 포기·입력창을 읽지 못한 포커스 pane 거부는 `/herdr-send`·`herdr_send`, `/herdr-call`·`herdr_agent_call` 경로에서만 적용된다. 기본 GJC 전달은 SDK로 입력창을 건드리지 않는다.
-
-에이전트가 bash 도구로 `herdr agent prompt`·`herdr pane send-text`/`send-keys`를 직접 부르면 위 플러그인 보호를 전혀 거치지 않아, 사람이 입력 중인 문장 뒤에 붙어 제출될 수 있다. 실제로 다른 팀에서 GJC가 셸 `herdr agent prompt`로 팀장 pane에 보낸 내용이 사용자가 입력 중이던 문장에 붙어 제출된 사례가 보고됐다(2026-10-11).
-
-GJC가 다른 에이전트에 보낼 때는 위 플러그인 명령·도구만 쓰고, 이 규칙을 팀 규칙 파일(`AGENTS.md` 등)에도 적는다. 사람이나 스크립트가 CLI를 직접 써야 하면 전송 전에 idle·비포커스·빈 입력란을 직접 확인한다. 이 저장소의 `scripts/critic-send.sh`가 이런 확인을 하는 예시다.
-
-### hc 백엔드 (herdr-core)
-
-- **백엔드 선택과 caller 조건:** `GJC_HERDR_BACKEND=herdr|hc`가 설정되면 그 백엔드를 강제 선택하고(그 밖의 값은 경고를 남기고 자동 선택으로 폴백), 미설정이면 공개 Herdr pane 환경이 감지될 때 `herdr`, 없고 `HC_TERMINAL_ID`가 비어 있지 않을 때 `hc`를 자동 선택한다(`GJC_HERDR_HC_BIN`으로 `hc` 바이너리 경로·이름 지정 가능, 기본 `hc`). `hc` 전용 환경에서는 Herdr 메타데이터 token 발행기·타이머를 등록하지 않는다. 보내는 쪽 프로세스에 유효한 터미널 주소 형식의 `HC_TERMINAL_ID`가 없으면 입력 0회 `not_sent`(`hc caller unknown`)로 거부하고, 자기 자신(주소 일치 또는 이름으로 해석된 주소 일치)으로의 전송도 입력 0회 `not_sent`로 거부한다.
-- **텍스트 전용·세션 토큰 없음·화면 읽기 없음:** `hc` 백엔드는 `hc send --json --if idle [--wait --timeout <초>] <대상> <텍스트>`를 단 1회 호출해 **텍스트만 전달**한다(`hc: text delivery only; no GJC session token; idle targets only`). GJC 세션 ID 토큰(`gjc_herdr_session_id`)이나 `gjc sdk session send`를 사용하지 않으며, 화면 읽기(`hc read`/`attach`)나 별도 Enter 키 전송(`hc keys`)을 수행하지 않는다. `-`로 시작하는 텍스트는 CLI 옵션 오인을 막기 위해 전송 전 `not_sent`(`text starting with '-' unsupported on hc`)로 거부하며 `--`를 끼워 넣지 않는다.
-- **`/`로 시작하는 글(미확인 한계):** `-`로 시작하는 글만 거부하고 `/`로 시작하는 글은 별도 처리 없이 그대로 `hc send`로 보낸다. 받는 쪽에서 슬래시 명령으로 동작한다고 보장하지 않는다. `hc` 0.1.20에서 보고된 에이전트끼리 `hc send`로 보낸 `/` 시작 글이 감싸져 일반 글로 들어갔다는 다른 사용 환경의 관측이 있으며, 이 저장소에서는 확인하지 않았다(미실측). 슬래시 명령이 필요하면 이 경로에 기대지 않는다.
-- **원격 주소 및 `--raw`·`--raw --wait` 허용:** 대상은 로컬 주소(`t2`), 원격 주소(`machine/t2`), 또는 `hc ls --json`에서 유일하게 해석되는 터미널 이름이다(원격 주소 허용은 텍스트 전달에 한하며 원격 답변 파일 회수는 지원하지 않는다). `--raw`와 `--raw --wait`도 별도 저수준 키 입력 없이 동일한 `hc send --json --if idle` 경로를 1회 실행하며 함께 쓸 수 있다.
-- **`idle` 전용·무인 전제 미검증·`done` 뒤 자동 후속 불가:** 항상 `--if idle`을 붙여 보내므로 대상이 `idle`이 아니면(`working`·`done`·`blocked` 등) 입력 전에 `not_sent`(`status_mismatch` 등)로 거부된다. `idle`은 빈 입력란이나 사람 부재의 증거가 아니며 플러그인은 무인(unattended) 전제를 검증하거나 사람 draft 보호를 보장하지 않는다. 한 턴이 끝난 뒤 `done` 상태에 머무는 대상에는 자동으로 후속 프롬프트를 보낼 수 없다.
-- **`status: "sent"`(전달 확인)와 완료 확인(`ok: true`)의 차이 및 재전송 금지:**
+- 형식: `/herdr-send [--wait] <terminal> <text>`. 대상 뒤 구분 공백 한 글자 다음의 내용은 따옴표·줄바꿈·`--`로 시작하는 단어까지 그대로 전달된다.
+- 모델이 쓰는 도구 `herdr_send`도 같은 기능이다: `{ pane, text, wait? }` (`raw?` 인자도 호환상 받지만 효과는 없다).
+- `--raw`: v0.7.0에서 `--raw`는 효과가 없다(명령·도구 모두 받아들이지만 일반 전달과 같은 `hc send` 경로를 실행하며, `--raw --wait`도 `--wait`와 같다).
+- **호출자 조건과 self 거부:** 보내는 쪽 프로세스에 유효한 `hc` 터미널 주소 형식의 `HC_TERMINAL_ID`가 없으면 입력 0회 `not_sent`(`hc caller unknown`)로 거부한다. 자기 자신(주소 일치 또는 이름으로 해석된 주소 일치)으로의 전송도 입력 0회 `not_sent`로 거부한다.
+- **대상 해석과 원격 주소:** 대상은 로컬 주소(`t2`), 원격 주소(`machine/t2`), 또는 `hc ls --json`에서 정확히 1건으로 해석되는 터미널 이름이다(연결 끊긴 호스트는 이름 검색 대상이 아니며, 0건·2건 이상은 입력 0회 `not_sent`). 원격 주소 허용은 텍스트 전달에 한하며, 원격 `machine/t1`은 로컬 호출자 `t1`과 구별된다.
+- **사전 조회와 `idle`/`done` 규칙·비원자 한계:** 대상 해석과 self 검사 뒤 남은 예산(총 60초, 조회 최대 3초) 안에서 `hc get --json <주소>`를 1회 실행한다.
+  - `state === "live" && reported === true`이고 `status.state === "idle"`이면 `hc send --json --if idle [--wait --timeout <초>]`로 1회 보낸다.
+  - 같은 조건에서 `status.state === "done"`이면 `--if` 없이 `hc send --json [--wait --timeout <초>]`로 1회 보낸다. Core의 `hc send --if`가 `done`을 받지 않으므로 **원자적이지 않다**: 조회 뒤 대상이 작업을 시작했으면 글이 진행 중 턴에 들어갈 수 있다. `done` 대상 전송 결과(`sent`·`uncertain`) 글에는 이 안내를 짧게 덧붙인다(`idle` 경로와 `not_sent` 결과에는 붙이지 않는다).
+  - 그 밖의 상태(`finished`·`reported !== true`·`working`·`blocked`·`error`·알 수 없는 상태)나 `hc get` 실패·예산 부족이면 `hc send` 0회 `not_sent`로 거부한다.
+  - `idle`·`done`은 빈 입력란이나 사람 부재의 증거가 아니며 플러그인은 무인(unattended) 전제나 사람 draft 보호를 검증·보장하지 않는다.
+- **`-`로 시작하는 글과 `/`로 시작하는 글:**
+  - `-`로 시작하는 글은 CLI 옵션 오인을 막기 위해 전송 전 `not_sent`(`text starting with '-' unsupported on hc`)로 거부하며 `--`를 끼워 넣지 않는다.
+  - `/`로 시작하는 글(미확인 한계): `-`로 시작하는 글만 거부하고 `/`로 시작하는 글은 별도 처리 없이 그대로 `hc send`로 보낸다. 받는 쪽에서 슬래시 명령으로 동작한다고 보장하지 않는다. `hc` 0.1.20에서 보고된 에이전트끼리 `hc send`로 보낸 `/` 시작 글이 감싸져 일반 글로 들어갔다는 다른 사용 환경의 관측이 있으며, 이 저장소에서는 확인하지 않았다(미실측). 슬래시 명령이 필요하면 이 경로에 기대지 않는다.
+- **`--wait`의 뜻(`status: "sent"`와 완료 확인의 차이) 및 재전송 금지:**
+  - `--wait` 없이 보내면 `hc send`가 턴 번호를 반환했을 때 `ok: true, status: "sent"`로 텍스트 전달만 확인하며 완료를 기다리지 않는다. `--wait`를 붙이면 남은 예산(총 60초) 안에서 `hc send --wait`로 턴 완료까지 기다리고, 전달(`status: "sent"`)과 대기 결과(`waited`)를 분리해 보고한다.
   - (1) **상위 `SendResult` 손상 또는 전송 단계 불확실 실패:** `hc send`가 종료 코드 `0`이라도 JSON이 아니거나 상위 `SendResult` 필드 타입(`turn` 음이 아닌 안전 정수, `started` 불리언/null/생략, `status` 문자열/null/생략)이 유효하지 않으면 전달 여부를 알 수 없는 `ok: false, status: "uncertain"`으로 분류한다(`unavailable`·`cancelled`·`needs_target`·미인식 오류 봉투·프로세스 timeout/abort도 같음). 반면 `hc send` 실패 중 입력 전 거부가 확인된 7종(`status_mismatch`, `blocked`, `finished`, `not_found`, `machine_unknown`, `invalid_params`, `config`)만 `status: "not_sent"`이다.
   - (2) **정상 제출 확인 뒤 중첩 `wait` 파싱 실패:** `hc send`가 종료 코드 `0`이고 상위 `SendResult` 필드 타입(`turn`·`started`·`status`)이 모두 유효하면 텍스트 제출이 확인된 `mode: "hc", status: "sent"`가 된다(`--wait` 없이 보냈을 때 중첩 `wait`가 없거나 유효하면 `ok: true, status: "sent"`이며 턴 완료 대기는 하지 않음). 이 상태에서 중첩 `wait` 객체 파싱만 실패한 경우(`!waitValid`)에는 텍스트는 이미 제출됐으므로 `status: "uncertain"`이 아니라 `ok: false, status: "sent"`로 보고한다.
   - (3) **`--wait` 시 `wait` 결과 부재(`null`/`undefined`)와 `started: false`:** `--wait`(및 `--raw --wait`)를 요청했는데 중첩 `wait` 결과가 없을 때만 `started === false`(`start was not observed; no wait result; completion unconfirmed`)와 일반 `wait` 누락을 별도 완료 미확인(`ok: false, status: "sent"`) 분기로 나눈다.
   - (4) **유효한 `WaitResult` 상관 판정:** 유효한 `WaitResult`가 있으면 상위 `started` 값과 무관하게 `waited: { reason, status, ended, turn }`을 담고 대상 터미널 일치(`terminal === addr`)·`ended`·`reason`·`status`·`turn` 상관으로 판정한다. 같은 대상에서 `ended === true && reason === "status" && (status === "idle" || status === "done") && turn >= send.turn + 1`일 때만 `ok: true, status: "sent"`이고, `terminal` 불일치·`reason`이 `timeout`/`message`/`not_started`/`exit`·`status`가 `blocked`/`error`·완료 응답에서 `turn < send.turn + 1`·그 밖의 미완료 상태는 모두 `ok: false, status: "sent"`이다. `status: "sent"`와 `status: "uncertain"`은 어떤 경우에도 **재전송하지 않는다**.
 
-## 감지 agent 호출 (v0.3.0)
+**주의: 셸 직접 전송은 플러그인 보호를 우회한다.** 셸(bash 도구 등)에서 `hc send`를 직접 부르면 플러그인의 사전 조회(`hc get`의 `live`·`reported`·`idle`/`done` 확인), 자기 터미널 거부, `-` 시작 글 거부 같은 보호를 거치지 않아 작업 중이거나 `blocked` 상태인 대상에 그대로 들어갈 수 있다. GJC가 다른 터미널에 보낼 때는 플러그인 명령·도구만 쓰고, 이 규칙을 팀 규칙 파일(`AGENTS.md` 등)에도 적는다. 사람이나 스크립트가 CLI를 직접 써야 하면 전송 전에 대상 상태를 직접 확인한다. 이 저장소의 `scripts/critic-send.sh`가 확인 후 보내는 예시다.
 
-Herdr가 **감지한** 다른 pane의 에이전트(Claude Code, Codex 등 Herdr 0.9.3이 알아본 종류)에게 프롬프트를 보내고, 그 답변 본문을 되돌려받는다. 전달·대기·회수 모두 Herdr 공개 CLI(`herdr agent prompt --wait` / `herdr agent read`)를 쓰며 스크래핑이나 `--raw` 입력은 사용하지 않는다.
+## 다른 에이전트 호출 (`/herdr-call`)
+
+같은 로컬 호스트의 다른 `hc` 터미널 에이전트에게 프롬프트를 보내고, 대상 에이전트가 작성한 **결과 파일**에서 답변 본문을 회수한다. 화면 읽기(`hc read`/`attach`)나 원격 키 입력(`hc keys`), `--force`, 재시도는 사용하지 않는다.
 
 ```text
-/herdr-call wC:p2 이 변경을 검토하고 문제점을 알려줘.
-/herdr-call --result-file /abs/path/to/answer.md wC:p2 이 변경을 검토하고 문제점을 알려줘.
+/herdr-call --result-file /abs/path/to/answer.md t2 이 변경을 검토하고 문제점을 알려줘.
 ```
 
-- 형식: `/herdr-call [--result-file <절대 경로>] <pane-id 또는 유일한 agent 이름> <text>`. 대상 뒤 구분 공백 한 글자 다음 내용은 그대로 전달된다. 모델이 쓰는 도구 `herdr_agent_call`도 같은 기능이다: `{ target, text, result_file? }`. 명령 형식의 `--result-file` 값은 공백으로 구분하므로 공백이 들어간 경로는 지원하지 않는다(공백이 포함된 경로는 도구 인자 `result_file`을 쓴다).
-- 동작: 대상 해석(pane ID는 직접, 이름은 `agent list`에서 정확히 1건일 때만) → 사전 상태 확인(`agent get`) → 프롬프트에 요청별 표식 지시를 붙여 **1회** 전송(`--wait`) → settle 후 화면(`--source recent-unwrapped`)을 읽어 `GJC_HERDR_BEGIN_<요청ID>`/`END_<요청ID>` 행 사이 본문만 회수(끝 표지만 있고 시작 표지가 없으며 읽기 예산이 남았을 때는 `--source recent`로 1회 더 읽는다). 표식 쌍이 온전하지 않으면 성공으로 승격하지 않고 `response_unverified`(캡처 원문 포함)로 보고한다. 긴 답에는 `--result-file` / `result_file` 모드를 권한다.
-- 결과 파일 회수(`--result-file` / `result_file`): 긴 답변이나 터미널 화면 접힘·잘림에 강하도록, 대상 에이전트가 답변 전문을 지정한 경로에 **새 파일로** 작성하고 화면에는 `GJC_HERDR_BEGIN_<요청ID>` / `<절대 경로>` / `GJC_HERDR_END_<요청ID>` 세 줄만 출력하게 한다. 대상 에이전트가 그 경로에 쓸 수 있어야 한다(예: sandbox 안의 agy는 저장소 내부 경로만 가능). **호출마다 새 경로**를 써야 하며, `result_file`은 비어 있지 않은 **절대 경로**(NUL·CR·LF 문자 없음)만 허용한다. 상대 경로·빈 값·앞뒤 공백·NUL/CR/LF 문자이거나, 처음 요청 검증 시점 또는 `#34` 준비 대기 후 실제 `prompt` 전송 직전에 해당 경로에 무엇이든(일반 파일·심볼릭 링크·디렉터리 등) 이미 있으면 전송 전에 `not_sent`(`invalid_request`, 입력 0회)로 거절한다. settle 뒤에는 보조 화면 읽기가 실패하거나 예외를 던져도(명시적 abort·settle timeout 제외) 파일 회수를 진행하며, `open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK)`으로 열어 **같은 파일 handle**에서 판정·읽기·닫기(`finally`)를 수행한다. 회수 **판정 순서**는 (1) handle 열기(`ENOENT`면 `result_file_missing`, 심볼릭 링크 `ELOOP` 등 열기 실패면 `result_file_invalid`) → (2) 같은 handle의 `stat()` 검사(일반 파일 `isFile()`이 아니거나, 하드 링크 `nlink !== 1`이거나, 원본 바이트 크기가 `0 < size <= 1 MiB` 범위를 벗어나면 `result_file_invalid`) → (3) 같은 handle에서 최대 `1 MiB + 1`바이트까지 읽기(읽은 원본 바이트가 `0` 이하이거나 `1 MiB`를 넘으면 `result_file_invalid`) → (4) `TextDecoder("utf-8", { fatal: true })` 엄격한 UTF-8 디코딩(잘못된 UTF-8 바이트가 있으면 `result_file_invalid`)이다. 모두 통과하면 디코딩된 문자열을 `answer`로 하여 `answered`(`resultFile` 포함)로 반환한다. 이때 화면 표식은 보조 확인이며, 화면 읽기가 성공하고 표식 사이 줄이 경로와 일치하면 `markerVerified: true`, 화면 읽기가 실패했거나 표식이 없거나 경로가 다르면 `markerVerified: false`를 싣는다. 파일 회수도 실패하면 파일 오류 코드(`result_file_missing` 또는 `result_file_invalid`)로 `response_unverified`를 내고, 화면 읽기가 성공했으면 `capture`를, 화면 읽기도 실패했으면 오류 메시지에 화면 읽기 오류 내용을 함께 남긴다. 한계: 대상 에이전트가 읽을 수 있는 다른 파일의 내용을 결과 파일에 복사하는 것까지는 막지 못하며, `O_NOFOLLOW`는 경로의 마지막 요소만 보호하므로 신뢰된 전용 폴더(예: 저장소 `.local/`)를 쓰도록 권한다.
-- 상태: `answered`(본문 회수 성공) / `blocked`·`not_sent`(전송 전 거부 — blocked·미등록·찾을 수 없음, 그리고 같은 `GJC_HERDR_INPUT_WAIT_SEC` 한도 안에서 2초 간격으로 기다린 뒤 포기하는 입력창에 글이 남아 있는 pane(`target_typing`, v0.3.3부터)·입력창을 읽지 못한 포커스 pane(`target_focused`)·작업 중인 에이전트(`target_busy`), **입력 0회**. 단, 입력창이 `unknown`이고 포커스되어 있어도 에이전트 상태가 `blocked`이면 `blocked`/`agent_blocked`, `unknown`이면 `not_sent`/`target_state_unknown`으로 포커스 대기보다 먼저 즉시 처리한다) / `answer_pending`(전달 확인 — `prompt --wait`이 Herdr `timeout`으로 끝났으나 뒤이은 `--source recent` 화면 읽기 1회에서 이번 요청의 표식 지시(`GJC_HERDR_BEGIN_<요청ID>` 또는 `result_file` 모드의 `<요청ID>`) 에코가 대상 화면에서 확인됨, 답 미회수(`answer_timeout`, `delivery: submitted`), **재전송하지 말 것**) / `stalled`·`uncertain`(전송은 됐으나 활동·완료 미확인) / `read_failed`·`response_unverified`(전달됐으나 회수 실패). `delivery`는 `not_sent`/`submitted`/`unknown`으로 전송 확실성을 구분해 함께 표시한다.
-  - 대상이 agy일 때 첫 `>` 입력란에 표시되는 모드 안내 문구(`Accept-edits`/`Auto`/`Plan mode: … (shift+tab to cycle)` 및 좁은 pane의 `...` 잘림, 전경색 `38;2;131;148;150` 단독)는 빈 입력란으로 본다.
-- 예산: 호출당 총 60초 고정, 읽기 200줄. 단, 대상이 일시적으로 준비되지 않아(`target_typing`·`target_focused`·`target_busy`) 기다린 합산 시간(실제 경과, 입력창 읽기·상태 재확인 시간 포함; `waitedMs`)은 이 60초 호출 예산에 포함하지 않는다(v0.3.4부터 단조 시계 기준). 전체 대기 상한은 `GJC_HERDR_INPUT_WAIT_SEC`(기본 60초, `0`이면 추가 대기 없음) 하나로 공유하며(재시도 조회도 남은 대기 한도로 제한하고, 남은 시간이 재확인 최소 예산 1초 미만이면 마지막 비준비 사유로 종료), 확인과 전송 사이의 경쟁은 남는다(원자적이지 않음). `--result-file`/`result_file`을 써도 60초 호출 예산은 그대로이며, 예산 안에 대상 작업이 끝나지 않으면 이번 요청 에코 확인 여부에 따라 `answer_pending/answer_timeout` 또는 `uncertain/timeout`(원격 에이전트는 계속 실행)이 되고 결과 파일은 나중에 직접 확인한다.
-
-제약 (정확한 의미):
-
-- **비대칭 취소**: 로컬 대기 중단·timeout은 이쪽 기다림만 끝낸다. 원격 에이전트는 계속 실행되며, 이 플러그인은 원격에 키 입력(중단·승인·재시도)을 **0회** 보낸다.
-- **busy 보호는 원자적이지 않다**: 사전 확인 시점의 `working`/`blocked`만 걸러낸다. 그 사이 상태가 바뀌면 Herdr의 게이트가 최종 판정한다(게이트 거부는 입력 0회 `not_sent`).
-- 같은 pane에 대한 동시 호출은 이 플러그인 인스턴스 안에서 1개만 허용하고 나머지는 거부한다.
-- reported(보고만 된) 대상은 Herdr 게이트가 거부한다(`agent_not_ready`, 입력 0회). 또한 reported 등록은 짧은 시간 안에 소멸하므로 이름·상태가 사라진 대상은 `target_not_found`가 될 수 있다 — 감지 종류만 안정적인 호출 대상이다.
-- 감지 종류가 아니어도 Herdr가 프롬프트를 받아들이는 관리 대상이라면 호출될 수 있다. GJC 대상은 `herdr_send`를 쓴다(Herdr가 `gjc`를 감지 종류로 취급하지 않음).
-- `agent_prompt_stalled`·전송 후 `blocked`의 실측 재현은 하지 못했다(단위 계약 매핑만 존재). 실제 환경에서 관측되면 상태 표기 그대로 보고된다.
-- Claude Code는 답변 첫 줄에 `⏺ ` 불릿을 붙이고 본문을 들여쓰기해 표시한다. 회수는 이런 터미널 장식(불릿·인용·들여쓰기)을 허용·정리하며, 문장 중간의 표식 언급(프롬프트 에코)은 표식으로 치지 않는다. Claude Code 대상은 화면 높이를 넘는 답의 시작 표지를 `--source recent`로 다시 읽으며(접힌 프롬프트 에코는 제외), 긴 답에는 `result_file` 모드를 권한다.
-
-### hc 백엔드 (herdr-core)
-
-- **백엔드 선택과 caller 조건:** 위 "프롬프트 전달 — hc 백엔드"와 같이 `GJC_HERDR_BACKEND` 또는 `HC_TERMINAL_ID`로 `hc` 백엔드가 선택되며, 유효한 터미널 주소 형식(`isValidHcAddress`)의 `HC_TERMINAL_ID`가 없으면 입력 0회 `status: "not_sent"`, `delivery: "not_sent"`, `error.code: "invalid_request"`(`hc caller unknown`)로 거부한다. 자기 자신(주소 또는 이름 해석 결과) 호출도 입력 0회 `status: "not_sent"`, `delivery: "not_sent"`, `error.code: "self_target"`으로 거부한다.
-- **필수 로컬 결과 파일(`--result-file` / `result_file`)과 원격 주소 거부:** `hc` 백엔드는 화면 읽기(`hc read`/`attach`)를 전혀 하지 않으므로 `--result-file <절대 경로>`(도구는 `result_file`)가 **필수**이며, 생략하거나 유효하지 않은 경로·이미 존재하는 경로이면 입력 0회 `status: "not_sent"`, `delivery: "not_sent"`, `error.code: "invalid_request"`로 거부한다. 같은 로컬 파일시스템에서 결과 파일을 직접 열어 검증·회수해야 하므로 원격 대상(`machine/t2` 또는 원격 주소로 해석되는 이름)은 입력 0회 `status: "not_sent"`, `delivery: "not_sent"`, `error.code: "invalid_request"`(`remote result file recovery unsupported`)로 거부한다. 회수된 답변의 `markerVerified`는 항상 `false`이며 화면 `capture`는 포함하지 않는다.
-- **`/`로 시작하는 글(미확인 한계):** `-`로 시작하는 글만 거부하고 `/`로 시작하는 글은 그 뒤에 결과 파일 지시문을 붙여 별도 처리 없이 그대로 `hc send`로 보낸다(보내는 글의 첫머리도 `/`). 받는 쪽에서 슬래시 명령으로 동작한다고 보장하지 않는다. `hc` 0.1.20에서 보고된 에이전트끼리 `hc send`로 보낸 `/` 시작 글이 감싸져 일반 글로 들어갔다는 다른 사용 환경의 관측이 있으며, 이 저장소에서는 확인하지 않았다(미실측). 슬래시 명령이 필요하면 이 경로에 기대지 않는다.
-- **`idle` 전용·무인 전제 미검증·`done` 뒤 자동 후속 불가:** 이 플러그인 인스턴스에서 같은 대상에 이미 호출이 진행 중(`inFlight`)이면 `status: "not_sent"`, `error.code: "target_busy"`로 거부한다. 사전 `hc get --json`에서는 대상이 `state === "live" && reported === true && status.state === "idle"`일 때만 전송하며, 그 밖의 상태는 모두 입력 0회 `status: "not_sent"`, `delivery: "not_sent"`로 거부한다(`state === "finished"` → `error.code: "terminal_finished"`, `reported !== true` → `error.code: "not_reported"`, `status.state === "done"` → `error.code: "agent_done"`, `status.state === "working"` → `error.code: "agent_busy"`, `status.state === "blocked"` → `error.code: "agent_blocked"`, 그 밖의 비-`idle` 상태 → `error.code: "agent_state_unknown"`). 전송도 `hc send --json --if idle --wait`로만 수행한다. Herdr 모드와 달리 준비 대기 루프(`GJC_HERDR_INPUT_WAIT_SEC`)나 화면 입력란 검사를 하지 않으므로 무인(unattended) 전제는 검증되지 않으며, 한 턴 뒤 `done`에 남는 대상의 반복 자동 호출은 지원하지 않는다.
+- 형식: `/herdr-call --result-file <abs-path> <terminal> <text>`. 대상 뒤 구분 공백 한 글자 다음 내용은 그대로 전달된다. 모델이 쓰는 도구 `herdr_agent_call`도 같은 기능이다: `{ target, text, result_file }`. 명령 형식의 `--result-file` 값은 공백으로 구분하므로 공백이 들어간 경로는 도구 인자 `result_file`을 쓴다(결과 파일 없이 실행하면 실행 시점에 `invalid_request`로 거부된다).
+- **호출자 조건·self 거부·로컬 터미널 전용:** 유효한 터미널 주소 형식의 `HC_TERMINAL_ID`가 없으면 입력 0회 `not_sent`(`invalid_request`, `hc caller unknown`)로 거부하고, 자기 자신(주소 또는 이름 해석 결과) 호출도 입력 0회 `not_sent`(`self_target`)로 거부한다. 같은 로컬 파일시스템에서 결과 파일을 직접 열어 검증·회수해야 하므로 원격 대상(`machine/t2` 또는 원격 주소로 해석되는 이름)은 입력 0회 `not_sent`(`invalid_request`, `remote result file recovery unsupported`)로 거부한다.
+- **결과 파일 규칙(필수):**
+  - 화면 읽기를 전혀 하지 않으므로 `--result-file <절대 경로>`(도구 `result_file`)가 **필수**다. 비어 있지 않은 **절대 경로**(앞뒤 공백·NUL·CR·LF 없음)만 허용하며, **호출마다 새 경로**를 써야 한다.
+  - 최초 요청 검증 시점과 사전 조회 뒤 실제 `hc send` 직전 재검사 시점에 해당 경로에 무엇이든(일반 파일·심볼릭 링크·디렉터리 등) 이미 있으면 입력 0회 `not_sent`(`invalid_request`, `result file check failed: already exists`)로 거부한다.
+  - 프롬프트 뒤에 지정 경로로 새 파일을 작성하라는 지시문을 붙여 1회 전송한다(대상 에이전트가 그 경로에 쓸 수 있어야 한다. 예: sandbox 안의 agy는 저장소 내부 경로만 가능).
+  - 정상 settle 뒤 `open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK)`으로 열어 **같은 파일 handle**에서 판정·읽기·닫기(`finally`)를 수행한다. 회수 **판정 순서**는 (1) handle 열기(`ENOENT`면 `result_file_missing`, 심볼릭 링크 `ELOOP` 등 열기 실패면 `result_file_invalid`) → (2) 같은 handle의 `stat()` 검사(일반 파일 `isFile()` 아님, 하드 링크 `nlink !== 1`, 원본 바이트 크기 `0 < size <= 1 MiB` 범위 밖이면 `result_file_invalid`) → (3) 같은 handle에서 최대 `1 MiB + 1`바이트까지 읽기(읽은 바이트가 `0` 이하이거나 `1 MiB`를 넘으면 `result_file_invalid`) → (4) `TextDecoder("utf-8", { fatal: true })` 엄격한 UTF-8 디코딩(잘못된 UTF-8이면 `result_file_invalid`)이다.
+  - 모두 통과하면 디코딩된 문자열을 `answer`로 하여 `answered`(`resultFile` 포함, `markerVerified: false`, 화면 `capture` 없음)를 반환한다. 한계: 대상 에이전트가 읽을 수 있는 다른 파일의 내용을 복사하는 것까지는 막지 못하며, `O_NOFOLLOW`는 경로의 마지막 요소만 보호하므로 신뢰된 전용 폴더(예: 저장소 `.local/`)를 쓰도록 권한다.
+- **동시 호출 제한과 사전 조회(`idle`/`done` 규칙·비원자 한계):**
+  - 같은 대상(정규 주소 기준)에 대한 동시 호출은 이 플러그인 인스턴스 안에서 1개만 허용하고 나머지는 입력 0회 `not_sent`(`target_busy`)로 거부한다.
+  - 사전 `hc get --json`에서 `state === "live" && reported === true`일 때만 전송한다. `status.state === "idle"`이면 `hc send --json --if idle --wait --timeout <초>`로 1회, `status.state === "done"`이면 `--if` 없이 `hc send --json --wait --timeout <초>`로 1회 보낸다. `done` 경로는 **원자적이지 않으며**(조회 뒤 대상이 작업을 시작했으면 진행 중 턴에 들어갈 수 있음), 전송 결과(`delivery !== "not_sent"`) 글에 이 안내를 덧붙인다(`idle` 경로와 `not_sent` 결과에는 붙이지 않는다).
+  - 그 밖의 상태는 모두 입력 0회 `status: "not_sent"`, `delivery: "not_sent"`로 거부한다(`state === "finished"` → `terminal_finished`, `reported !== true` → `not_reported`, `status.state === "working"` → `agent_busy`, `status.state === "blocked"` → `agent_blocked`, `error` 포함 그 밖의 상태 → `agent_state_unknown`). 무인(unattended) 전제는 검증하지 않는다.
+- **`-`와 `/`로 시작하는 글:** `-`로 시작하는 글은 전송 전 `not_sent`(`invalid_request`, `text starting with '-' unsupported on hc`)로 거부한다. `/`로 시작하는 글은 그 뒤에 결과 파일 지시문을 붙여 별도 처리 없이 그대로 `hc send`로 보내며, 받는 쪽에서 슬래시 명령으로 동작한다고 보장하지 않는다(미실측 한계, 위 "프롬프트 전달" 절 참조).
+- **예산(총 60초·파일 회수 여유 5초)과 비대칭 취소:** 총 호출 예산은 60초 고정이며, 파일 회수 여유(5초)를 뺀 대기 예산 안에서 `hc send --wait`를 1회 실행한다. 로컬 대기 중단·timeout은 이쪽 기다림만 끝내며, 대상 에이전트는 계속 실행되고 플러그인은 중단·승인·재시도 키 입력을 **0회** 보낸다.
 - **제출 확인(`delivery: "submitted"`)과 완료·답변 회수(`status: "answered"`)의 차이 및 재전송 금지:**
-  - **호출 예산과 후속 `hc wait` 조건:** 총 호출 예산은 60초 고정이며, 파일 회수 여유(5초)를 뺀 대기 예산 안에서 `hc send --json --if idle --wait --timeout <초>`를 1회 실행한다. 반환된 `WaitResult`가 같은 대상(`terminal === addr` 및 단조 `turn`)이고 `ended === false`, `reason === "timeout"` 또는 `"message"`, `status === null` 또는 `"working"`이며 대기 예산이 남아 있을 때만 **재전송 없이** `hc wait --json <주소> --timeout <초>`로 완료 대기를 이어간다(대상·`turn` 확인과 `not_started`·`exit`·`blocked`·`error`의 개별 처리를 거친 나머지 `ended === false` 응답에서 `reason`이 `timeout`/`message`가 아니거나 `status`가 `null`/`working`이 아니면 재대기하지 않고 `status: "uncertain", delivery: "submitted", error.code: "protocol"`로 종료한다).
+  - **후속 `hc wait` 조건:** 반환된 `WaitResult`가 같은 대상(`terminal === addr` 및 단조 `turn`)이고 `ended === false`, `reason === "timeout"` 또는 `"message"`, `status === null` 또는 `"working"`이며 대기 예산이 남아 있을 때만 **재전송 없이** `hc wait --json <주소> --timeout <초>`로 완료 대기를 이어간다(대상·`turn` 확인과 `not_started`·`exit`·`blocked`·`error`의 개별 처리를 거친 나머지 `ended === false` 응답에서 `reason`이 `timeout`/`message`가 아니거나 `status`가 `null`/`working`이 아니면 재대기하지 않고 `status: "uncertain", delivery: "submitted", error.code: "protocol"`로 종료한다).
   - (1) **상위 `SendResult` 손상 또는 전송 단계 불확실 실패:** `hc send` 단계에서 입력 전 거부가 확인된 7종만 `status: "not_sent", delivery: "not_sent"`이고, `unavailable`·`cancelled`·`needs_target`·미인식 오류·프로세스 timeout/abort와, 종료 코드 `0`이라도 상위 `SendResult` 필드 타입(`turn` 음이 아닌 안전 정수, `started` 불리언/null/생략, `status` 문자열/null/생략)이 손상된 경우는 모두 `status: "uncertain", delivery: "unknown"`(`error.code: "protocol_error"` 등)이다.
   - (2) **정상 제출 확인 뒤 중첩 `wait` 손상:** `hc send`가 종료 코드 `0`이고 상위 `SendResult` 필드 타입이 모두 유효하면 `delivery: "submitted"`가 확정된다. 이 상태에서 `send.turn < preflight.turn`이거나 중첩 `wait` 파싱이 실패한 경우(`!waitValid`, 또는 후속 `hc wait`의 `WaitResult` 파싱 실패)에는 `delivery: "unknown"`이 아니라 `status: "uncertain", delivery: "submitted", error.code: "protocol"`로 보고한다.
   - (3) **`wait` 결과 부재(`null`/`undefined`)와 `started: false`:** 유효한 제출 뒤 중첩 `wait`가 없을 때(`null`/`undefined`)만 `started === false`를 별도 분기(`status: "stalled", delivery: "submitted", error.code: "stalled"`)로 처리하고, 그 밖의 `wait` 누락은 `status: "uncertain", delivery: "submitted", error.code: "protocol"`로 처리한다.
   - (4) **유효한 `WaitResult` 상관 판정:** 유효한 `WaitResult`가 있으면 상위 `started` 값과 무관하게 대상 일치·`ended`·`reason`·`status`·`turn` 상관으로 판정한다(모두 `delivery: "submitted"`): `reason === "not_started"` → `status: "stalled", error.code: "stalled"`; `reason === "exit"`(`ended === true`) → `status: "response_unverified", error.code: "terminal_finished"`(`ended !== true`이면 `status: "uncertain", error.code: "protocol"`); 제출 뒤 `status === "blocked"` → `status: "response_unverified", error.code: "agent_blocked"`; 제출 뒤 `status === "error"` → `status: "response_unverified", error.code: "agent_error"`; 완료 응답(`ended === true`)에서 `terminal` 불일치·`reason !== "status"`·`status`가 `idle`/`done` 아님·`turn < send.turn + 1`(`turn` 미진행) → `status: "uncertain", error.code: "protocol"`; 대기 예산 소진 → `status: "uncertain", error.code: "timeout"`. 정상 settle(`ended === true && reason === "status" && (status === "idle" || status === "done") && turn >= send.turn + 1`) 뒤 결과 파일 검증이 통과하면 `ok: true, status: "answered", delivery: "submitted"`를 반환하고, 결과 파일 미생성(`result_file_missing`)·무효(`result_file_invalid`)는 `status: "response_unverified"`, 파일 I/O 시간 초과는 `status: "uncertain", error.code: "timeout"`, 파일 읽기 abort는 `status: "read_failed", error.code: "aborted"`를 반환한다. `delivery: "submitted"`와 `delivery: "unknown"`은 어떤 경우에도 **재전송하지 않는다**.
-
-### Herdr agent skill 안내
-
-GJC 0.18.7은 플러그인이 skill을 등록할 수 없다(파일시스템 기반 skill 발견만 지원). Herdr 공식 agent skill을 쓰고 싶으면 [herdr.dev agent skill 문서](https://herdr.dev/docs/agent-skill)를 따라 사용자가 직접 설치한다. 이 플러그인은 skill 등록 API가 없어 그 경로를 사용하지 않으며(`resources_discover`/`skillPaths` 공개 설정이 존재하기는 하나 이 범위에서는 미사용), `/herdr-call`이 그 역할을 대신한다.
 
 ## 파일 우편함 보내기·받기
 
@@ -297,11 +214,13 @@ gjc
 
 | 항목 | 확인 결과 |
 |---|---|
+| v0.7.0 (Core/`hc` 전용, #100·#101) | 단위 시험(모의) 기준(`herdr server` 경로 제거, `HC_TERMINAL_ID` 조건 등록, 보내기·호출 `done` 대상 허용). 설치 판 GJC에서의 로드와 Core(`hc`) 안 실제 호출은 release 전 확인 예정 |
+| **v0.6.x 이전(`herdr server`) 기준** | 아래 행들은 `herdr server` 경로가 포함돼 있던 옛 판 기준 실측·검증 기록이다 |
 | 환경 | macOS arm64, Herdr 0.9.3. Git 설치는 GJC 0.18.7(격리 HOME과 실제 사용자 환경)에서 검증. 이전 MVP 검증은 GJC 0.18.6 격리 환경 |
 | Git 설치 (v0.1.2·v0.1.3) | 격리 HOME과 실제 사용자 환경 모두: 당시 tag(`#v0.1.2`, 사용자 환경은 `#v0.1.3`까지)의 한 줄 명령으로 설치·실제 로드·token 발행·`/rename` 갱신·정상 종료 clear·제거 후 native-only 실행(plugin token 없음)·재설치 확인. 두 환경 모두 설치된 `dist/extension.js`가 commit된 파일과 동일(sha256) |
 | metadata | 모델 변경, `/rename` 갱신, native·다른 source의 키 보존, 오래된 seq 거부 확인 |
 | 실제 sidebar | 사용자 설정에서 native 행을 보존하고 두 custom 행 추가. 사용자 제공 화면으로 최종 표시 확인 |
-| provider | 기존 `cliproxyapi/glm-5.3`과 사용자 기본 모델 `cliproxyapi/gpt-6.1-sol` 각각 인증·실제 추론 1회 성공 |
+| provider | 기존 provider 경로 두 개 각각 인증·실제 추론 1회 성공 |
 | 프롬프트 전달 (0.2.0) | GJC 0.18.7·Herdr 0.9.3, 격리 plugin registry에 설치한 로컬 build로 두 pane 실제 확인: `/herdr-send`(수락)·`--wait`+agent 이름(완료)·모델의 `herdr_send` 도구 호출·`--raw` 각각 받는 쪽 실제 응답, GJC가 종료된 shell pane 대상은 무전송 오류, 세 token 발행·정상 종료 clear. 작업 중 대상의 추가 프롬프트 처리와 다른 cwd에서의 session ID 지정 전달은 공식 CLI로 확인. 실제 사용자 환경의 `#v0.2.0` Git 설치본(같은 dist sha256)으로는 로드·session ID token·자기 전송 거절·입력 오류 처리·정상 종료 clear까지 확인했고, 두 pane 실제 전달은 다시 하지 않음 |
 | 최신 설치·업데이트 | 격리 registry에서 tag 없는 명령이 `main`(= `v0.2.0` commit)을 설치함을 확인. 이전 commit에 고정된 설치는 같은 명령 재실행·`--force`로 바뀌지 않고, 제거 후 설치하면 최신으로 바뀜을 확인(다른 plugin 유지) |
 | marketplace 설치 (미지원) | GJC 0.18.7에서 실험됨: `.claude-plugin/marketplace.json` catalog로 `marketplace add`·`discover`·`install`·`uninstall`은 동작하지만, marketplace 설치는 `plugins/cache/plugins/…` 복사본으로만 존재하고 session의 extension loader는 `plugins/package.json` + `plugins/node_modules`만 읽어서 `gjc.extensions`가 로드되지 않음(같은 격리 root에서 git 설치 대조군은 token 발행). catalog는 되돌림(22d8076). 근거 `.local/verification/marketplace-20261006/`

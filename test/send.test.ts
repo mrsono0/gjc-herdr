@@ -15,6 +15,7 @@ import {
 	deliverPrompt,
 	deliverViaHc,
 	describeResult,
+	HC_DONE_NON_ATOMIC_NOTE,
 	HC_SEND_NOTE,
 	parseCommandArgs,
 	registerSendFeatures,
@@ -65,11 +66,25 @@ test("command arguments keep everything after the target separator verbatim", ()
 });
 
 // ============================================================================
-// #86 3b: hc backend send tests (boundaries 1, 2, 3, 4, 6)
+// #86 3b & #101 r1: hc backend send tests (boundaries 1, 2, 3, 4, 6 + preflight get)
 // ============================================================================
 
 const HC_CALLER = "t1";
 const HC_TARGET = "t2";
+
+function hcGetPayload(
+	address: string,
+	overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
+	return {
+		address,
+		state: "live",
+		reported: true,
+		turn: 4,
+		status: { state: "idle", kind: null, msg: "idle" },
+		...overrides,
+	};
+}
 
 function hcWaitPayload(
 	terminal: string,
@@ -149,9 +164,10 @@ function fakeHcSendExec(routes: Record<string, Handler>) {
 }
 
 test("hc send boundary 1: default, --raw, --wait, and --raw --wait execute one hc send with --if idle, 0 Enter, 0 screen read, and classify SendResult & 2x9 error kinds", async () => {
-	// Default and --raw both run `hc send --json --if idle t2 <text>` once
+	// Default and --raw both preflight with `hc get --json t2` then run `hc send --json --if idle t2 <text>` once
 	for (const raw of [false, true]) {
 		const { deps, calls } = fakeHcSendExec({
+			"hc get": () => ok(hcGetPayload(HC_TARGET)),
 			"hc send": () => ok(hcSendPayload()),
 		});
 		const res = await deliverPrompt(
@@ -164,8 +180,9 @@ test("hc send boundary 1: default, --raw, --wait, and --raw --wait execute one h
 			status: "sent",
 			pane: HC_TARGET,
 		});
-		assert.equal(calls.length, 1);
-		assert.deepEqual(calls[0]?.args, [
+		assert.equal(calls.length, 2);
+		assert.deepEqual(calls[0]?.args, ["get", "--json", HC_TARGET]);
+		assert.deepEqual(calls[1]?.args, [
 			"send",
 			"--json",
 			"--if",
@@ -173,12 +190,15 @@ test("hc send boundary 1: default, --raw, --wait, and --raw --wait execute one h
 			HC_TARGET,
 			"hello hc",
 		]);
-		assert.match(describeResult(res), new RegExp(HC_SEND_NOTE));
+		const formatted = describeResult(res);
+		assert.match(formatted, new RegExp(HC_SEND_NOTE));
+		assert.equal(formatted.includes(HC_DONE_NON_ATOMIC_NOTE), false);
 	}
 
 	// --wait and --raw --wait are both allowed on hc and run `hc send --json --if idle --wait --timeout 60 t2 <text>` once
 	for (const raw of [false, true]) {
 		const { deps, calls } = fakeHcSendExec({
+			"hc get": () => ok(hcGetPayload(HC_TARGET)),
 			"hc send": () =>
 				ok(
 					hcSendPayload({
@@ -207,8 +227,9 @@ test("hc send boundary 1: default, --raw, --wait, and --raw --wait execute one h
 				turn: 5,
 			},
 		});
-		assert.equal(calls.length, 1);
-		assert.deepEqual(calls[0]?.args, [
+		assert.equal(calls.length, 2);
+		assert.deepEqual(calls[0]?.args, ["get", "--json", HC_TARGET]);
+		assert.deepEqual(calls[1]?.args, [
 			"send",
 			"--json",
 			"--if",
@@ -219,7 +240,9 @@ test("hc send boundary 1: default, --raw, --wait, and --raw --wait execute one h
 			HC_TARGET,
 			"wait hc",
 		]);
-		assert.match(describeResult(res), /turn completed.*status=done, ended=true, turn=5/);
+		const formatted = describeResult(res);
+		assert.match(formatted, /turn completed.*status=done, ended=true, turn=5/);
+		assert.equal(formatted.includes(HC_DONE_NON_ATOMIC_NOTE), false);
 	}
 
 	// SendResult optional field variations (started true/false/null/omitted, status null/omitted) succeed when not waiting
@@ -230,6 +253,7 @@ test("hc send boundary 1: default, --raw, --wait, and --raw --wait execute one h
 		{ turn: 4 },
 	]) {
 		const { deps, calls } = fakeHcSendExec({
+			"hc get": () => ok(hcGetPayload(HC_TARGET)),
 			"hc send": () => ok(payload),
 		});
 		const res = await deliverPrompt(
@@ -239,7 +263,8 @@ test("hc send boundary 1: default, --raw, --wait, and --raw --wait execute one h
 		assert.equal(res.ok, true);
 		assert.equal(res.mode, "hc");
 		assert.equal(res.status, "sent");
-		assert.equal(calls.length, 1);
+		assert.equal(calls.length, 2);
+		assert.equal(calls.filter((c) => c.args[0] === "send").length, 1);
 	}
 
 	// Malformed SendResult (invalid JSON, missing/negative turn, invalid started/status) -> uncertain, 1 send
@@ -251,6 +276,7 @@ test("hc send boundary 1: default, --raw, --wait, and --raw --wait execute one h
 		JSON.stringify({ turn: 4, status: 123 }),
 	]) {
 		const { deps, calls } = fakeHcSendExec({
+			"hc get": () => ok(hcGetPayload(HC_TARGET)),
 			"hc send": () => ({ code: 0, stdout: badStdout }),
 		});
 		const res = await deliverPrompt(
@@ -260,12 +286,14 @@ test("hc send boundary 1: default, --raw, --wait, and --raw --wait execute one h
 		assert.equal(res.ok, false, badStdout);
 		assert.equal(res.mode, "hc", badStdout);
 		assert.equal(res.status, "uncertain", badStdout);
-		assert.equal(calls.length, 1, badStdout);
+		assert.equal(calls.length, 2, badStdout);
+		assert.equal(calls.filter((c) => c.args[0] === "send").length, 1, badStdout);
 	}
 
 	// Valid turn + malformed nested wait -> status="sent", ok=false, no waited, 1 send, 0 resends (both wait=true and wait=false)
 	for (const waitRequested of [true, false]) {
 		const { deps, calls } = fakeHcSendExec({
+			"hc get": () => ok(hcGetPayload(HC_TARGET)),
 			"hc send": () => ({
 				code: 0,
 				stdout: JSON.stringify({ turn: 4, wait: "invalid" }),
@@ -284,7 +312,7 @@ test("hc send boundary 1: default, --raw, --wait, and --raw --wait execute one h
 			res.error,
 			"text delivered; wait result invalid; completion unconfirmed; do not resend",
 		);
-		assert.equal(calls.length, 1);
+		assert.equal(calls.length, 2);
 		assert.equal(calls.filter((c) => c.args[0] === "send").length, 1);
 		const formatted = describeResult(res);
 		assert.match(formatted, /status: sent/);
@@ -302,6 +330,7 @@ test("hc send boundary 1: default, --raw, --wait, and --raw --wait execute one h
 	for (const useDataKind of [false, true]) {
 		for (const kind of all9Kinds) {
 			const { deps, calls } = fakeHcSendExec({
+				"hc get": () => ok(hcGetPayload(HC_TARGET)),
 				"hc send": () =>
 					hcErrorResult(kind, "SECRET_RAW_STDERR_MSG", useDataKind),
 			});
@@ -315,7 +344,8 @@ test("hc send boundary 1: default, --raw, --wait, and --raw --wait execute one h
 			assert.equal(res.ok, false);
 			assert.equal(res.mode, "hc");
 			assert.equal(res.status, expectedStatus, `kind=${kind}`);
-			assert.equal(calls.length, 1);
+			assert.equal(calls.length, 2);
+			assert.equal(calls.filter((c) => c.args[0] === "send").length, 1);
 			assert.equal(describeResult(res).includes("SECRET_RAW_STDERR_MSG"), false);
 		}
 	}
@@ -328,6 +358,7 @@ test("hc send boundary 1: default, --raw, --wait, and --raw --wait execute one h
 		"plain stderr failure",
 	]) {
 		const { deps, calls } = fakeHcSendExec({
+			"hc get": () => ok(hcGetPayload(HC_TARGET)),
 			"hc send": () => ({ code: 1, stderr: badStderr }),
 		});
 		const res = await deliverPrompt(
@@ -336,7 +367,8 @@ test("hc send boundary 1: default, --raw, --wait, and --raw --wait execute one h
 		);
 		assert.equal(res.ok, false);
 		assert.equal(res.status, "uncertain");
-		assert.equal(calls.length, 1);
+		assert.equal(calls.length, 2);
+		assert.equal(calls.filter((c) => c.args[0] === "send").length, 1);
 	}
 });
 
@@ -348,6 +380,7 @@ test("hc send boundary 2: --wait separates delivery (status=sent) from waited ou
 		["not_started", "idle"],
 	] as const) {
 		const { deps, calls } = fakeHcSendExec({
+			"hc get": () => ok(hcGetPayload(HC_TARGET)),
 			"hc send": () =>
 				ok(
 					hcSendPayload({
@@ -375,7 +408,8 @@ test("hc send boundary 2: --wait separates delivery (status=sent) from waited ou
 			ended: false,
 			turn: reason === "not_started" ? 4 : 5,
 		});
-		assert.equal(calls.length, 1, reason);
+		assert.equal(calls.length, 2, reason);
+		assert.equal(calls.filter((c) => c.args[0] === "send").length, 1, reason);
 		const formatted = describeResult(res);
 		assert.match(formatted, /status: sent/);
 		assert.match(formatted, new RegExp(`reason=${reason}`));
@@ -389,6 +423,7 @@ test("hc send boundary 2: --wait separates delivery (status=sent) from waited ou
 		'{"turn":4,"started":false,"wait":null}',
 	]) {
 		const { deps, calls } = fakeHcSendExec({
+			"hc get": () => ok(hcGetPayload(HC_TARGET)),
 			"hc send": () => ({ code: 0, stdout: rawNoWait }),
 		});
 		const res = await deliverPrompt(
@@ -405,7 +440,8 @@ test("hc send boundary 2: --wait separates delivery (status=sent) from waited ou
 			"start was not observed; no wait result; completion unconfirmed",
 			rawNoWait,
 		);
-		assert.equal(calls.length, 1, rawNoWait);
+		assert.equal(calls.length, 2, rawNoWait);
+		assert.equal(calls.filter((c) => c.args[0] === "send").length, 1, rawNoWait);
 		const formatted = describeResult(res);
 		assert.match(formatted, /status: sent/);
 		assert.equal(
@@ -421,6 +457,7 @@ test("hc send boundary 2: --wait separates delivery (status=sent) from waited ou
 	// blocked, error, exit -> ok=false, status="sent", waited preserved and displayed in describeResult
 	{
 		const { deps: blockedDeps } = fakeHcSendExec({
+			"hc get": () => ok(hcGetPayload(HC_TARGET)),
 			"hc send": () =>
 				ok(
 					hcSendPayload({
@@ -448,6 +485,7 @@ test("hc send boundary 2: --wait separates delivery (status=sent) from waited ou
 		assert.match(describeResult(blockedRes), /status=blocked/);
 
 		const { deps: errorDeps } = fakeHcSendExec({
+			"hc get": () => ok(hcGetPayload(HC_TARGET)),
 			"hc send": () =>
 				ok(
 					hcSendPayload({
@@ -475,6 +513,7 @@ test("hc send boundary 2: --wait separates delivery (status=sent) from waited ou
 		assert.match(describeResult(errorRes), /status=error/);
 
 		const { deps: exitDeps } = fakeHcSendExec({
+			"hc get": () => ok(hcGetPayload(HC_TARGET)),
 			"hc send": () =>
 				ok(
 					hcSendPayload({
@@ -509,6 +548,7 @@ test("hc send boundary 2: --wait separates delivery (status=sent) from waited ou
 	// Turn non-advance (turn <= send.turn) or mismatched terminal -> ok=false, status="sent"
 	{
 		const { deps } = fakeHcSendExec({
+			"hc get": () => ok(hcGetPayload(HC_TARGET)),
 			"hc send": () =>
 				ok(
 					hcSendPayload({
@@ -531,6 +571,7 @@ test("hc send boundary 2: --wait separates delivery (status=sent) from waited ou
 		assert.equal(res.waited?.turn, 4);
 
 		const { deps: mismatchDeps } = fakeHcSendExec({
+			"hc get": () => ok(hcGetPayload(HC_TARGET)),
 			"hc send": () =>
 				ok(
 					hcSendPayload({
@@ -568,6 +609,7 @@ test("hc send boundary 3 & 4: allows remote addresses, refuses self (ID and name
 					hidden_finished: 0,
 					machines: [],
 				}),
+			"hc get": (args) => ok(hcGetPayload(args[2]!)),
 			"hc send": () => ok(hcSendPayload()),
 		});
 		const directRemote = await deliverPrompt(
@@ -580,8 +622,9 @@ test("hc send boundary 3 & 4: allows remote addresses, refuses self (ID and name
 			status: "sent",
 			pane: "rohan/t7",
 		});
-		assert.equal(calls.length, 1);
-		assert.equal(calls[0]?.args[4], "rohan/t7");
+		assert.equal(calls.length, 2);
+		assert.deepEqual(calls[0]?.args, ["get", "--json", "rohan/t7"]);
+		assert.equal(calls[1]?.args[4], "rohan/t7");
 
 		const namedRemote = await deliverPrompt(
 			deps,
@@ -593,7 +636,7 @@ test("hc send boundary 3 & 4: allows remote addresses, refuses self (ID and name
 			status: "sent",
 			pane: "rohan/t7",
 		});
-		assert.equal(calls.length, 3); // 1 direct send + 1 ls + 1 send
+		assert.equal(calls.length, 5); // 2 direct (get+send) + 3 named (ls+get+send)
 
 		// Remote "rohan/t1" is distinct from local caller "t1"
 		const remoteSameNum = await deliverPrompt(
@@ -657,6 +700,7 @@ test("hc send boundary 3 & 4: allows remote addresses, refuses self (ID and name
 	{
 		let sentArgs: string[] = [];
 		const { deps } = fakeHcSendExec({
+			"hc get": () => ok(hcGetPayload(HC_TARGET)),
 			"hc send": (args) => {
 				sentArgs = args;
 				return ok(hcSendPayload());
@@ -672,7 +716,7 @@ test("hc send boundary 3 & 4: allows remote addresses, refuses self (ID and name
 		assert.equal(sentArgs[sentArgs.length - 1], complexText);
 	}
 
-	// Lookup elapsed time reduces send --wait timeout budget; < 1ms remaining before send returns not_sent
+	// Lookup elapsed time reduces send --wait timeout budget; < 1ms remaining before get/send returns not_sent
 	{
 		let sendArgs: string[] = [];
 		let sendExecTimeout: number | undefined;
@@ -685,6 +729,7 @@ test("hc send boundary 3 & 4: allows remote addresses, refuses self (ID and name
 					machines: [],
 				});
 			},
+			"hc get": () => ok(hcGetPayload(HC_TARGET)),
 			"hc send": (args, options) => {
 				sendArgs = args;
 				sendExecTimeout = options?.timeout;
@@ -789,6 +834,18 @@ test("hc send boundary 6: registerSendFeatures with hc backend verifies descript
 			assertExecTimeout(options?.timeout);
 			assert.equal(command, "/custom/hc", "must use custom hcBin and never fall back to herdr or gjc");
 			execCalls.push({ command, args });
+			if (args[0] === "get") {
+				return {
+					stdout: JSON.stringify(
+						hcGetPayload(args[2]!, {
+							status: { state: "idle", kind: null, msg: "SECRET_STATUS_MSG_888" },
+						}),
+					),
+					stderr: "",
+					code: 0,
+					killed: false,
+				};
+			}
 			return {
 				stdout: "",
 				stderr: "",
@@ -824,6 +881,8 @@ test("hc send boundary 6: registerSendFeatures with hc backend verifies descript
 
 	assert.equal(commandDesc.includes(HC_SEND_NOTE), true);
 	assert.equal(toolDesc.includes(HC_SEND_NOTE), true);
+	assert.match(commandDesc, /idle.*done.*not atomic/i);
+	assert.match(toolDesc, /idle.*done.*not atomic/i);
 
 	const headlessCtx = {
 		hasUI: false,
@@ -842,9 +901,11 @@ test("hc send boundary 6: registerSendFeatures with hc backend verifies descript
 		}),
 	);
 	await commandHandler!(`--raw --wait ${HC_TARGET} SECRET_PROMPT_TEXT_777`, headlessCtx);
-	assert.equal(execCalls.length, 1);
+	assert.equal(execCalls.length, 2);
 	assert.equal(execCalls[0]?.command, "/custom/hc");
-	assert.deepEqual(execCalls[0]?.args, [
+	assert.deepEqual(execCalls[0]?.args, ["get", "--json", HC_TARGET]);
+	assert.equal(execCalls[1]?.command, "/custom/hc");
+	assert.deepEqual(execCalls[1]?.args, [
 		"send",
 		"--json",
 		"--if",
@@ -861,12 +922,13 @@ test("hc send boundary 6: registerSendFeatures with hc backend verifies descript
 	assert.equal(logs[0]!.includes(HC_SEND_NOTE), true);
 	assert.equal(logs[0]!.includes(HC_TARGET), false);
 
-	// Remote address via /herdr-send command -> stub exec argv gets remote address once, logger has neither address nor machine name
+	// Remote address via /herdr-send command -> stub exec argv gets remote address once each in get & send, logger has neither address nor machine name
 	currentSendResult = ok(hcSendPayload());
 	await commandHandler!("rohan/t7 SECRET_PROMPT_TEXT_777", headlessCtx);
-	assert.equal(execCalls.length, 2);
+	assert.equal(execCalls.length, 4);
+	assert.deepEqual(execCalls[2]?.args, ["get", "--json", "rohan/t7"]);
 	assert.equal(
-		execCalls[1]?.args.filter((arg) => arg === "rohan/t7").length,
+		execCalls[3]?.args.filter((arg) => arg === "rohan/t7").length,
 		1,
 	);
 	assert.equal(logs.length, 2);
@@ -998,13 +1060,15 @@ test("hc send migrated boundaries: rejects invalid requests and failed name look
 		() => new Error("spawn EIO"),
 	]) {
 		const { deps, calls } = fakeHcSendExec({
+			"hc get": () => ok(hcGetPayload(HC_TARGET)),
 			"hc send": sendImpl,
 		});
 		const res = await deliverViaHc(deps, { pane: HC_TARGET, text: "uncertain send" });
 		assert.equal(res.ok, false);
 		assert.equal(res.mode, "hc");
 		assert.equal(res.status, "uncertain");
-		assert.equal(calls.length, 1);
+		assert.equal(calls.length, 2);
+		assert.equal(calls.filter((c) => c.args[0] === "send").length, 1);
 	}
 
 	// registerSendFeatures: invalid command flag surfaces USAGE via warn log (0 execs), and tool execute returns ok/sent
@@ -1028,6 +1092,14 @@ test("hc send migrated boundaries: rejects invalid requests and failed name look
 			exec: async (command: string, args: string[], options: ExecOptions) => {
 				assertExecTimeout(options?.timeout);
 				execCalls.push({ command, args });
+				if (args[0] === "get") {
+					return {
+						stdout: JSON.stringify(hcGetPayload(args[2]!)),
+						stderr: "",
+						code: 0,
+						killed: false,
+					};
+				}
 				return { stdout: JSON.stringify(hcSendPayload()), stderr: "", code: 0, killed: false };
 			},
 			logger: {
@@ -1062,7 +1134,9 @@ test("hc send migrated boundaries: rejects invalid requests and failed name look
 			pane: HC_TARGET,
 			text: "hello tool",
 		});
-		assert.equal(execCalls.length, 1);
+		assert.equal(execCalls.length, 2);
+		assert.deepEqual(execCalls[0]?.args, ["get", "--json", HC_TARGET]);
+		assert.equal(execCalls[1]?.args[0], "send");
 		assert.equal(toolRes.isError, false);
 		assert.deepEqual(toolRes.details, {
 			ok: true,
@@ -1071,5 +1145,276 @@ test("hc send migrated boundaries: rejects invalid requests and failed name look
 			pane: HC_TARGET,
 		});
 		assert.equal(toolRes.content[0]?.text.includes(HC_SEND_NOTE), true);
+	}
+});
+
+test("hc send preflight get: idle uses --if idle, done omits --if with non-atomic note, non-ready/failed get returns not_sent with 0 sends, and done send errors/wait/remote behave cleanly", async () => {
+	// 1. Preflight idle -> hc send with --if idle, no non-atomic caveat
+	{
+		const { deps, calls } = fakeHcSendExec({
+			"hc get": () => ok(hcGetPayload(HC_TARGET, { status: { state: "idle", kind: null } })),
+			"hc send": () => ok(hcSendPayload()),
+		});
+		const res = await deliverViaHc(deps, { pane: HC_TARGET, text: "idle msg" });
+		assert.deepEqual(res, {
+			ok: true,
+			mode: "hc",
+			status: "sent",
+			pane: HC_TARGET,
+		});
+		assert.equal(calls.length, 2);
+		assert.deepEqual(calls[0]?.args, ["get", "--json", HC_TARGET]);
+		assert.deepEqual(calls[1]?.args, ["send", "--json", "--if", "idle", HC_TARGET, "idle msg"]);
+		assert.equal(describeResult(res).includes(HC_DONE_NON_ATOMIC_NOTE), false);
+	}
+
+	// 2. Preflight done -> hc send omits --if, sets nonAtomicDone, and appends non-atomic caveat
+	{
+		const { deps, calls } = fakeHcSendExec({
+			"hc get": () => ok(hcGetPayload(HC_TARGET, { status: { state: "done", kind: null } })),
+			"hc send": () => ok(hcSendPayload()),
+		});
+		const res = await deliverViaHc(deps, { pane: HC_TARGET, text: "done msg" });
+		assert.deepEqual(res, {
+			ok: true,
+			mode: "hc",
+			status: "sent",
+			pane: HC_TARGET,
+			nonAtomicDone: true,
+		});
+		assert.equal(calls.length, 2);
+		assert.deepEqual(calls[0]?.args, ["get", "--json", HC_TARGET]);
+		assert.deepEqual(calls[1]?.args, ["send", "--json", HC_TARGET, "done msg"]);
+		assert.equal(calls[1]?.args.includes("--if"), false);
+		const formatted = describeResult(res);
+		assert.equal(formatted.includes(HC_SEND_NOTE), true);
+		assert.equal(formatted.includes(HC_DONE_NON_ATOMIC_NOTE), true);
+	}
+
+	// 3. Non-ready preflight states (finished, reported=false, working, blocked, error, unknown/null) -> not_sent, 0 sends
+	for (const [label, payload, expectedPattern] of [
+		["finished", hcGetPayload(HC_TARGET, { state: "finished" }), /finished/i],
+		[
+			"reported=false",
+			hcGetPayload(HC_TARGET, { reported: false, status: { state: "idle", kind: null } }),
+			/not reported/i,
+		],
+		[
+			"working",
+			hcGetPayload(HC_TARGET, { status: { state: "working", kind: null } }),
+			/working/i,
+		],
+		[
+			"blocked",
+			hcGetPayload(HC_TARGET, { status: { state: "blocked", kind: null } }),
+			/blocked/i,
+		],
+		[
+			"error",
+			hcGetPayload(HC_TARGET, { status: { state: "error", kind: null } }),
+			/error/i,
+		],
+		[
+			"unknown_state",
+			hcGetPayload(HC_TARGET, { status: { state: "paused", kind: null } }),
+			/unknown/i,
+		],
+		["null_status", hcGetPayload(HC_TARGET, { status: null }), /unknown/i],
+	] as const) {
+		const { deps, calls } = fakeHcSendExec({
+			"hc get": () => ok(payload),
+		});
+		const res = await deliverViaHc(deps, { pane: HC_TARGET, text: `skip ${label}` });
+		assert.equal(res.ok, false, label);
+		assert.equal(res.mode, "hc", label);
+		assert.equal(res.status, "not_sent", label);
+		assert.equal(res.pane, HC_TARGET, label);
+		assert.equal(res.nonAtomicDone, undefined, label);
+		assert.match(res.error ?? "", expectedPattern, label);
+		assert.equal(calls.length, 1, label);
+		assert.equal(calls[0]?.args[0], "get", label);
+		assert.equal(calls.filter((c) => c.args[0] === "send").length, 0, label);
+		const formatted = describeResult(res);
+		assert.match(formatted, expectedPattern, label);
+		assert.equal(formatted.includes(HC_DONE_NON_ATOMIC_NOTE), false, label);
+	}
+
+	// 4. Preflight hc get failures (error kind, plain stderr, killed, throw, invalid JSON, budget exhausted during get) -> not_sent, 0 sends, 0 secret leakage
+	for (const [label, getImpl] of [
+		["not_found", () => hcErrorResult("not_found", "SECRET_GET_ERR_123")],
+		["plain_err", () => ({ code: 1, stderr: "SECRET_GET_ERR_123" })],
+		["killed", () => ({ code: 1, killed: true, stderr: "SECRET_GET_ERR_123" })],
+		["throw", () => new Error("SECRET_GET_ERR_123")],
+		["bad_json", () => ({ code: 0, stdout: "not-json" })],
+	] as const) {
+		const { deps, calls } = fakeHcSendExec({
+			"hc get": getImpl,
+		});
+		const res = await deliverViaHc(deps, { pane: HC_TARGET, text: `get fail ${label}` });
+		assert.equal(res.ok, false, label);
+		assert.equal(res.status, "not_sent", label);
+		assert.equal(calls.length, 1, label);
+		assert.equal(calls.filter((c) => c.args[0] === "send").length, 0, label);
+		const formatted = describeResult(res);
+		assert.equal(formatted.includes("SECRET_GET_ERR_123"), false, label);
+		assert.equal(formatted.includes(HC_DONE_NON_ATOMIC_NOTE), false, label);
+	}
+	{
+		const { deps, calls, advance } = fakeHcSendExec({
+			"hc get": () => {
+				advance(60_000);
+				return ok(hcGetPayload(HC_TARGET, { status: { state: "done", kind: null } }));
+			},
+		});
+		const res = await deliverViaHc(deps, { pane: HC_TARGET, text: "budget out after get" });
+		assert.equal(res.ok, false);
+		assert.equal(res.status, "not_sent");
+		assert.equal(res.error, "Send budget exhausted before hc send.");
+		assert.equal(calls.length, 1);
+		assert.equal(calls.filter((c) => c.args[0] === "send").length, 0);
+	}
+
+	// 5. Preflight done -> Core pre-input rejection (blocked/finished) returns not_sent without nonAtomicDone; uncertain (killed/timeout/unavailable) returns uncertain with 0 resend and non-atomic note
+	for (const preInputKind of ["blocked", "finished"] as const) {
+		const { deps, calls } = fakeHcSendExec({
+			"hc get": () => ok(hcGetPayload(HC_TARGET, { status: { state: "done", kind: null } })),
+			"hc send": () => hcErrorResult(preInputKind, "SECRET_SEND_MSG"),
+		});
+		const res = await deliverViaHc(deps, { pane: HC_TARGET, text: `done ${preInputKind}` });
+		assert.equal(res.ok, false, preInputKind);
+		assert.equal(res.status, "not_sent", preInputKind);
+		assert.equal(res.nonAtomicDone, undefined, preInputKind);
+		assert.equal(calls.length, 2, preInputKind);
+		assert.equal(calls[1]?.args.includes("--if"), false, preInputKind);
+		assert.equal(calls.filter((c) => c.args[0] === "send").length, 1, preInputKind);
+		const formatted = describeResult(res);
+		assert.equal(formatted.includes("SECRET_SEND_MSG"), false, preInputKind);
+		assert.equal(formatted.includes(HC_DONE_NON_ATOMIC_NOTE), false, preInputKind);
+	}
+	for (const [label, sendImpl] of [
+		["killed", () => ({ code: 1, killed: true, stderr: "" })],
+		["unavailable", () => hcErrorResult("unavailable", "SECRET_SEND_MSG")],
+		["throw", () => new Error("socket closed")],
+	] as const) {
+		const { deps, calls } = fakeHcSendExec({
+			"hc get": () => ok(hcGetPayload(HC_TARGET, { status: { state: "done", kind: null } })),
+			"hc send": sendImpl,
+		});
+		const res = await deliverViaHc(deps, { pane: HC_TARGET, text: `done ${label}` });
+		assert.equal(res.ok, false, label);
+		assert.equal(res.status, "uncertain", label);
+		assert.equal(res.nonAtomicDone, true, label);
+		assert.equal(calls.length, 2, label);
+		assert.equal(calls.filter((c) => c.args[0] === "send").length, 1, label);
+		const formatted = describeResult(res);
+		assert.match(formatted, /Do not resend/, label);
+		assert.equal(formatted.includes(HC_DONE_NON_ATOMIC_NOTE), true, label);
+	}
+
+	// 6. --wait with done target separates delivery (status=sent) from waited outcome
+	{
+		const { deps, calls } = fakeHcSendExec({
+			"hc get": () => ok(hcGetPayload(HC_TARGET, { status: { state: "done", kind: null } })),
+			"hc send": () =>
+				ok(
+					hcSendPayload({
+						wait: hcWaitPayload(HC_TARGET, {
+							ended: true,
+							reason: "status",
+							status: "done",
+							turn: 5,
+						}),
+					}),
+				),
+		});
+		const okWait = await deliverViaHc(deps, {
+			pane: HC_TARGET,
+			text: "done wait ok",
+			wait: true,
+		});
+		assert.deepEqual(okWait, {
+			ok: true,
+			mode: "hc",
+			status: "sent",
+			pane: HC_TARGET,
+			nonAtomicDone: true,
+			waited: {
+				reason: "status",
+				status: "done",
+				ended: true,
+				turn: 5,
+			},
+		});
+		assert.deepEqual(calls[1]?.args, [
+			"send",
+			"--json",
+			"--wait",
+			"--timeout",
+			"60",
+			HC_TARGET,
+			"done wait ok",
+		]);
+		const formattedOk = describeResult(okWait);
+		assert.match(formattedOk, /turn completed.*status=done, ended=true, turn=5/);
+		assert.equal(formattedOk.includes(HC_DONE_NON_ATOMIC_NOTE), true);
+
+		const { deps: timeoutDeps, calls: timeoutCalls } = fakeHcSendExec({
+			"hc get": () => ok(hcGetPayload(HC_TARGET, { status: { state: "done", kind: null } })),
+			"hc send": () =>
+				ok(
+					hcSendPayload({
+						wait: hcWaitPayload(HC_TARGET, {
+							ended: false,
+							reason: "timeout",
+							status: "working",
+							turn: 5,
+						}),
+					}),
+				),
+		});
+		const timeoutWait = await deliverViaHc(timeoutDeps, {
+			pane: HC_TARGET,
+			text: "done wait timeout",
+			wait: true,
+		});
+		assert.equal(timeoutWait.ok, false);
+		assert.equal(timeoutWait.status, "sent");
+		assert.equal(timeoutWait.nonAtomicDone, true);
+		assert.deepEqual(timeoutWait.waited, {
+			reason: "timeout",
+			status: "working",
+			ended: false,
+			turn: 5,
+		});
+		assert.equal(timeoutCalls.filter((c) => c.args[0] === "send").length, 1);
+		const formattedTimeout = describeResult(timeoutWait);
+		assert.match(formattedTimeout, /status: sent/);
+		assert.match(formattedTimeout, /reason=timeout/);
+		assert.doesNotMatch(formattedTimeout, /turn completed/);
+		assert.equal(formattedTimeout.includes(HC_DONE_NON_ATOMIC_NOTE), true);
+	}
+
+	// 7. Remote address target (rohan/t7) preflights hc get once then sends (including done without --if)
+	{
+		const { deps, calls } = fakeHcSendExec({
+			"hc get": (args) =>
+				ok(hcGetPayload(args[2]!, { status: { state: "done", kind: null } })),
+			"hc send": () => ok(hcSendPayload()),
+		});
+		const remoteDone = await deliverViaHc(deps, {
+			pane: "rohan/t7",
+			text: "remote done msg",
+		});
+		assert.deepEqual(remoteDone, {
+			ok: true,
+			mode: "hc",
+			status: "sent",
+			pane: "rohan/t7",
+			nonAtomicDone: true,
+		});
+		assert.equal(calls.length, 2);
+		assert.deepEqual(calls[0]?.args, ["get", "--json", "rohan/t7"]);
+		assert.deepEqual(calls[1]?.args, ["send", "--json", "rohan/t7", "remote done msg"]);
+		assert.equal(describeResult(remoteDone).includes(HC_DONE_NON_ATOMIC_NOTE), true);
 	}
 });

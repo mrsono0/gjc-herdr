@@ -965,7 +965,8 @@ export function parseWaitFacts(raw: unknown): {
 }
 
 /**
- * Executes `hc send --json --if idle [--wait --timeout <sec>] <addr> <text>`.
+ * Executes `hc send --json [--if idle] [--wait --timeout <sec>] <addr> <text>`.
+ * Includes `--if idle` by default; omits `--if idle` only when `options.ifIdle === false`.
  * Rejects text starting with `-` before spawning (no `--` insertion).
  * Never uses `--force` and never sends extra keys.
  */
@@ -973,7 +974,7 @@ export async function hcSend(
 	deps: HcExecDeps,
 	address: string,
 	text: string,
-	options: { wait?: boolean; timeoutSec?: number },
+	options: { wait?: boolean; timeoutSec?: number; ifIdle?: boolean },
 	timeoutMs: number,
 	signal?: AbortSignal,
 ): Promise<HcSendOutcome> {
@@ -986,7 +987,10 @@ export async function hcSend(
 		};
 	}
 
-	const args = ["send", "--json", "--if", "idle"];
+	const args = ["send", "--json"];
+	if (options.ifIdle !== false) {
+		args.push("--if", "idle");
+	}
 	if (options.wait) {
 		const sec = Math.max(1, Math.ceil(options.timeoutSec ?? 1));
 		args.push("--wait", "--timeout", String(sec));

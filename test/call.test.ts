@@ -6,6 +6,7 @@ import {
 	callRegisteredAgent,
 	callViaHc,
 	describeCallResult,
+	HC_CALL_BACKEND_NOTE,
 	parseCallCommandArgs,
 	registerCallFeatures,
 	USAGE,
@@ -15,6 +16,7 @@ import {
 	type ResultFileReadResult,
 	type ResultFileStat,
 } from "../src/call.ts";
+import { HC_DONE_NON_ATOMIC_NOTE } from "../src/send.ts";
 
 type ExecOptions = Parameters<ExtensionAPI["exec"]>[2];
 const timeoutViolations: string[] = [];
@@ -652,8 +654,8 @@ test("hc boundary 2: WaitResult validation (malformed wait, terminal mismatch, t
 	}
 });
 
-test("hc boundary 2: preflight hc get states (finished, reported=false, done, working, blocked, error) and post-send blocked, error, exit, and follow-up wait failure (including needs_target)", async () => {
-	// Preflight state="finished", reported=false, status.state="done"|"working"|"blocked"|"error" -> all rejected before hc send
+test("hc boundary 2: preflight hc get states (finished, reported=false, working, blocked, error rejected; done allowed without --if) and post-send blocked, error, exit, and follow-up wait failure (including needs_target)", async () => {
+	// Preflight state="finished", reported=false, status.state="working"|"blocked"|"error" -> all rejected before hc send
 	const preflightCases: Array<{
 		terminal: Record<string, unknown>;
 		expectedCode: string;
@@ -666,11 +668,6 @@ test("hc boundary 2: preflight hc get states (finished, reported=false, done, wo
 		{
 			terminal: hcTerminalJson(HC_TARGET_ID, null, { reported: false }),
 			expectedCode: "not_reported",
-		},
-		{
-			terminal: hcTerminalJson(HC_TARGET_ID, "done"),
-			expectedCode: "agent_done",
-			expectedMessage: /target finished its last turn; a new turn needs idle/,
 		},
 		{
 			terminal: hcTerminalJson(HC_TARGET_ID, "working"),
@@ -701,6 +698,36 @@ test("hc boundary 2: preflight hc get states (finished, reported=false, done, wo
 			assert.match(res.error?.message ?? "", expectedMessage);
 		}
 		assert.equal(calls.filter((c) => c.args[0] === "send").length, 0);
+	}
+
+	// Preflight status.state="done" is allowed (omits --if, recovers answer, surfaces non-atomic note)
+	{
+		const { deps, calls } = fakeHcExec({
+			"hc get": () => ok(hcTerminalJson(HC_TARGET_ID, "done", { turn: 4 })),
+			"hc send": (args) => {
+				assert.equal(args.includes("--if"), false);
+				assert.deepEqual(args.slice(0, 4), [
+					"send",
+					"--json",
+					"--wait",
+					"--timeout",
+				]);
+				return ok(hcSendJson(HC_TARGET_ID));
+			},
+		});
+		const res = await callRegisteredAgent(
+			deps,
+			{ target: HC_TARGET_ID, text: "preflight done allowed", resultFile: HC_RESULT_PATH },
+		);
+		assert.equal(res.ok, true);
+		assert.equal(res.status, "answered");
+		assert.equal(res.delivery, "submitted");
+		assert.equal(res.answer, "hc file answer");
+		assert.equal(res.nonAtomicDone, true);
+		assert.equal(calls.filter((c) => c.args[0] === "send").length, 1);
+		const formatted = describeCallResult(res);
+		assert.equal(formatted.includes(HC_DONE_NON_ATOMIC_NOTE), true);
+		assert.equal(formatted.includes("hc file answer"), true);
 	}
 
 	// Post-send status="blocked" -> response_unverified, submitted, error.code="agent_blocked", 0 file open, 0 keys/--force
@@ -1690,14 +1717,10 @@ test("hc boundary 6: registerCallFeatures with hc backend verifies descriptions,
 		hcBin: "/custom/hc",
 		hcCallerId: "",
 	});
-	assert.match(
-		commandDesc,
-		/hc: unattended target assumed \(not verified by the plugin\); a target left in done cannot take a follow-up automatically; text delivery only, no GJC session token/,
-	);
-	assert.match(
-		toolDesc,
-		/hc: unattended target assumed \(not verified by the plugin\); a target left in done cannot take a follow-up automatically; text delivery only, no GJC session token/,
-	);
+	assert.equal(commandDesc.includes(HC_CALL_BACKEND_NOTE), true);
+	assert.equal(toolDesc.includes(HC_CALL_BACKEND_NOTE), true);
+	assert.match(commandDesc, /idle or done targets only.*not atomic/i);
+	assert.match(toolDesc, /idle or done targets only.*not atomic/i);
 	// hc tool description must not claim 200-line screen reads or screen marker extraction
 	assert.doesNotMatch(toolDesc, /200-line screen reads/);
 	assert.doesNotMatch(toolDesc, /per-request marker lines/);
@@ -2061,6 +2084,269 @@ test("hc result_file: honors abort during pre-send lstat recheck and during open
 			assert.equal(counts.stat, 1, abortAt);
 			assert.equal(counts.read, 0, abortAt);
 		}
+	}
+});
+
+test("hc call done target: omits --if and recovers answer with non-atomic note, preserves done state on pre-send failure, classifies core pre-input rejection vs uncertain without resend, and keeps idle note-free", async () => {
+	assert.equal(
+		USAGE,
+		"Usage: /herdr-call --result-file <abs-path> <terminal> <text>",
+	);
+
+	// 1. Preflight idle keeps --if idle and omits non-atomic note
+	{
+		const { deps, calls } = fakeHcExec({
+			"hc get": () => ok(hcTerminalJson(HC_TARGET_ID, "idle", { turn: 4 })),
+			"hc send": (args) => {
+				assert.deepEqual(args.slice(0, 6), [
+					"send",
+					"--json",
+					"--if",
+					"idle",
+					"--wait",
+					"--timeout",
+				]);
+				return ok(hcSendJson(HC_TARGET_ID));
+			},
+		});
+		const res = await callRegisteredAgent(deps, {
+			target: HC_TARGET_ID,
+			text: "idle call",
+			resultFile: HC_RESULT_PATH,
+		});
+		assert.equal(res.ok, true);
+		assert.equal(res.status, "answered");
+		assert.equal(res.nonAtomicDone, undefined);
+		assert.equal(calls.filter((c) => c.args[0] === "send").length, 1);
+		assert.equal(describeCallResult(res).includes(HC_DONE_NON_ATOMIC_NOTE), false);
+	}
+
+	// 2. Preflight done omits --if, supports follow-up hc wait, recovers result file, and surfaces non-atomic note
+	{
+		const { deps, calls } = fakeHcExec(
+			{
+				"hc get": () => ok(hcTerminalJson(HC_TARGET_ID, "done", { turn: 4 })),
+				"hc send": (args) => {
+					assert.equal(args.includes("--if"), false);
+					assert.deepEqual(args.slice(0, 4), [
+						"send",
+						"--json",
+						"--wait",
+						"--timeout",
+					]);
+					return ok(
+						hcSendJson(HC_TARGET_ID, {
+							started: true,
+							status: "working",
+							wait: hcWaitJson(HC_TARGET_ID, {
+								ended: false,
+								reason: "timeout",
+								status: "working",
+								turn: 5,
+							}),
+						}),
+					);
+				},
+				"hc wait": () =>
+					ok(
+						hcWaitJson(HC_TARGET_ID, {
+							ended: true,
+							reason: "status",
+							status: "done",
+							turn: 5,
+						}),
+					),
+			},
+			"done follow-up answer",
+		);
+		const res = await callRegisteredAgent(deps, {
+			target: HC_TARGET_ID,
+			text: "done follow-up call",
+			resultFile: HC_RESULT_PATH,
+		});
+		assert.equal(res.ok, true);
+		assert.equal(res.status, "answered");
+		assert.equal(res.delivery, "submitted");
+		assert.equal(res.state, "done");
+		assert.equal(res.answer, "done follow-up answer");
+		assert.equal(res.markerVerified, false);
+		assert.equal(res.nonAtomicDone, true);
+		assert.equal(calls.filter((c) => c.args[0] === "send").length, 1);
+		assert.equal(calls.filter((c) => c.args[0] === "wait").length, 1);
+		const formatted = describeCallResult(res);
+		assert.match(formatted, /^herdr-call answered \(delivery submitted,/);
+		assert.equal(formatted.includes(HC_DONE_NON_ATOMIC_NOTE), true);
+		assert.equal(formatted.includes("done follow-up answer"), true);
+	}
+
+	// 3. Preflight done + stale wait turn (turn === send.turn) still rejected as uncertain/protocol with 0 file open
+	{
+		const { deps, getOpenCalls } = fakeHcExec({
+			"hc get": () => ok(hcTerminalJson(HC_TARGET_ID, "done", { turn: 4 })),
+			"hc send": () =>
+				ok(
+					hcSendJson(HC_TARGET_ID, {
+						turn: 4,
+						wait: hcWaitJson(HC_TARGET_ID, {
+							ended: true,
+							reason: "status",
+							status: "done",
+							turn: 4,
+						}),
+					}),
+				),
+		});
+		const res = await callRegisteredAgent(deps, {
+			target: HC_TARGET_ID,
+			text: "stale done turn",
+			resultFile: HC_RESULT_PATH,
+		});
+		assert.equal(res.ok, false);
+		assert.equal(res.status, "uncertain");
+		assert.equal(res.delivery, "submitted");
+		assert.equal(res.error?.code, "protocol");
+		assert.equal(res.nonAtomicDone, true);
+		assert.equal(getOpenCalls(), 0);
+		assert.equal(describeCallResult(res).includes(HC_DONE_NON_ATOMIC_NOTE), true);
+	}
+
+	// 4. Preflight done + budget exhausted before hc send -> not_sent, state="done" (not "idle"), 0 sends, no non-atomic note
+	{
+		const { deps, calls, setClock } = fakeHcExec({
+			"hc get": () => {
+				setClock(56_000);
+				return ok(hcTerminalJson(HC_TARGET_ID, "done", { turn: 4 }));
+			},
+			"hc send": () => {
+				throw new Error("should not spawn hc send when budget exhausted");
+			},
+		});
+		deps.fs = {
+			lstat: async () => {
+				throw enoentError();
+			},
+			open: async () => {
+				throw new Error("should not open");
+			},
+		};
+		// First lstat succeeds (ENOENT), hc get sets clock to waitDeadline (56_000) -> pre-send lstat times out with state="done"
+		const resLstatTimeout = await callRegisteredAgent(deps, {
+			target: HC_TARGET_ID,
+			text: "done budget out before lstat",
+			resultFile: HC_RESULT_PATH,
+		});
+		assert.equal(resLstatTimeout.ok, false);
+		assert.equal(resLstatTimeout.status, "not_sent");
+		assert.equal(resLstatTimeout.delivery, "not_sent");
+		assert.equal(resLstatTimeout.state, "done");
+		assert.equal(resLstatTimeout.nonAtomicDone, undefined);
+		assert.equal(calls.filter((c) => c.args[0] === "send").length, 0);
+		assert.equal(
+			describeCallResult(resLstatTimeout).includes(HC_DONE_NON_ATOMIC_NOTE),
+			false,
+		);
+
+		// Budget expires right after pre-send lstat -> budget exhausted before hc send preserves state="done"
+		let lstatCount = 0;
+		let postSecondLstatNowCalls = 0;
+		const { deps: deps2, calls: calls2 } = fakeHcExec({
+			"hc get": () => ok(hcTerminalJson(HC_TARGET_ID, "done", { turn: 4 })),
+			"hc send": () => {
+				throw new Error("should not spawn hc send when budget exhausted");
+			},
+		});
+		deps2.now = () => {
+			if (lstatCount < 2) return 1_000;
+			postSecondLstatNowCalls++;
+			// First call after 2nd lstat is raceResultFileOp's post-check (still 1ms left); next call is sendRemMs (0ms left)
+			return postSecondLstatNowCalls === 1 ? 55_999 : 56_000;
+		};
+		deps2.fs = {
+			lstat: async () => {
+				lstatCount++;
+				throw enoentError();
+			},
+			open: async () => {
+				throw new Error("should not open");
+			},
+		};
+		const resSendBudget = await callRegisteredAgent(deps2, {
+			target: HC_TARGET_ID,
+			text: "done budget out before send",
+			resultFile: HC_RESULT_PATH,
+		});
+		assert.equal(resSendBudget.ok, false);
+		assert.equal(resSendBudget.status, "not_sent");
+		assert.equal(resSendBudget.delivery, "not_sent");
+		assert.equal(resSendBudget.state, "done");
+		assert.equal(resSendBudget.error?.code, "timeout");
+		assert.equal(
+			resSendBudget.error?.message,
+			"Call budget exhausted before hc send.",
+		);
+		assert.equal(resSendBudget.nonAtomicDone, undefined);
+		assert.equal(calls2.filter((c) => c.args[0] === "send").length, 0);
+		assert.equal(
+			describeCallResult(resSendBudget).includes(HC_DONE_NON_ATOMIC_NOTE),
+			false,
+		);
+	}
+
+	// 5. Preflight done -> Core pre-input rejection (blocked/finished) returns not_sent without nonAtomicDone, 1 send, 0 resend
+	for (const [kind, code] of [
+		["blocked", "agent_blocked"],
+		["finished", "terminal_finished"],
+	] as const) {
+		const { deps, calls } = fakeHcExec({
+			"hc get": () => ok(hcTerminalJson(HC_TARGET_ID, "done", { turn: 4 })),
+			"hc send": (args) => {
+				assert.equal(args.includes("--if"), false);
+				return hcErr(kind, `SECRET_DONE_${kind}`);
+			},
+		});
+		const res = await callRegisteredAgent(deps, {
+			target: HC_TARGET_ID,
+			text: `done core ${kind}`,
+			resultFile: HC_RESULT_PATH,
+		});
+		assert.equal(res.ok, false, kind);
+		assert.equal(res.status, "not_sent", kind);
+		assert.equal(res.delivery, "not_sent", kind);
+		assert.equal(res.error?.code, code, kind);
+		assert.equal(res.nonAtomicDone, undefined, kind);
+		assert.equal(calls.filter((c) => c.args[0] === "send").length, 1, kind);
+		const formatted = describeCallResult(res);
+		assert.equal(formatted.includes(`SECRET_DONE_${kind}`), false, kind);
+		assert.equal(formatted.includes(HC_DONE_NON_ATOMIC_NOTE), false, kind);
+	}
+
+	// 6. Preflight done -> Core uncertain send outcome (killed/unavailable/throw) returns uncertain with delivery="unknown", 0 resend, and non-atomic note
+	for (const [label, sendImpl] of [
+		["killed", () => ({ code: 1, killed: true, stderr: "" })],
+		["unavailable", () => hcErr("unavailable", "SECRET_DONE_UNAVAIL")],
+		["throw", () => new Error("spawn EIO")],
+	] as const) {
+		const { deps, calls } = fakeHcExec({
+			"hc get": () => ok(hcTerminalJson(HC_TARGET_ID, "done", { turn: 4 })),
+			"hc send": (args) => {
+				assert.equal(args.includes("--if"), false);
+				return sendImpl();
+			},
+		});
+		const res = await callRegisteredAgent(deps, {
+			target: HC_TARGET_ID,
+			text: `done uncertain ${label}`,
+			resultFile: HC_RESULT_PATH,
+		});
+		assert.equal(res.ok, false, label);
+		assert.equal(res.status, "uncertain", label);
+		assert.equal(res.delivery, "unknown", label);
+		assert.equal(res.nonAtomicDone, true, label);
+		assert.equal(calls.filter((c) => c.args[0] === "send").length, 1, label);
+		const formatted = describeCallResult(res);
+		assert.match(formatted, /Do not resend/, label);
+		assert.equal(formatted.includes("SECRET_DONE_UNAVAIL"), false, label);
+		assert.equal(formatted.includes(HC_DONE_NON_ATOMIC_NOTE), true, label);
 	}
 });
 
