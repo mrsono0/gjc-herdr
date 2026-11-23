@@ -1,7 +1,7 @@
 {
 	"name": "gjc-herdr",
-	"version": "0.6.1",
-	"description": "Herdr model/session metadata, pane-to-pane prompt delivery, and detected-agent calls for GJC",
+	"version": "0.7.0",
+	"description": "herdr-core (hc) prompt delivery, agent calls with result files, and a file mailbox for GJC",
 	"type": "module",
 	"license": "MIT",
 	"repository": {
